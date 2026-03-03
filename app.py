@@ -1,6 +1,5 @@
 """PIM — Product Information Management
 Самостоятельное Streamlit-приложение для управления каталогом товаров.
-
 Функции:
 - Загрузка каталога из Excel
 - Обогащение габаритов и веса через AI
@@ -50,30 +49,28 @@ with st.sidebar:
     st.header("⚙️ Настройки")
     
     # Поле ввода API ключа
-    # Сначала пытаемся взять из session_state, потом из secrets
-    default_key = st.session_state.get("openai_key", "")
-    if not default_key:
+    # Пытаемся взять начальное значение из session_state или secrets
+    if "openai_key" not in st.session_state:
         try:
-            default_key = st.secrets.get("OPENAI_API_KEY", "")
+            st.session_state["openai_key"] = st.secrets.get("OPENAI_API_KEY", "")
         except:
-            pass
-
+            st.session_state["openai_key"] = ""
+            
     user_key = st.text_input(
         "OpenAI API Key", 
-        value=default_key,
+        value=st.session_state["openai_key"],
         type="password",
-        help="Ключ необходим для AI-обогащения товаров. Если оставить пустым, будет использоваться fallback на категории."
+        help="Ключ необходим для AI-обогащения товаров. Если оставить пустым, будут использоваться средние по категории."
     )
-    if user_key:
-        st.session_state["openai_key"] = user_key
+    st.session_state["openai_key"] = user_key
     
     st.divider()
     st.info(f"📁 База данных: {os.path.abspath(DB_PATH)}")
+    st.caption("Данные сохраняются автоматически в файл .db")
 
 api_key = st.session_state.get("openai_key", "")
 
 st.title("📦 PIM — Каталог товаров")
-
 st.divider()
 
 # ── Блок 1: Загрузка каталога из Excel ──────────────────────────────
@@ -84,46 +81,40 @@ with st.expander("📥 Загрузить каталог из Excel", expanded=F
         dim_unit = st.selectbox("Единица габаритов в файле", ["см", "мм"], key="pim_dim_unit")
     with col2:
         weight_unit = st.selectbox("Единица веса в файле", ["кг", "г"], key="pim_weight_unit")
-
+    
     if uploaded and st.button("Загрузить в БД", key="load_excel"):
         try:
             df = pd.read_excel(uploaded)
-        except Exception as e:
-            st.error(f"Ошибка чтения файла: {e}")
-            df = None
-
-        if df is not None:
-            required = ["SKU", "Название"]
-            if not all(c in df.columns for c in required):
-                st.error(f"Файл должен содержать минимум колонки: {required}")
-            else:
-                c = conn.cursor()
-                loaded = 0
-                for _, row in df.iterrows():
-                    sku = str(row.get("SKU", "")).strip()
-                    name = str(row.get("Название", "")).strip()
-                    if not sku or not name or sku == "nan" or name == "nan":
-                        continue
-                    length = normalize_value(row.get("Длина", 0), dim_unit)
-                    width = normalize_value(row.get("Ширина", 0), dim_unit)
-                    height = normalize_value(row.get("Высота", 0), dim_unit)
-                    weight = normalize_value(row.get("Вес", 0), weight_unit)
-                    try:
-                        cost = float(row.get("Себестоимость", 0) or 0)
-                    except (ValueError, TypeError):
-                        cost = 0.0
-                    ean = str(row.get("EAN", "") or "").strip()
-                    brand = str(row.get("Бренд", "") or "").strip()
-                    category = str(row.get("Категория", "") or "").strip()
-                    desc = str(row.get("Описание", "") or "").strip()
-                    img = str(row.get("Фото", "") or "").strip()
-                    c.execute("""
-                        INSERT INTO products 
+            if df is not None:
+                required = ["SKU", "Название"]
+                if not all(c in df.columns for c in required):
+                    st.error(f"Файл должен содержать минимум колонки: {required}")
+                else:
+                    c = conn.cursor()
+                    loaded = 0
+                    for _, row in df.iterrows():
+                        sku = str(row.get("SKU", "")).strip()
+                        name = str(row.get("Название", "")).strip()
+                        if not sku or not name or sku == "nan" or name == "nan":
+                            continue
+                            
+                        length = normalize_value(row.get("Длина", 0), dim_unit)
+                        width = normalize_value(row.get("Ширина", 0), dim_unit)
+                        height = normalize_value(row.get("Высота", 0), dim_unit)
+                        weight = normalize_value(row.get("Вес", 0), weight_unit)
+                        
+                        try:
+                            cost = float(row.get("Себестоимость", 0) or 0)
+                        except:
+                            cost = 0.0
+                            
+                        c.execute("""
+                            INSERT INTO products 
                             (sku, name, length_cm, width_cm, height_cm, 
-                             weight_kg, cost, ean, brand, category, 
-                             description, main_image_url)
-                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
-                        ON CONFLICT(sku) DO UPDATE SET 
+                            weight_kg, cost, ean, brand, category, 
+                            description, main_image_url)
+                            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+                            ON CONFLICT(sku) DO UPDATE SET 
                             name=excluded.name,
                             length_cm=excluded.length_cm,
                             width_cm=excluded.width_cm,
@@ -135,11 +126,16 @@ with st.expander("📥 Загрузить каталог из Excel", expanded=F
                             category=excluded.category,
                             description=excluded.description,
                             main_image_url=excluded.main_image_url
-                    """, (sku, name, length, width, height, weight, cost, ean, brand, category, desc, img))
-                    loaded += 1
-                conn.commit()
-                st.success(f"✅ Загружено {loaded} товаров. Данные сохранены в базу.")
-                st.rerun()
+                        """, (sku, name, length, width, height, weight, cost, 
+                              str(row.get("EAN", "")), str(row.get("Бренд", "")), 
+                              str(row.get("Категория", "")), str(row.get("Описание", "")), 
+                              str(row.get("Фото", ""))))
+                        loaded += 1
+                    conn.commit()
+                    st.success(f"✅ Загружено {loaded} товаров. Данные сохранены в базу.")
+                    st.rerun()
+        except Exception as e:
+            st.error(f"Ошибка: {e}")
 
 st.divider()
 
@@ -156,132 +152,102 @@ products = c.execute("""
 st.subheader(f"Товары в каталоге ({len(products)})")
 
 if not products:
-    st.info("Каталог пуст — загрузите Excel файл. Данные хранятся в файле pim_storage.db")
+    st.info("Каталог пуст — загрузите Excel файл. База данных готова (pim_storage.db).")
 else:
     COLUMNS = [
         "ID", "SKU", "Название", "Бренд", "Категория", 
         "Длина (см)", "Ширина (см)", "Высота (см)", "Вес (кг)", 
-        "Себестоимость", "EAN", "Статус обогащения", "Источник"
+        "Себестоимость", "EAN", "Статус", "Источник"
     ]
     df_view = pd.DataFrame(products, columns=COLUMNS)
-
+    
     # Фильтры
     col1, col2, col3 = st.columns(3)
     with col1:
-        filt_cat = st.multiselect("Фильтр по категории", df_view["Категория"].dropna().unique(), key="filt_cat")
+        filt_cat = st.multiselect("Категория", df_view["Категория"].dropna().unique())
     with col2:
-        filt_brand = st.multiselect("Фильтр по бренду", df_view["Бренд"].dropna().unique(), key="filt_brand")
+        filt_brand = st.multiselect("Бренд", df_view["Бренд"].dropna().unique())
     with col3:
-        show_empty = st.checkbox("Только без габаритов/веса", key="show_empty")
-
+        show_empty = st.checkbox("Только без размеров")
+    
     df_filtered = df_view.copy()
     if filt_cat:
         df_filtered = df_filtered[df_filtered["Категория"].isin(filt_cat)]
     if filt_brand:
         df_filtered = df_filtered[df_filtered["Бренд"].isin(filt_brand)]
     if show_empty:
-        dim_cols = ["Длина (см)", "Ширина (см)", "Высота (см)", "Вес (кг)"]
-        mask = df_filtered[dim_cols].apply(
-            lambda col: col.isna() | (col == 0) | (col.astype(str).str.strip() == "")
+        mask = df_filtered[["Длина (см)", "Ширина (см)", "Высота (см)", "Вес (кг)"]].apply(
+            lambda x: (x <= 0) | x.isna()
         ).any(axis=1)
         df_filtered = df_filtered[mask]
-
+        
     st.dataframe(df_filtered, use_container_width=True, height=400)
-
+    
     if len(df_filtered) > 0:
         output = BytesIO()
         with pd.ExcelWriter(output, engine="openpyxl") as writer:
-            df_filtered.to_excel(writer, index=False, sheet_name="Каталог")
-        output.seek(0)
+            df_filtered.to_excel(writer, index=False)
         st.download_button(
-            label="📥 Скачать каталог в Excel",
-            data=output,
-            file_name=f"pim_catalog_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            key="export_catalog",
+            "📥 Скачать выбранное в Excel",
+            data=output.getvalue(),
+            file_name="pim_export.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
-
-    st.divider()
-
-    # ── Блок 3: Обогащение габаритов и веса ───────────────────────────────
-    st.subheader("🔍 Обогащение габаритов и веса")
-    col1, col2 = st.columns(2)
-    with col1:
-        enrich_mode = st.radio(
-            "Режим обогащения", 
-            ["Только пустые (без размеров)", "Все товары (перезаписать)"], 
-            key="enrich_mode"
-        )
-    with col2:
-        if not api_key:
-            st.warning("⚠️ OpenAI API ключ не введён. Введите его в Настройках (слева в сайдбаре), чтобы использовать ИИ.")
-        else:
-            st.success("✅ OpenAI подключен. Можно использовать AI-обогащение.")
-
-    if st.button("🚀 Обогатить выбранные товары", key="enrich_btn", type="primary"):
-        force = (enrich_mode == "Все товары (перезаписать)")
-        products_to_enrich = []
-        for _, row in df_filtered.iterrows():
-            products_to_enrich.append({
-                "id":         row["ID"],
-                "sku":        row["SKU"],
-                "name":       row["Название"],
-                "brand":      row["Бренд"],
-                "category":   row["Категория"],
-                "ean":        row["EAN"],
-                "length_cm":  row["Длина (см)"],
-                "width_cm":   row["Ширина (см)"],
-                "height_cm":  row["Высота (см)"],
-                "weight_kg":  row["Вес (кг)"],
-            })
-
-        if not products_to_enrich:
-            st.warning("Нет товаров для обогащения (проверьте фильтры)")
-        else:
-            progress = st.progress(0)
-            status = st.empty()
-            results = []
-            cur = conn.cursor()
-
-            for i, prod in enumerate(products_to_enrich):
-                status.text(f"Обработка {i + 1}/{len(products_to_enrich)}: {prod['name']}")
-                
-                updated_prod, method = pim_enrich.enrich_product(
-                    prod, conn, api_key, 
-                    search_results=None, 
-                    force=force
-                )
-                
-                cur.execute("""
-                    UPDATE products 
-                    SET length_cm=?, 
-                        width_cm=?, 
-                        height_cm=?, 
-                        weight_kg=?, 
-                        enrich_source=?, 
-                        enrich_status=?
-                    WHERE id=?
-                """, (
-                    updated_prod.get("length_cm"),
-                    updated_prod.get("width_cm"),
-                    updated_prod.get("height_cm"),
-                    updated_prod.get("weight_kg"),
-                    updated_prod.get("enrich_source", method),
-                    updated_prod.get("enrich_status", "enriched" if method != "failed" else "failed"),
-                    int(prod["id"])
-                ))
-                conn.commit()
-
-                success = method not in ("failed", "already_filled")
-                pim_enrich.log_enrichment(conn, prod["id"], method, success)
-                results.append({"SKU": prod["sku"], "Метод": method, "Успех": success})
-                progress.progress((i + 1) / len(products_to_enrich))
-
-            status.text("✅ Обогащение завершено. Данные сохранены в базу.")
-            st.success(f"Обработано {len(results)} товаров")
-            df_results = pd.DataFrame(results)
-            st.dataframe(df_results, use_container_width=True)
-            st.rerun()
 
 st.divider()
-st.caption("💡 База данных pim_storage.db сохраняется автоматически. Данные не пропадут после перезапуска.")
+
+# ── Блок 3: Обогащение ──────────────────────────────────────────────
+st.subheader("🔍 Обогащение данных через AI")
+
+col1, col2 = st.columns(2)
+with col1:
+    enrich_mode = st.radio(
+        "Режим", 
+        ["Только пустые", "Все (перезаписать)"], 
+        horizontal=True
+    )
+with col2:
+    if not api_key:
+        st.warning("⚠️ OpenAI ключ не настроен — будут использоваться только средние по категории")
+    else:
+        st.success("✅ OpenAI подключен")
+
+if st.button("🚀 Запустить обогащение", type="primary"):
+    force = (enrich_mode == "Все (перезаписать)")
+    to_process = []
+    for _, row in df_filtered.iterrows():
+        to_process.append({
+            "id": row["ID"], "sku": row["SKU"], "name": row["Название"],
+            "brand": row["Бренд"], "category": row["Категория"],
+            "length_cm": row["Длина (см)"], "width_cm": row["Ширина (см)"],
+            "height_cm": row["Высота (см)"], "weight_kg": row["Вес (кг)"]
+        })
+    
+    if not to_process:
+        st.warning("Нет товаров для обработки.")
+    else:
+        progress = st.progress(0)
+        status = st.empty()
+        cur = conn.cursor()
+        
+        for i, prod in enumerate(to_process):
+            status.text(f"Обработка {i+1}/{len(to_process)}: {prod['name']}")
+            
+            updated, method = pim_enrich.enrich_product(prod, conn, api_key, force=force)
+            
+            cur.execute("""
+                UPDATE products 
+                SET length_cm=?, width_cm=?, height_cm=?, weight_kg=?, 
+                    enrich_source=?, enrich_status=?
+                WHERE id=?
+            """, (updated["length_cm"], updated["width_cm"], updated["height_cm"], 
+                  updated["weight_kg"], method, "enriched" if method != "failed" else "failed", 
+                  int(prod["id"])))
+            conn.commit()
+            progress.progress((i + 1) / len(to_process))
+            
+        st.success("✅ Готово! Данные в базе обновлены.")
+        st.rerun()
+
+st.divider()
+st.caption("💡 База данных сохраняется в файл pim_storage.db. Вы можете перезапускать приложение, данные не пропадут.")
