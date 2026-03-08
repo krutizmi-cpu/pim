@@ -46,7 +46,6 @@ COLUMN_HELP = {
 }
 
 
-@st.cache_resource
 def get_db_connection():
     conn = get_connection()
     init_db(conn)
@@ -137,7 +136,7 @@ def show_catalog() -> None:
         st.dataframe(
             pd.DataFrame(TEMPLATE_EXAMPLE_ROWS, columns=TEMPLATE_COLUMNS),
             hide_index=True,
-            width="stretch",
+            use_container_width=True,
         )
 
         uploaded_file = st.file_uploader("Excel файл каталога", type=["xlsx", "xls"])
@@ -160,7 +159,7 @@ def show_catalog() -> None:
                     )
                     if result.duplicates:
                         st.warning("Найдены возможные дубли по похожему name (>85%).")
-                        st.dataframe(pd.DataFrame(result.duplicates), width="stretch", hide_index=True)
+                        st.dataframe(pd.DataFrame(result.duplicates), use_container_width=True, hide_index=True)
                     st.rerun()
 
     products_df = load_products_df(conn)
@@ -209,7 +208,7 @@ def show_catalog() -> None:
         st.dataframe(
             view_df[["article", "name", "barcode", "weight", "dimensions", "supplier_url", "image_url"]],
             hide_index=True,
-            width="stretch",
+            use_container_width=True,
         )
 
         output = BytesIO()
@@ -226,6 +225,8 @@ def show_catalog() -> None:
         count = enrich_products_stub(conn)
         st.info(f"Заглушка выполнена. Товаров, требующих обогащения: {count}.")
         st.caption(f"Лог записан в: {LOG_PATH}")
+
+    conn.close()
 
 
 if __name__ == "__main__":
