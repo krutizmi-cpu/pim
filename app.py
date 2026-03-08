@@ -1,100 +1,24 @@
 from __future__ import annotations
 
+from datetime import datetime
 from io import BytesIO
 from pathlib import Path
 
 import pandas as pd
 import streamlit as st
-from openpyxl import Workbook
-from openpyxl.styles import Font, PatternFill
 
 from db import get_connection, init_db
-from services.catalog_service import ImportTemplateError, import_catalog_from_excel
+from services.catalog_service import import_catalog_from_excel
 from services.enrichment_stub import LOG_PATH, enrich_products_stub
 
 st.set_page_config(page_title="PIM — Каталог товаров", page_icon="📦", layout="wide")
 
-TEMPLATE_COLUMNS = [
-    "article",
-    "name",
-    "barcode",
-    "weight",
-    "length",
-    "width",
-    "height",
-    "supplier_url",
-    "image_url",
-    "description",
-]
 
-TEMPLATE_EXAMPLE_ROWS = [
-    ["VEL-0001", "Велосипед горный Sprint 27.5", "4601234567890", 14.8, 145, 22, 78, "https://supplier.example/item/vel-0001", "https://supplier.example/item/vel-0001.jpg", "Горный велосипед, алюминиевая рама, 21 скорость"],
-    ["SAM-0002", "Самокат городской Urban X", "", "", "", "", "", "https://supplier.example/item/sam-0002", "", ""],
-]
-
-COLUMN_HELP = {
-    "article": "Обязательно. Уникальный артикул товара в вашей базе.",
-    "name": "Обязательно. Наименование товара.",
-    "barcode": "Необязательно. Штрихкод/EAN.",
-    "weight": "Необязательно. Вес товара в кг.",
-    "length": "Необязательно. Длина в см.",
-    "width": "Необязательно. Ширина в см.",
-    "height": "Необязательно. Высота в см.",
-    "supplier_url": "Необязательно. Ссылка на сайт поставщика или производителя.",
-    "image_url": "Необязательно. Прямая ссылка на фото товара.",
-    "description": "Необязательно. Базовое описание товара.",
-}
-
-
+@st.cache_resource
 def get_db_connection():
     conn = get_connection()
     init_db(conn)
     return conn
-
-
-@st.cache_data
-def build_template_bytes() -> bytes:
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Шаблон"
-
-    header_fill = PatternFill(fill_type="solid", fgColor="1F4E78")
-    help_fill = PatternFill(fill_type="solid", fgColor="D9EAF7")
-    required_fill = PatternFill(fill_type="solid", fgColor="FFF2CC")
-
-    for col_idx, title in enumerate(TEMPLATE_COLUMNS, start=1):
-        cell = ws.cell(row=1, column=col_idx, value=title)
-        cell.font = Font(bold=True, color="FFFFFF")
-        cell.fill = header_fill
-        ws.cell(row=2, column=col_idx, value=COLUMN_HELP[title]).fill = help_fill
-        if title in {"article", "name"}:
-            ws.cell(row=2, column=col_idx).fill = required_fill
-
-    for row_idx, row_values in enumerate(TEMPLATE_EXAMPLE_ROWS, start=3):
-        for col_idx, value in enumerate(row_values, start=1):
-            ws.cell(row=row_idx, column=col_idx, value=value)
-
-    widths = {
-        "A": 16, "B": 36, "C": 18, "D": 12, "E": 12, "F": 12, "G": 12,
-        "H": 40, "I": 40, "J": 42,
-    }
-    for col_letter, width in widths.items():
-        ws.column_dimensions[col_letter].width = width
-    ws.freeze_panes = "A3"
-
-    info = wb.create_sheet("Справка")
-    info["A1"] = "Как загружать новые товары"
-    info["A1"].font = Font(bold=True, size=14)
-    info["A3"] = "1. Заполняйте минимум два поля: article и name."
-    info["A4"] = "2. Габариты указывайте в сантиметрах, вес — в килограммах."
-    info["A5"] = "3. supplier_url — ссылка на карточку поставщика/производителя для будущего обогащения."
-    info["A6"] = "4. image_url — прямая ссылка на фото, если она уже есть."
-    info["A7"] = "5. Можно грузить файл с русскими колонками: Артикул, Наименование, Штрихкод, Вес, Длина, Ширина, Высота, Ссылка поставщика, Фото, Описание."
-    info.column_dimensions["A"].width = 120
-
-    output = BytesIO()
-    wb.save(output)
-    return output.getvalue()
 
 
 def format_dimensions(row: pd.Series) -> str:
@@ -107,38 +31,132 @@ def format_dimensions(row: pd.Series) -> str:
 def load_products_df(conn) -> pd.DataFrame:
     rows = conn.execute(
         """
-        SELECT article, name, barcode, weight, length, width, height, supplier_url, image_url, description
+        SELECT id, article, name, barcode, weight, length, width, height,
+               supplier_url, image_url, enrichment_status, updated_at
         FROM products
         ORDER BY id DESC
         """
     ).fetchall()
     if not rows:
         return pd.DataFrame(
-            columns=["article", "name", "barcode", "weight", "length", "width", "height", "supplier_url", "image_url", "description"]
+            columns=[
+                "id",
+                "article",
+                "name",
+                "barcode",
+                "weight",
+                "length",
+                "width",
+                "height",
+                "supplier_url",
+                "image_url",
+                "enrichment_status",
+                "updated_at",
+            ]
         )
     return pd.DataFrame([dict(row) for row in rows])
 
 
+def show_product_card(product_id: int) -> None:
+    st.title("🗂️ Карточка товара")
+    conn = get_db_connection()
+
+    product = conn.execute(
+        """
+        SELECT id, article, name, barcode, weight, length, width, height,
+               supplier_url, image_url, description,
+               enrichment_status, enrichment_comment,
+               created_at, updated_at
+        FROM products
+        WHERE id = ?
+        """,
+        (product_id,),
+    ).fetchone()
+
+    if not product:
+        st.error("Товар не найден.")
+        if st.button("Вернуться в каталог"):
+            st.session_state["selected_product_id"] = None
+            st.rerun()
+        return
+
+    with st.form("product_form"):
+        st.subheader(f"Товар ID: {product['id']}")
+
+        article = st.text_input("article", value=product["article"] or "")
+        name = st.text_input("name", value=product["name"] or "")
+        barcode = st.text_input("barcode", value=product["barcode"] or "")
+
+        c1, c2 = st.columns(2)
+        with c1:
+            weight = st.number_input("weight", value=float(product["weight"] or 0.0), min_value=0.0)
+            length = st.number_input("length", value=float(product["length"] or 0.0), min_value=0.0)
+        with c2:
+            width = st.number_input("width", value=float(product["width"] or 0.0), min_value=0.0)
+            height = st.number_input("height", value=float(product["height"] or 0.0), min_value=0.0)
+
+        supplier_url = st.text_input("supplier_url", value=product["supplier_url"] or "")
+        image_url = st.text_input("image_url", value=product["image_url"] or "")
+        description = st.text_area("description", value=product["description"] or "", height=120)
+
+        enrichment_status = st.text_input("enrichment_status", value=product["enrichment_status"] or "")
+        enrichment_comment = st.text_area("enrichment_comment", value=product["enrichment_comment"] or "", height=100)
+
+        save_clicked = st.form_submit_button("Сохранить", type="primary")
+
+    if save_clicked:
+        conn.execute(
+            """
+            UPDATE products
+            SET article = ?,
+                name = ?,
+                barcode = ?,
+                weight = ?,
+                length = ?,
+                width = ?,
+                height = ?,
+                supplier_url = ?,
+                image_url = ?,
+                description = ?,
+                enrichment_status = ?,
+                enrichment_comment = ?,
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                article.strip(),
+                name.strip(),
+                barcode.strip() or None,
+                weight if weight > 0 else None,
+                length if length > 0 else None,
+                width if width > 0 else None,
+                height if height > 0 else None,
+                supplier_url.strip() or None,
+                image_url.strip() or None,
+                description.strip() or None,
+                enrichment_status.strip() or None,
+                enrichment_comment.strip() or None,
+                datetime.utcnow().isoformat(timespec="seconds"),
+                product_id,
+            ),
+        )
+        conn.commit()
+        st.success("Товар сохранён")
+        st.session_state["selected_product_id"] = None
+        st.rerun()
+
+    if st.button("Вернуться в каталог"):
+        st.session_state["selected_product_id"] = None
+        st.rerun()
+
+
 def show_catalog() -> None:
     st.title("📦 Каталог товаров")
-    st.caption("База товаров хранится постоянно и используется как основа для дальнейшего обогащения, наполнения карточек и выгрузок.")
+    st.caption("Базовый модуль: загрузка каталога из 1С, просмотр и контроль качества данных.")
 
     conn = get_db_connection()
 
     with st.expander("📥 Загрузить каталог из Excel", expanded=True):
-        st.markdown("**Что грузить:** Excel-файл базового каталога. Минимум нужны поля **article** и **name**.")
-        st.download_button(
-            "Скачать образец шаблона Excel",
-            data=build_template_bytes(),
-            file_name="catalog_import_template.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
-        st.dataframe(
-            pd.DataFrame(TEMPLATE_EXAMPLE_ROWS, columns=TEMPLATE_COLUMNS),
-            hide_index=True,
-            use_container_width=True,
-        )
-
         uploaded_file = st.file_uploader("Excel файл каталога", type=["xlsx", "xls"])
         if st.button("Загрузить каталог из Excel", type="primary", disabled=uploaded_file is None):
             if uploaded_file is None:
@@ -149,18 +167,14 @@ def show_catalog() -> None:
                 excel_path = uploads_dir / uploaded_file.name
                 excel_path.write_bytes(uploaded_file.getbuffer())
 
-                try:
-                    result = import_catalog_from_excel(conn, excel_path)
-                except ImportTemplateError as exc:
-                    st.error(f"Ошибка шаблона: {exc}")
-                else:
-                    st.success(
-                        f"Импорт завершён: импортировано {result.imported}, новых {result.created}, обновлено {result.updated}, пропущено {result.skipped}."
-                    )
-                    if result.duplicates:
-                        st.warning("Найдены возможные дубли по похожему name (>85%).")
-                        st.dataframe(pd.DataFrame(result.duplicates), use_container_width=True, hide_index=True)
-                    st.rerun()
+                result = import_catalog_from_excel(conn, excel_path)
+                st.success(
+                    f"Импорт завершён: импортировано {result.imported}, новых {result.created}, обновлено {result.updated}."
+                )
+                if result.duplicates:
+                    st.warning("Найдены возможные дубли по похожему name (>85%).")
+                    st.dataframe(pd.DataFrame(result.duplicates), width="stretch")
+                st.rerun()
 
     products_df = load_products_df(conn)
 
@@ -206,14 +220,32 @@ def show_catalog() -> None:
         view_df = filtered.copy()
         view_df["dimensions"] = view_df.apply(format_dimensions, axis=1)
         st.dataframe(
-            view_df[["article", "name", "barcode", "weight", "dimensions", "supplier_url", "image_url"]],
+            view_df[[
+                "article",
+                "name",
+                "barcode",
+                "weight",
+                "dimensions",
+                "supplier_url",
+                "enrichment_status",
+                "updated_at",
+            ]],
             hide_index=True,
-            use_container_width=True,
+            width="stretch",
         )
+
+        st.subheader("Открыть карточку")
+        for _, row in view_df.iterrows():
+            c1, c2, c3 = st.columns([2, 5, 2])
+            c1.write(row["article"])
+            c2.write(row["name"])
+            if c3.button("Открыть карточку", key=f"open_{int(row['id'])}"):
+                st.session_state["selected_product_id"] = int(row["id"])
+                st.rerun()
 
         output = BytesIO()
         with pd.ExcelWriter(output, engine="openpyxl") as writer:
-            view_df.to_excel(writer, index=False, sheet_name="catalog")
+            view_df.to_excel(writer, index=False)
         st.download_button(
             "Скачать текущую выборку (Excel)",
             data=output.getvalue(),
@@ -226,8 +258,12 @@ def show_catalog() -> None:
         st.info(f"Заглушка выполнена. Товаров, требующих обогащения: {count}.")
         st.caption(f"Лог записан в: {LOG_PATH}")
 
-    conn.close()
-
 
 if __name__ == "__main__":
-    show_catalog()
+    if "selected_product_id" not in st.session_state:
+        st.session_state["selected_product_id"] = None
+
+    if st.session_state["selected_product_id"] is None:
+        show_catalog()
+    else:
+        show_product_card(int(st.session_state["selected_product_id"]))
