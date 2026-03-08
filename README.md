@@ -16,6 +16,11 @@ project/
   data/
 ```
 
+## Статус
+
+- Проект объединён в одну рабочую ветку: `codex/create-mvp-for-product-information-management`.
+- В этой ветке находятся оба проверочных сценария: выгрузка из Ozon API и импорт Excel 1С в SQLite.
+
 ## Установка
 
 ```bash
