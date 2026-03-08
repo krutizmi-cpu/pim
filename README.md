@@ -1,18 +1,32 @@
-# PIM MVP (Streamlit + SQLite)
+# PIM — модуль базового каталога товаров
 
-Простой MVP PIM-системы для управления товарными данными.
+Этот этап проекта — первый модуль PIM: **базовый каталог товаров** для торговой компании.
 
-## Что умеет
+## Что реализовано
 
-- Импорт товаров из Excel с маппингом колонок.
-- Хранение мастер-карточки товара в SQLite.
-- Управление клиентами, категориями, атрибутами и синонимами атрибутов.
-- Нормализация размеров и веса (мм/см/м, г/кг).
-- Поиск кандидатов в дубли.
-- Генерация названия товара.
-- Подбор товаров по размерам и весу.
-- Выгрузка в Excel с фильтрами.
-- Заглушки под GS1 и AI-функции.
+- хранение каталога в SQLite (`data/catalog.db`);
+- обязательные поля: `article` (уникальный), `name`;
+- необязательные поля: `barcode`, `weight`, `length`, `width`, `height`, `supplier_url`, `image_url`, `description`;
+- импорт каталога из Excel (1С) с обновлением по `article`;
+- таблица `duplicate_candidates` для похожих `name` (>85%);
+- Streamlit-раздел «Каталог товаров» с поиском и фильтрами;
+- кнопка «Обогатить данные» как заглушка с логом в `data/enrichment.log`.
+
+## Структура
+
+```text
+project/
+  app.py
+  db.py
+  import_1c_catalog.py
+  pim_enrich.py
+  requirements.txt
+  services/
+    __init__.py
+    catalog_service.py
+    enrichment_stub.py
+  data/
+```
 
 ## Запуск
 
@@ -21,29 +35,23 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
-## Структура
+## Импорт Excel
 
-```text
-pim/
-├── app.py
-├── db.py
-├── models.py
-├── requirements.txt
-├── services/
-│   ├── ai_stub.py
-│   ├── barcode.py
-│   ├── duplicates.py
-│   ├── exports.py
-│   ├── imports.py
-│   ├── name_generator.py
-│   └── units.py
-├── utils/
-│   └── text_normalizer.py
-├── data/          # файл базы создаётся автоматически
-└── uploads/       # временные excel-файлы импорта
+Поддерживаемые колонки:
+
+- `article`
+- `name`
+- `barcode`
+- `weight`
+- `length`
+- `width`
+- `height`
+- `supplier_url`
+
+Если часть колонок отсутствует, импорт продолжается.
+
+CLI-импорт:
+
+```bash
+python import_1c_catalog.py catalog.xlsx
 ```
-
-## Примечание
-
-Архитектура оставлена простой, но с разделением на сервисы и модели,
-чтобы позже можно было перейти на PostgreSQL и вынести API без полной переделки.

@@ -1,33 +1,88 @@
 from __future__ import annotations
 
+import sqlite3
 from pathlib import Path
 
-from sqlalchemy import create_engine
-from sqlalchemy.orm import Session, sessionmaker
-
-from models import Base, Client
-
-DB_PATH = Path("data/pim.db")
-DATABASE_URL = f"sqlite:///{DB_PATH}"
-
-engine = create_engine(DATABASE_URL, future=True)
-SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
+DB_PATH = Path("data/catalog.db")
 
 
-def init_db() -> None:
-    """Create DB file/folders and tables on first launch."""
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    Base.metadata.create_all(bind=engine)
+REQUIRED_PRODUCT_COLUMNS: dict[str, str] = {
+    "article": "TEXT",
+    "name": "TEXT",
+    "barcode": "TEXT",
+    "weight": "REAL",
+    "length": "REAL",
+    "width": "REAL",
+    "height": "REAL",
+    "supplier_url": "TEXT",
+    "image_url": "TEXT",
+    "description": "TEXT",
+    "created_at": "TEXT DEFAULT CURRENT_TIMESTAMP",
+}
 
 
-def get_session() -> Session:
-    return SessionLocal()
+def get_connection(db_path: Path = DB_PATH) -> sqlite3.Connection:
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    return conn
 
 
-def seed_demo_data() -> None:
-    """Optional helper to seed a demo client only once."""
-    with get_session() as session:
-        exists = session.query(Client).filter(Client.name == "Demo клиент").first()
-        if not exists:
-            session.add(Client(name="Demo клиент", comment="Тестовый клиент"))
-            session.commit()
+def _table_columns(conn: sqlite3.Connection, table_name: str) -> set[str]:
+    rows = conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+    return {str(row["name"]) for row in rows}
+
+
+def _ensure_products_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS products (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            article TEXT UNIQUE NOT NULL,
+            name TEXT NOT NULL,
+            barcode TEXT,
+            weight REAL,
+            length REAL,
+            width REAL,
+            height REAL,
+            supplier_url TEXT,
+            image_url TEXT,
+            description TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+
+    existing = _table_columns(conn, "products")
+    for col, col_type in REQUIRED_PRODUCT_COLUMNS.items():
+        if col not in existing:
+            conn.execute(f"ALTER TABLE products ADD COLUMN {col} {col_type}")
+
+    conn.execute(
+        """
+        DELETE FROM products
+        WHERE article IS NOT NULL
+          AND rowid NOT IN (
+              SELECT MAX(rowid) FROM products WHERE article IS NOT NULL GROUP BY article
+          )
+        """
+    )
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_products_article_unique ON products(article)")
+
+
+def init_db(conn: sqlite3.Connection) -> None:
+    _ensure_products_table(conn)
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS duplicate_candidates (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            new_article TEXT NOT NULL,
+            existing_article TEXT NOT NULL,
+            similarity REAL NOT NULL,
+            reason TEXT NOT NULL,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    conn.commit()
