@@ -17,7 +17,10 @@ REQUIRED_PRODUCT_COLUMNS: dict[str, str] = {
     "supplier_url": "TEXT",
     "image_url": "TEXT",
     "description": "TEXT",
+    "enrichment_status": "TEXT",
+    "enrichment_comment": "TEXT",
     "created_at": "TEXT DEFAULT CURRENT_TIMESTAMP",
+    "updated_at": "TEXT",
 }
 
 
@@ -48,7 +51,10 @@ def _ensure_products_table(conn: sqlite3.Connection) -> None:
             supplier_url TEXT,
             image_url TEXT,
             description TEXT,
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            enrichment_status TEXT,
+            enrichment_comment TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT
         )
         """
     )
