@@ -25,22 +25,16 @@ SUPPORTED_FIELDS = [
 
 COLUMN_MAP: dict[str, list[str]] = {
     "article": ["article", "артикул", "sku", "код товара", "код"],
-    "name": ["name", "название", "наименование", "товар"],
-    "barcode": ["barcode", "ean", "штрихкод", "шк"],
-    "weight": ["weight", "вес", "вес кг", "вес, кг"],
-    "length": ["length", "длина", "длина см", "длина, см"],
-    "width": ["width", "ширина", "ширина см", "ширина, см"],
-    "height": ["height", "высота", "высота см", "высота, см"],
-    "supplier_url": ["supplier_url", "url поставщика", "ссылка поставщика", "supplier link", "ссылка"],
-    "image_url": ["image_url", "фото", "картинка", "image", "ссылка на фото"],
+    "name": ["name", "название", "наименование"],
+    "barcode": ["barcode", "ean", "штрихкод"],
+    "weight": ["weight", "вес"],
+    "length": ["length", "длина"],
+    "width": ["width", "ширина"],
+    "height": ["height", "высота"],
+    "supplier_url": ["supplier_url", "url поставщика", "ссылка поставщика", "supplier link"],
+    "image_url": ["image_url", "фото", "картинка", "image"],
     "description": ["description", "описание"],
 }
-
-REQUIRED_IMPORT_FIELDS = ["article", "name"]
-
-
-class ImportTemplateError(ValueError):
-    pass
 
 
 @dataclass
@@ -48,21 +42,16 @@ class ImportResult:
     imported: int
     created: int
     updated: int
-    skipped: int
     duplicates: list[dict[str, Any]]
 
 
-def _normalize_label(label: object) -> str:
-    return str(label).strip().lower().replace("ё", "е")
-
-
-def normalize_columns(df: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, str]]:
-    source_columns = {_normalize_label(col): col for col in df.columns}
+def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    source_columns = {str(col).strip().lower(): col for col in df.columns}
     rename_map: dict[str, str] = {}
 
     for target, aliases in COLUMN_MAP.items():
         for alias in aliases:
-            src = source_columns.get(_normalize_label(alias))
+            src = source_columns.get(alias)
             if src:
                 rename_map[src] = target
                 break
@@ -72,8 +61,7 @@ def normalize_columns(df: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, str]]:
         if col not in normalized.columns:
             normalized[col] = None
 
-    recognized = {target: source for source, target in rename_map.items()}
-    return normalized[SUPPORTED_FIELDS], recognized
+    return normalized[SUPPORTED_FIELDS]
 
 
 def _to_text(value: object) -> str | None:
@@ -131,26 +119,16 @@ def _find_name_duplicate(conn: sqlite3.Connection, article: str, name: str, thre
 def import_catalog_from_excel(conn: sqlite3.Connection, excel_path: Path) -> ImportResult:
     init_db(conn)
     df = pd.read_excel(excel_path)
-    normalized, recognized = normalize_columns(df)
-
-    missing_required = [field for field in REQUIRED_IMPORT_FIELDS if field not in recognized]
-    if missing_required:
-        raise ImportTemplateError(
-            "В файле не найдены обязательные колонки: "
-            + ", ".join(missing_required)
-            + ". Используйте шаблон загрузки из интерфейса."
-        )
+    normalized = normalize_columns(df)
 
     created = 0
     updated = 0
-    skipped = 0
     duplicates: list[dict[str, Any]] = []
 
     for _, row in normalized.iterrows():
         article = _to_text(row.get("article"))
         name = _to_text(row.get("name"))
         if not article or not name:
-            skipped += 1
             continue
 
         exists = conn.execute("SELECT id FROM products WHERE article = ?", (article,)).fetchone()
@@ -208,4 +186,4 @@ def import_catalog_from_excel(conn: sqlite3.Connection, excel_path: Path) -> Imp
         created += 1
 
     conn.commit()
-    return ImportResult(imported=created + updated, created=created, updated=updated, skipped=skipped, duplicates=duplicates)
+    return ImportResult(imported=created + updated, created=created, updated=updated, duplicates=duplicates)
