@@ -1,51 +1,53 @@
-# PIM — Product Information Management
+# Минимальный тестовый проект: Ozon + 1C Excel
 
-Самостоятельное Streamlit-приложение для управления **единым каталогом товаров** для всех маркетплейсов.
+Проект нужен для первичной проверки структуры данных из двух источников перед разработкой PIM:
 
-## Функции
+1. Ozon Seller API (`ozon_test.py`)
+2. Excel-каталог из 1С (`import_1c_catalog.py`)
 
-- 📥 **Загрузка Excel** — импорт каталога товаров с гибкими названиями столбцов
-- 🔍 **Обогащение AI** — автоматическое заполнение габаритов (д, ш, в в см) и веса (кг) через GPT-4o
-- 📊 **Фильтрация** — по категории, бренду, наличию габаритов
-- 📥 **Экспорт в Excel** — выгрузка отфильтрованного каталога
-- 📄 **Лог обогащения** — история обработки каждого товара с источником данных
+## Структура
+
+```text
+project/
+  ozon_test.py
+  import_1c_catalog.py
+  db.py
+  requirements.txt
+  data/
+```
 
 ## Установка
 
 ```bash
 pip install -r requirements.txt
-streamlit run app.py
 ```
 
-## Структура Excel-файла
+## Запуск
 
-Обязательные колонки: `SKU`, `Название`
-
-Опциональные: `EAN`, `Бренд`, `Категория`, `Описание`, `Фото`, `Длина`, `Ширина`, `Высота`, `Вес`, `Себестоимость`
-
-## Структура проекта
-
-```
-pim/
-├── app.py              # Главное Streamlit-приложение
-├── pim_enrich.py       # Модуль обогащения (AI + fallback)
-├── requirements.txt    # Зависимости
-└── pim_storage.db      # SQLite БД (создаётся автоматически)
+```bash
+python ozon_test.py --client-id <OZON_CLIENT_ID> --api-key <OZON_API_KEY>
+python import_1c_catalog.py catalog.xlsx
 ```
 
-## Технологии
+Можно передавать ключи Ozon через переменные окружения:
 
-- Python 3.9+
-- Streamlit
-- SQLite (встроен в Python)
-- OpenAI GPT-4o (опционально, для AI-обогащения)
-- pandas + openpyxl
+```bash
+export OZON_CLIENT_ID=xxx
+export OZON_API_KEY=yyy
+python ozon_test.py
+```
 
-## Связь с другими сервисами
+## Что делает `ozon_test.py`
 
-Данный репозиторий является частью архитектуры, состоящей из:
+- Делает POST-запрос к `https://api-seller.ozon.ru/v2/product/list`
+- Сохраняет сырой ответ в `data/ozon_products_raw.json`
+- Печатает в консоль количество товаров, поля товара и пример одного товара
 
-| Сервис | Репозиторий | Назначение |
-|---------|-------------|------------|
-| **PIM** | `krutizmi-cpu/pim` | Единый каталог товаров |
-| **Unit Economics** | `krutizmi-cpu/unit` | Расчёт цен (Озон, М.Видео, Спортмастер...) |
+## Что делает `import_1c_catalog.py`
+
+- Читает Excel через pandas
+- Поддерживает поля: `article`, `name`, `brand`, `barcode`, `category_path`, `weight`, `length`, `width`, `height`, `description`
+- Создаёт недостающие категории по `category_path`
+- Сохраняет данные в SQLite `data/catalog.db` (таблицы `products`, `categories`)
+- Копирует исходный Excel в папку `data/`
+- Выводит количество товаров, количество категорий и 5 примеров товаров
