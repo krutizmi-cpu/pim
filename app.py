@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 from io import BytesIO
 from pathlib import Path
 
@@ -7,27 +8,13 @@ import pandas as pd
 import streamlit as st
 
 from db import get_connection, init_db
-from services.catalog_service import (
-    TEMPLATE_INSTRUCTIONS,
-    build_catalog_template_excel,
-    import_catalog_from_excel,
-    load_product_by_id,
-    load_products_df,
-    save_product,
-)
+from services.catalog_service import import_catalog_from_excel
+from services.duplicate_service import refresh_duplicates_for_product
 from services.enrichment_stub import LOG_PATH, enrich_products_stub
+from services.logistics_service import estimate_logistics
+from services.text_utils import normalize_name
 
 st.set_page_config(page_title="PIM — Каталог товаров", page_icon="📦", layout="wide")
-
-
-STATUS_LABELS = {
-    None: "Новый",
-    "new": "Новый",
-    "needs_enrichment": "Требует обогащения",
-    "partial": "Частично заполнен",
-    "enriched": "Готов",
-    "failed": "Ошибка",
-}
 
 
 def get_db_connection():
@@ -36,152 +23,247 @@ def get_db_connection():
     return conn
 
 
-def format_dimensions(row: pd.Series) -> str:
-    values = [row.get("length"), row.get("width"), row.get("height")]
+def format_dimensions(row: pd.Series, prefix: str = "") -> str:
+    cols = [f"{prefix}length", f"{prefix}width", f"{prefix}height"]
+    values = [row.get(c) for c in cols]
     if any(v is None or pd.isna(v) for v in values):
         return "—"
-    cleaned = []
-    for value in values:
-        if float(value).is_integer():
-            cleaned.append(str(int(value)))
-        else:
-            cleaned.append(str(round(float(value), 2)))
-    return " × ".join(cleaned) + " см"
+    return f"{values[0]} x {values[1]} x {values[2]}"
 
 
-def format_weight(value: float | None) -> str:
-    if value is None or pd.isna(value):
-        return "—"
-    return f"{round(float(value), 3)} кг"
-
-
-def status_to_label(value: str | None) -> str:
-    return STATUS_LABELS.get(value, value or "Новый")
+def load_products_df(conn) -> pd.DataFrame:
+    rows = conn.execute(
+        """
+        SELECT id, article, name, barcode, category, supplier_url,
+               weight, length, width, height,
+               package_length, package_width, package_height, gross_weight,
+               is_estimated_logistics, image_url,
+               enrichment_status, enrichment_comment,
+               duplicate_status, updated_at
+        FROM products
+        ORDER BY id DESC
+        """
+    ).fetchall()
+    return pd.DataFrame([dict(row) for row in rows]) if rows else pd.DataFrame()
 
 
 def show_product_card(product_id: int) -> None:
     st.title("🗂️ Карточка товара")
-    st.caption("Здесь можно вручную дозаполнить и скорректировать товар перед дальнейшим обогащением.")
-
     conn = get_db_connection()
-    product = load_product_by_id(conn, product_id)
+
+    product = conn.execute(
+        """
+        SELECT * FROM products WHERE id = ?
+        """,
+        (product_id,),
+    ).fetchone()
 
     if not product:
         st.error("Товар не найден.")
-        if st.button("← Вернуться в каталог"):
+        if st.button("Вернуться в каталог"):
             st.session_state["selected_product_id"] = None
             st.rerun()
-        conn.close()
         return
 
-    top1, top2, top3 = st.columns([2, 3, 2])
-    top1.metric("Артикул", product["article"] or "—")
-    top2.metric("Статус", status_to_label(product["enrichment_status"]))
+    top1, top2, top3 = st.columns(3)
+    top1.metric("Статус дубля", product["duplicate_status"] or "—")
+    top2.metric("Статус обогащения", product["enrichment_status"] or "—")
     top3.metric("Обновлён", product["updated_at"] or "—")
 
-    with st.form("product_form", clear_on_submit=False):
-        st.subheader("Основные данные")
+    with st.form("product_form"):
+        st.subheader(f"Товар ID: {product['id']}")
+
         c1, c2 = st.columns(2)
         with c1:
-            article = st.text_input("Артикул *", value=product["article"] or "")
-            barcode = st.text_input("Штрихкод / EAN", value=product["barcode"] or "")
+            article = st.text_input("Артикул", value=product["article"] or "")
+            name = st.text_input("Наименование", value=product["name"] or "")
+            barcode = st.text_input("Штрихкод", value=product["barcode"] or "")
+            category = st.text_input("Категория", value=product["category"] or "")
             supplier_url = st.text_input("Ссылка поставщика", value=product["supplier_url"] or "")
         with c2:
-            name = st.text_input("Наименование *", value=product["name"] or "")
             image_url = st.text_input("Ссылка на фото", value=product["image_url"] or "")
             enrichment_status = st.selectbox(
-                "Статус товара",
-                options=["new", "needs_enrichment", "partial", "enriched", "failed"],
-                index=["new", "needs_enrichment", "partial", "enriched", "failed"].index(
-                    product["enrichment_status"] or "new"
-                ),
-                format_func=status_to_label,
+                "Статус обогащения",
+                ["new", "needs_enrichment", "partial", "enriched", "failed"],
+                index=["new", "needs_enrichment", "partial", "enriched", "failed"].index(product["enrichment_status"])
+                if product["enrichment_status"] in ["new", "needs_enrichment", "partial", "enriched", "failed"]
+                else 0,
+            )
+            duplicate_status = st.selectbox(
+                "Статус дубля",
+                ["", "suspected", "checked", "not_duplicate"],
+                index=["", "suspected", "checked", "not_duplicate"].index(product["duplicate_status"] or "")
+                if (product["duplicate_status"] or "") in ["", "suspected", "checked", "not_duplicate"]
+                else 0,
+            )
+            is_estimated_logistics = st.checkbox(
+                "Логистика оценочная",
+                value=bool(product["is_estimated_logistics"] or 0),
             )
 
-        st.subheader("Габариты и вес")
+        st.markdown("### Товарные параметры")
         d1, d2, d3, d4 = st.columns(4)
-        weight = d1.number_input("Вес, кг", value=float(product["weight"] or 0.0), min_value=0.0, step=0.1)
-        length = d2.number_input("Длина, см", value=float(product["length"] or 0.0), min_value=0.0, step=0.1)
-        width = d3.number_input("Ширина, см", value=float(product["width"] or 0.0), min_value=0.0, step=0.1)
-        height = d4.number_input("Высота, см", value=float(product["height"] or 0.0), min_value=0.0, step=0.1)
+        with d1:
+            weight = st.number_input("Вес", value=float(product["weight"] or 0.0), min_value=0.0)
+        with d2:
+            length = st.number_input("Длина", value=float(product["length"] or 0.0), min_value=0.0)
+        with d3:
+            width = st.number_input("Ширина", value=float(product["width"] or 0.0), min_value=0.0)
+        with d4:
+            height = st.number_input("Высота", value=float(product["height"] or 0.0), min_value=0.0)
 
-        st.subheader("Контент")
-        description = st.text_area("Описание", value=product["description"] or "", height=160)
+        st.markdown("### Логистические параметры упаковки")
+        p1, p2, p3, p4 = st.columns(4)
+        with p1:
+            package_length = st.number_input("Длина упаковки", value=float(product["package_length"] or 0.0), min_value=0.0)
+        with p2:
+            package_width = st.number_input("Ширина упаковки", value=float(product["package_width"] or 0.0), min_value=0.0)
+        with p3:
+            package_height = st.number_input("Высота упаковки", value=float(product["package_height"] or 0.0), min_value=0.0)
+        with p4:
+            gross_weight = st.number_input("Вес брутто", value=float(product["gross_weight"] or 0.0), min_value=0.0)
+
+        description = st.text_area("Описание", value=product["description"] or "", height=120)
         enrichment_comment = st.text_area(
             "Комментарий по обогащению",
             value=product["enrichment_comment"] or "",
             height=100,
         )
 
-        b1, b2 = st.columns([1, 1])
-        save_clicked = b1.form_submit_button("💾 Сохранить", type="primary", use_container_width=True)
-        back_clicked = b2.form_submit_button("← Назад в каталог", use_container_width=True)
+        save_clicked = st.form_submit_button("Сохранить", type="primary")
 
-    if save_clicked:
-        errors = []
-        if not article.strip():
-            errors.append("Артикул обязателен.")
-        if not name.strip():
-            errors.append("Наименование обязательно.")
-
-        if errors:
-            for error in errors:
-                st.error(error)
-        else:
-            save_product(
-                conn,
-                product_id=product_id,
-                article=article.strip(),
-                name=name.strip(),
-                barcode=barcode.strip() or None,
-                weight=weight if weight > 0 else None,
-                length=length if length > 0 else None,
-                width=width if width > 0 else None,
-                height=height if height > 0 else None,
-                supplier_url=supplier_url.strip() or None,
-                image_url=image_url.strip() or None,
-                description=description.strip() or None,
-                enrichment_status=enrichment_status,
-                enrichment_comment=enrichment_comment.strip() or None,
+    cta1, cta2, cta3 = st.columns(3)
+    with cta1:
+        if st.button("Проверить дубли"):
+            conn.execute(
+                "UPDATE products SET normalized_name = ?, updated_at = ? WHERE id = ?",
+                (normalize_name(product["name"]), datetime.utcnow().isoformat(timespec="seconds"), product_id),
             )
-            st.success("Товар сохранён.")
+            conn.commit()
+            found = refresh_duplicates_for_product(conn, product_id)
+            if found:
+                st.warning(f"Найдено подозрений на дубли: {len(found)}")
+                st.dataframe(pd.DataFrame(found), use_container_width=True, hide_index=True)
+            else:
+                st.success("Подозрения на дубли не найдены")
+    with cta2:
+        if st.button("Оценить логистические параметры"):
+            result = estimate_logistics(conn, product_id)
+            if result:
+                st.success(
+                    f"Оценка выполнена по {result['matched_count']} похожим товарам: "
+                    f"{result['package_length']} x {result['package_width']} x {result['package_height']}, вес {result['gross_weight']}"
+                )
+                st.rerun()
+            else:
+                st.warning("Не удалось оценить логистику: нет похожих товаров с заполненной упаковкой")
+    with cta3:
+        if st.button("Вернуться в каталог"):
             st.session_state["selected_product_id"] = None
-            conn.close()
             st.rerun()
 
-    if back_clicked or st.button("← Вернуться без сохранения"):
-        st.session_state["selected_product_id"] = None
-        conn.close()
+    if save_clicked:
+        normalized_name = normalize_name(name.strip())
+        conn.execute(
+            """
+            UPDATE products
+            SET article = ?,
+                name = ?,
+                barcode = ?,
+                category = ?,
+                supplier_url = ?,
+                weight = ?,
+                length = ?,
+                width = ?,
+                height = ?,
+                package_length = ?,
+                package_width = ?,
+                package_height = ?,
+                gross_weight = ?,
+                is_estimated_logistics = ?,
+                image_url = ?,
+                description = ?,
+                enrichment_status = ?,
+                enrichment_comment = ?,
+                duplicate_status = ?,
+                normalized_name = ?,
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                article.strip(),
+                name.strip(),
+                barcode.strip() or None,
+                category.strip() or None,
+                supplier_url.strip() or None,
+                weight if weight > 0 else None,
+                length if length > 0 else None,
+                width if width > 0 else None,
+                height if height > 0 else None,
+                package_length if package_length > 0 else None,
+                package_width if package_width > 0 else None,
+                package_height if package_height > 0 else None,
+                gross_weight if gross_weight > 0 else None,
+                1 if is_estimated_logistics else 0,
+                image_url.strip() or None,
+                description.strip() or None,
+                enrichment_status or None,
+                enrichment_comment.strip() or None,
+                duplicate_status or None,
+                normalized_name,
+                datetime.utcnow().isoformat(timespec="seconds"),
+                product_id,
+            ),
+        )
+        conn.commit()
+        st.success("Товар сохранён")
         st.rerun()
 
-    conn.close()
+
+def show_duplicates(conn) -> None:
+    st.title("🔎 Подозрения на дубли")
+    rows = conn.execute(
+        """
+        SELECT
+            d.id,
+            p1.article AS article_1,
+            p1.name AS name_1,
+            p2.article AS article_2,
+            p2.name AS name_2,
+            ROUND(d.similarity_score * 100, 2) AS similarity_score,
+            d.reason,
+            d.created_at
+        FROM duplicate_candidates d
+        JOIN products p1 ON d.product_id_1 = p1.id
+        JOIN products p2 ON d.product_id_2 = p2.id
+        ORDER BY d.similarity_score DESC, d.created_at DESC
+        LIMIT 500
+        """
+    ).fetchall()
+
+    if not rows:
+        st.info("Подозрений на дубли пока нет.")
+        return
+
+    df = pd.DataFrame([dict(r) for r in rows])
+    st.dataframe(df, use_container_width=True, hide_index=True)
 
 
 def show_catalog() -> None:
     st.title("📦 Каталог товаров")
-    st.caption("База товаров хранится в SQLite и используется как основа для дальнейшего обогащения и наполнения карточек.")
+    st.caption("Базовый каталог, карточка, логистика и контроль дублей.")
 
     conn = get_db_connection()
 
-    with st.expander("📥 Загрузка каталога из Excel", expanded=True):
-        st.markdown("**Минимум для импорта:** `article` и `name`.")
-        st.caption("Остальные поля можно заполнить позже в карточке товара или через модуль обогащения.")
+    menu = st.sidebar.radio("Раздел", ["Каталог", "Подозрения на дубли"])
+    if menu == "Подозрения на дубли":
+        show_duplicates(conn)
+        conn.close()
+        return
 
-        template_bytes = build_catalog_template_excel()
-        st.download_button(
-            "⬇️ Скачать шаблон Excel",
-            data=template_bytes,
-            file_name="catalog_import_template.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=False,
-        )
-
-        with st.popover("Поля шаблона"):
-            st.markdown(TEMPLATE_INSTRUCTIONS)
-
-        uploaded_file = st.file_uploader("Excel файл каталога", type=["xlsx", "xls"], key="catalog_uploader")
-
-        if st.button("Загрузить каталог", type="primary", disabled=uploaded_file is None):
+    with st.expander("📥 Загрузить каталог из Excel", expanded=True):
+        uploaded_file = st.file_uploader("Excel файл каталога", type=["xlsx", "xls"])
+        if st.button("Загрузить каталог из Excel", type="primary", disabled=uploaded_file is None):
             if uploaded_file is None:
                 st.warning("Выберите файл для загрузки.")
             else:
@@ -192,132 +274,111 @@ def show_catalog() -> None:
 
                 result = import_catalog_from_excel(conn, excel_path)
                 st.success(
-                    f"Импорт завершён: обработано {result.imported}, новых {result.created}, обновлено {result.updated}, пропущено {result.skipped}."
+                    f"Импорт завершён: импортировано {result.imported}, новых {result.created}, обновлено {result.updated}."
                 )
                 if result.duplicates:
-                    st.warning("Найдены возможные дубли по похожему названию (>85%).")
-                    st.dataframe(pd.DataFrame(result.duplicates), use_container_width=True, hide_index=True)
-                if result.skipped_rows:
-                    st.info("Часть строк пропущена как служебные или пустые.")
-                    st.dataframe(pd.DataFrame(result.skipped_rows), use_container_width=True, hide_index=True)
+                    st.warning(f"Найдены возможные дубли: {len(result.duplicates)}")
                 st.rerun()
 
     products_df = load_products_df(conn)
-
     if products_df.empty:
-        st.info("Каталог пока пуст. Скачай шаблон Excel, заполни минимум article и name и загрузи файл.")
+        st.info("Товары не найдены. Загрузите каталог.")
         conn.close()
         return
 
-    products_df["dimensions"] = products_df.apply(format_dimensions, axis=1)
-    products_df["weight_display"] = products_df["weight"].apply(format_weight)
-    products_df["status_label"] = products_df["enrichment_status"].apply(status_to_label)
-
-    k1, k2, k3, k4 = st.columns(4)
-    k1.metric("Товаров в базе", len(products_df))
-    k2.metric("С фото", int(products_df["image_url"].fillna("").str.strip().ne("").sum()))
-    k3.metric("С весом", int(products_df["weight"].notna().sum()))
-    dims_mask = products_df[["length", "width", "height"]].notna().all(axis=1)
-    k4.metric("С габаритами", int(dims_mask.sum()))
-
-    st.subheader("Фильтры")
-    col1, col2 = st.columns(2)
+    col1, col2, col3 = st.columns(3)
     with col1:
-        article_q = st.text_input("Поиск по артикулу")
+        article_q = st.text_input("Поиск по article")
     with col2:
-        name_q = st.text_input("Поиск по наименованию")
+        name_q = st.text_input("Поиск по name")
+    with col3:
+        category_q = st.text_input("Фильтр по category")
 
     f1, f2, f3, f4 = st.columns(4)
     with f1:
-        has_dimensions = st.selectbox("Есть ли габариты", ["Все", "Да", "Нет"])
+        has_supplier = st.selectbox("Есть supplier_url", ["Все", "Да", "Нет"])
     with f2:
-        has_weight = st.selectbox("Есть ли вес", ["Все", "Да", "Нет"])
+        has_package = st.selectbox("Есть упаковка", ["Все", "Да", "Нет"])
     with f3:
-        has_photo = st.selectbox("Есть ли фото", ["Все", "Да", "Нет"])
+        has_duplicate = st.selectbox("Есть подозрение на дубль", ["Все", "Да", "Нет"])
     with f4:
-        status_filter = st.selectbox("Статус", ["Все", "Новый", "Требует обогащения", "Частично заполнен", "Готов", "Ошибка"])
+        has_photo = st.selectbox("Есть фото", ["Все", "Да", "Нет"])
 
     filtered = products_df.copy()
     if article_q:
         filtered = filtered[filtered["article"].fillna("").str.contains(article_q, case=False, na=False)]
     if name_q:
         filtered = filtered[filtered["name"].fillna("").str.contains(name_q, case=False, na=False)]
+    if category_q:
+        filtered = filtered[filtered["category"].fillna("").str.contains(category_q, case=False, na=False)]
 
-    has_all_dims = filtered[["length", "width", "height"]].notna().all(axis=1)
-    if has_dimensions == "Да":
-        filtered = filtered[has_all_dims]
-    elif has_dimensions == "Нет":
-        filtered = filtered[~has_all_dims]
+    package_ok = filtered[["package_length", "package_width", "package_height", "gross_weight"]].notna().all(axis=1)
+    if has_supplier == "Да":
+        filtered = filtered[filtered["supplier_url"].fillna("").str.strip() != ""]
+    elif has_supplier == "Нет":
+        filtered = filtered[filtered["supplier_url"].fillna("").str.strip() == ""]
 
-    if has_weight == "Да":
-        filtered = filtered[filtered["weight"].notna()]
-    elif has_weight == "Нет":
-        filtered = filtered[filtered["weight"].isna()]
+    if has_package == "Да":
+        filtered = filtered[package_ok]
+    elif has_package == "Нет":
+        filtered = filtered[~package_ok]
+
+    if has_duplicate == "Да":
+        filtered = filtered[filtered["duplicate_status"].fillna("").str.strip() != ""]
+    elif has_duplicate == "Нет":
+        filtered = filtered[filtered["duplicate_status"].fillna("").str.strip() == ""]
 
     if has_photo == "Да":
         filtered = filtered[filtered["image_url"].fillna("").str.strip() != ""]
     elif has_photo == "Нет":
         filtered = filtered[filtered["image_url"].fillna("").str.strip() == ""]
 
-    if status_filter != "Все":
-        filtered = filtered[filtered["status_label"] == status_filter]
+    view_df = filtered.copy()
+    view_df["dimensions"] = view_df.apply(format_dimensions, axis=1)
+    view_df["package_dimensions"] = view_df.apply(lambda r: format_dimensions(r, prefix="package_"), axis=1)
 
-    st.subheader("Текущий каталог")
-    catalog_view = filtered[[
-        "article",
-        "name",
-        "barcode",
-        "weight_display",
-        "dimensions",
-        "supplier_url",
-        "image_url",
-        "status_label",
-        "updated_at",
-    ]].rename(
-        columns={
-            "article": "Артикул",
-            "name": "Наименование",
-            "barcode": "Штрихкод",
-            "weight_display": "Вес",
-            "dimensions": "Габариты",
-            "supplier_url": "Ссылка поставщика",
-            "image_url": "Фото",
-            "status_label": "Статус",
-            "updated_at": "Обновлён",
-        }
-    )
-    st.dataframe(catalog_view, hide_index=True, use_container_width=True)
-
-    selector_df = filtered[["id", "article", "name", "status_label"]].copy()
-    selector_df["label"] = selector_df.apply(
-        lambda row: f"{row['article']} — {row['name']} [{row['status_label']}]",
-        axis=1,
-    )
-
-    selected_label = st.selectbox("Выбери товар для открытия карточки", selector_df["label"].tolist())
-    selected_id = int(selector_df.loc[selector_df["label"] == selected_label, "id"].iloc[0])
-
-    action1, action2 = st.columns([1, 2])
-    if action1.button("🗂️ Открыть карточку", type="primary", use_container_width=True):
-        st.session_state["selected_product_id"] = selected_id
-        conn.close()
-        st.rerun()
-
-    export_df = filtered.drop(columns=["weight_display", "status_label"], errors="ignore")
-    output = BytesIO()
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        export_df.to_excel(writer, index=False, sheet_name="catalog")
-    action2.download_button(
-        "⬇️ Скачать текущую выборку (Excel)",
-        data=output.getvalue(),
-        file_name="catalog_export.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    st.dataframe(
+        view_df[[
+            "id",
+            "article",
+            "name",
+            "category",
+            "barcode",
+            "weight",
+            "dimensions",
+            "package_dimensions",
+            "gross_weight",
+            "supplier_url",
+            "duplicate_status",
+            "enrichment_status",
+            "updated_at",
+        ]],
+        hide_index=True,
         use_container_width=True,
     )
 
-    if st.button("Обогатить данные", use_container_width=False):
+    select_options = {
+        f"{row['article']} — {row['name']}": int(row["id"]) for _, row in view_df.iterrows()
+    }
+    if select_options:
+        selected_label = st.selectbox("Открыть карточку товара", list(select_options.keys()))
+        if st.button("Открыть карточку выбранного товара"):
+            st.session_state["selected_product_id"] = select_options[selected_label]
+            st.rerun()
+
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        view_df.to_excel(writer, index=False)
+    st.download_button(
+        "Скачать текущую выборку (Excel)",
+        data=output.getvalue(),
+        file_name="catalog_export.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+    if st.button("Обогатить данные"):
         count = enrich_products_stub(conn)
-        st.info(f"Промежуточная заглушка выполнена. Товаров, требующих обогащения: {count}.")
+        st.info(f"Обработка выполнена. Товаров, требующих обогащения: {count}.")
         st.caption(f"Лог записан в: {LOG_PATH}")
 
     conn.close()
