@@ -1,3 +1,4 @@
+
 from __future__ import annotations
 
 from datetime import datetime
@@ -17,6 +18,20 @@ from services.text_utils import normalize_name
 st.set_page_config(page_title="PIM — Каталог товаров", page_icon="📦", layout="wide")
 
 
+STATUS_LABELS = {
+    "new": "Новый",
+    "needs_enrichment": "Требует обогащения",
+    "partial": "Частично заполнен",
+    "enriched": "Готов",
+    "failed": "Ошибка",
+    "suspected": "Подозрение на дубль",
+    "checked": "Проверено",
+    "not_duplicate": "Не дубль",
+    None: "—",
+    "": "—",
+}
+
+
 def get_db_connection():
     conn = get_connection()
     init_db(conn)
@@ -28,7 +43,11 @@ def format_dimensions(row: pd.Series, prefix: str = "") -> str:
     values = [row.get(c) for c in cols]
     if any(v is None or pd.isna(v) for v in values):
         return "—"
-    return f"{values[0]} x {values[1]} x {values[2]}"
+    return f"{values[0]} × {values[1]} × {values[2]}"
+
+
+def status_label(value: str | None) -> str:
+    return STATUS_LABELS.get(value, value or "—")
 
 
 def load_products_df(conn) -> pd.DataFrame:
@@ -47,6 +66,34 @@ def load_products_df(conn) -> pd.DataFrame:
     return pd.DataFrame([dict(row) for row in rows]) if rows else pd.DataFrame()
 
 
+def build_export_df(df: pd.DataFrame) -> pd.DataFrame:
+    export_df = df.copy()
+    if export_df.empty:
+        return export_df
+    export_df["dimensions"] = export_df.apply(format_dimensions, axis=1)
+    export_df["package_dimensions"] = export_df.apply(lambda r: format_dimensions(r, prefix="package_"), axis=1)
+    export_df["enrichment_status_label"] = export_df["enrichment_status"].map(status_label)
+    export_df["duplicate_status_label"] = export_df["duplicate_status"].map(status_label)
+    return export_df[
+        [
+            "id",
+            "article",
+            "name",
+            "category",
+            "barcode",
+            "weight",
+            "dimensions",
+            "package_dimensions",
+            "gross_weight",
+            "supplier_url",
+            "image_url",
+            "duplicate_status_label",
+            "enrichment_status_label",
+            "updated_at",
+        ]
+    ]
+
+
 def show_product_card(product_id: int) -> None:
     st.title("🗂️ Карточка товара")
     conn = get_db_connection()
@@ -63,11 +110,12 @@ def show_product_card(product_id: int) -> None:
         if st.button("Вернуться в каталог"):
             st.session_state["selected_product_id"] = None
             st.rerun()
+        conn.close()
         return
 
     top1, top2, top3 = st.columns(3)
-    top1.metric("Статус дубля", product["duplicate_status"] or "—")
-    top2.metric("Статус обогащения", product["enrichment_status"] or "—")
+    top1.metric("Статус дубля", status_label(product["duplicate_status"]))
+    top2.metric("Статус обогащения", status_label(product["enrichment_status"]))
     top3.metric("Обновлён", product["updated_at"] or "—")
 
     with st.form("product_form"):
@@ -85,6 +133,7 @@ def show_product_card(product_id: int) -> None:
             enrichment_status = st.selectbox(
                 "Статус обогащения",
                 ["new", "needs_enrichment", "partial", "enriched", "failed"],
+                format_func=status_label,
                 index=["new", "needs_enrichment", "partial", "enriched", "failed"].index(product["enrichment_status"])
                 if product["enrichment_status"] in ["new", "needs_enrichment", "partial", "enriched", "failed"]
                 else 0,
@@ -92,6 +141,7 @@ def show_product_card(product_id: int) -> None:
             duplicate_status = st.selectbox(
                 "Статус дубля",
                 ["", "suspected", "checked", "not_duplicate"],
+                format_func=status_label,
                 index=["", "suspected", "checked", "not_duplicate"].index(product["duplicate_status"] or "")
                 if (product["duplicate_status"] or "") in ["", "suspected", "checked", "not_duplicate"]
                 else 0,
@@ -152,7 +202,7 @@ def show_product_card(product_id: int) -> None:
             if result:
                 st.success(
                     f"Оценка выполнена по {result['matched_count']} похожим товарам: "
-                    f"{result['package_length']} x {result['package_width']} x {result['package_height']}, вес {result['gross_weight']}"
+                    f"{result['package_length']} × {result['package_width']} × {result['package_height']}, вес {result['gross_weight']}"
                 )
                 st.rerun()
             else:
@@ -219,6 +269,8 @@ def show_product_card(product_id: int) -> None:
         st.success("Товар сохранён")
         st.rerun()
 
+    conn.close()
+
 
 def show_duplicates(conn) -> None:
     st.title("🔎 Подозрения на дубли")
@@ -249,9 +301,70 @@ def show_duplicates(conn) -> None:
     st.dataframe(df, use_container_width=True, hide_index=True)
 
 
+def render_selection_table(filtered: pd.DataFrame) -> tuple[pd.DataFrame, list[int]]:
+    if filtered.empty:
+        return filtered, []
+
+    current_selection = set(st.session_state.get("selected_product_ids", []))
+    table_df = filtered.copy()
+    table_df["selected"] = table_df["id"].isin(current_selection)
+    table_df["dimensions"] = table_df.apply(format_dimensions, axis=1)
+    table_df["package_dimensions"] = table_df.apply(lambda r: format_dimensions(r, prefix="package_"), axis=1)
+    table_df["enrichment_status"] = table_df["enrichment_status"].map(status_label)
+    table_df["duplicate_status"] = table_df["duplicate_status"].map(status_label)
+
+    edited_df = st.data_editor(
+        table_df[
+            [
+                "selected",
+                "id",
+                "article",
+                "name",
+                "category",
+                "barcode",
+                "weight",
+                "dimensions",
+                "package_dimensions",
+                "gross_weight",
+                "supplier_url",
+                "duplicate_status",
+                "enrichment_status",
+                "updated_at",
+            ]
+        ],
+        hide_index=True,
+        use_container_width=True,
+        column_config={
+            "selected": st.column_config.CheckboxColumn("Выбрать", help="Отметьте товары для выгрузки"),
+            "supplier_url": st.column_config.TextColumn("supplier_url", width="medium"),
+            "name": st.column_config.TextColumn("name", width="large"),
+        },
+        disabled=[
+            "id",
+            "article",
+            "name",
+            "category",
+            "barcode",
+            "weight",
+            "dimensions",
+            "package_dimensions",
+            "gross_weight",
+            "supplier_url",
+            "duplicate_status",
+            "enrichment_status",
+            "updated_at",
+        ],
+        key="catalog_editor",
+    )
+
+    selected_ids = edited_df.loc[edited_df["selected"], "id"].astype(int).tolist()
+    st.session_state["selected_product_ids"] = selected_ids
+    return edited_df, selected_ids
+
+
 def show_catalog() -> None:
     st.title("📦 Каталог товаров")
-    st.caption("Базовый каталог, карточка, логистика и контроль дублей.")
+    st.caption("Базовый каталог, карточка, логистика, контроль дублей и выборка товаров для выгрузки.")
 
     conn = get_db_connection()
 
@@ -285,6 +398,12 @@ def show_catalog() -> None:
         st.info("Товары не найдены. Загрузите каталог.")
         conn.close()
         return
+
+    top1, top2, top3, top4 = st.columns(4)
+    top1.metric("Всего товаров", len(products_df))
+    top2.metric("С supplier_url", int(products_df["supplier_url"].fillna("").str.strip().ne("").sum()))
+    top3.metric("С подозрением на дубль", int(products_df["duplicate_status"].fillna("").str.strip().ne("").sum()))
+    top4.metric("Выбрано к выгрузке", len(st.session_state.get("selected_product_ids", [])))
 
     col1, col2, col3 = st.columns(3)
     with col1:
@@ -333,44 +452,47 @@ def show_catalog() -> None:
     elif has_photo == "Нет":
         filtered = filtered[filtered["image_url"].fillna("").str.strip() == ""]
 
-    view_df = filtered.copy()
-    view_df["dimensions"] = view_df.apply(format_dimensions, axis=1)
-    view_df["package_dimensions"] = view_df.apply(lambda r: format_dimensions(r, prefix="package_"), axis=1)
-
-    st.dataframe(
-        view_df[[
-            "id",
-            "article",
-            "name",
-            "category",
-            "barcode",
-            "weight",
-            "dimensions",
-            "package_dimensions",
-            "gross_weight",
-            "supplier_url",
-            "duplicate_status",
-            "enrichment_status",
-            "updated_at",
-        ]],
-        hide_index=True,
-        use_container_width=True,
-    )
-
-    select_options = {
-        f"{row['article']} — {row['name']}": int(row["id"]) for _, row in view_df.iterrows()
-    }
-    if select_options:
-        selected_label = st.selectbox("Открыть карточку товара", list(select_options.keys()))
-        if st.button("Открыть карточку выбранного товара"):
-            st.session_state["selected_product_id"] = select_options[selected_label]
+    toolbar1, toolbar2, toolbar3 = st.columns([1, 1, 2])
+    with toolbar1:
+        if st.button("Выбрать всё в текущем фильтре"):
+            st.session_state["selected_product_ids"] = filtered["id"].astype(int).tolist()
             st.rerun()
+    with toolbar2:
+        if st.button("Снять все галочки"):
+            st.session_state["selected_product_ids"] = []
+            st.rerun()
+    with toolbar3:
+        st.caption("Поставь галочки у нужных товаров — выгрузка будет только по выбранным позициям.")
+
+    edited_df, selected_ids = render_selection_table(filtered)
+
+    if selected_ids:
+        selected_df = products_df[products_df["id"].isin(selected_ids)].copy()
+    else:
+        selected_df = filtered.copy()
+
+    card_col1, card_col2 = st.columns([2, 3])
+    with card_col1:
+        select_options = {
+            f"{row['article']} — {row['name']}": int(row["id"]) for _, row in filtered.iterrows()
+        }
+        if select_options:
+            selected_label = st.selectbox("Открыть карточку товара", list(select_options.keys()))
+            if st.button("Открыть карточку выбранного товара"):
+                st.session_state["selected_product_id"] = select_options[selected_label]
+                st.rerun()
+    with card_col2:
+        if selected_ids:
+            st.success(f"Выбрано товаров для выгрузки: {len(selected_ids)}")
+        else:
+            st.info("Галочки не проставлены — если скачать сейчас, выгрузится текущая отфильтрованная выборка.")
 
     output = BytesIO()
+    export_df = build_export_df(selected_df)
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        view_df.to_excel(writer, index=False)
+        export_df.to_excel(writer, index=False, sheet_name="catalog_export")
     st.download_button(
-        "Скачать текущую выборку (Excel)",
+        "Скачать выбранные товары (Excel)" if selected_ids else "Скачать текущую выборку (Excel)",
         data=output.getvalue(),
         file_name="catalog_export.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -387,6 +509,8 @@ def show_catalog() -> None:
 if __name__ == "__main__":
     if "selected_product_id" not in st.session_state:
         st.session_state["selected_product_id"] = None
+    if "selected_product_ids" not in st.session_state:
+        st.session_state["selected_product_ids"] = []
 
     if st.session_state["selected_product_id"] is None:
         show_catalog()
