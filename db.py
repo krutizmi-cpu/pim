@@ -29,7 +29,7 @@ REQUIRED_PRODUCT_COLUMNS: dict[str, str] = {
     "normalized_name": "TEXT",
     "created_at": "TEXT DEFAULT CURRENT_TIMESTAMP",
     "updated_at": "TEXT",
-    # PIM intake / master extensions
+    # PIM master / intake extensions
     "supplier_name": "TEXT",
     "supplier_article": "TEXT",
     "internal_article": "TEXT",
@@ -37,6 +37,10 @@ REQUIRED_PRODUCT_COLUMNS: dict[str, str] = {
     "uom": "TEXT",
     "subcategory": "TEXT",
     "wheel_diameter_inch": "REAL",
+    "brand": "TEXT",
+    "model": "TEXT",
+    "base_category": "TEXT",
+    "tnved_code": "TEXT",
 }
 
 
@@ -49,7 +53,7 @@ def get_connection(db_path: Path = DB_PATH) -> sqlite3.Connection:
 
 def _table_columns(conn: sqlite3.Connection, table_name: str) -> set[str]:
     rows = conn.execute(f"PRAGMA table_info({table_name})").fetchall()
-    return {str(row['name']) for row in rows}
+    return {str(row["name"]) for row in rows}
 
 
 def _ensure_products_table(conn: sqlite3.Connection) -> None:
@@ -85,7 +89,11 @@ def _ensure_products_table(conn: sqlite3.Connection) -> None:
             barcode_source TEXT,
             uom TEXT,
             subcategory TEXT,
-            wheel_diameter_inch REAL
+            wheel_diameter_inch REAL,
+            brand TEXT,
+            model TEXT,
+            base_category TEXT,
+            tnved_code TEXT
         )
         """
     )
@@ -110,6 +118,7 @@ def _ensure_products_table(conn: sqlite3.Connection) -> None:
 
     conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_products_article_unique ON products(article)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_products_category ON products(category)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_products_base_category ON products(base_category)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_products_normalized_name ON products(normalized_name)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_products_barcode ON products(barcode)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_products_supplier_article ON products(supplier_article)")
@@ -189,6 +198,105 @@ def _ensure_category_defaults_table(conn: sqlite3.Connection) -> None:
     )
 
 
+def _ensure_attribute_tables(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS attribute_definitions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            code TEXT UNIQUE NOT NULL,
+            name TEXT NOT NULL,
+            data_type TEXT NOT NULL DEFAULT 'text',
+            scope TEXT NOT NULL DEFAULT 'master',
+            entity_type TEXT NOT NULL DEFAULT 'product',
+            is_required INTEGER DEFAULT 0,
+            is_multi_value INTEGER DEFAULT 0,
+            unit TEXT,
+            description TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_attr_defs_scope ON attribute_definitions(scope)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_attr_defs_entity_type ON attribute_definitions(entity_type)")
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS product_attribute_values (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            product_id INTEGER NOT NULL,
+            attribute_code TEXT NOT NULL,
+            value_text TEXT,
+            value_number REAL,
+            value_boolean INTEGER,
+            value_json TEXT,
+            locale TEXT,
+            channel_code TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT,
+            UNIQUE(product_id, attribute_code, COALESCE(channel_code, ''), COALESCE(locale, ''))
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_pav_product ON product_attribute_values(product_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_pav_attr ON product_attribute_values(attribute_code)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_pav_channel ON product_attribute_values(channel_code)")
+
+
+def _ensure_channel_tables(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS channel_profiles (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            channel_code TEXT UNIQUE NOT NULL,
+            channel_name TEXT NOT NULL,
+            is_active INTEGER DEFAULT 1,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT
+        )
+        """
+    )
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS channel_attribute_requirements (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            channel_code TEXT NOT NULL,
+            category_code TEXT,
+            attribute_code TEXT NOT NULL,
+            is_required INTEGER DEFAULT 0,
+            sort_order INTEGER DEFAULT 100,
+            notes TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT,
+            UNIQUE(channel_code, COALESCE(category_code, ''), attribute_code)
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_car_channel ON channel_attribute_requirements(channel_code)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_car_category ON channel_attribute_requirements(category_code)")
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS channel_mapping_rules (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            channel_code TEXT NOT NULL,
+            category_code TEXT,
+            target_field TEXT NOT NULL,
+            source_type TEXT NOT NULL DEFAULT 'attribute',
+            source_name TEXT NOT NULL,
+            transform_rule TEXT,
+            is_required INTEGER DEFAULT 0,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT,
+            UNIQUE(channel_code, COALESCE(category_code, ''), target_field)
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_cmr_channel ON channel_mapping_rules(channel_code)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_cmr_category ON channel_mapping_rules(category_code)")
+
+
 def _seed_category_defaults(conn: sqlite3.Connection) -> None:
     count = conn.execute("SELECT COUNT(*) AS cnt FROM category_defaults").fetchone()["cnt"]
     if count and int(count) > 0:
@@ -229,10 +337,61 @@ def _seed_category_defaults(conn: sqlite3.Connection) -> None:
     )
 
 
+def _seed_attribute_definitions(conn: sqlite3.Connection) -> None:
+    rows = [
+        ("brand", "Бренд", "text", "master", 0, 0, None, "Бренд товара"),
+        ("model", "Модель", "text", "master", 0, 0, None, "Модель товара"),
+        ("color", "Цвет", "text", "master", 0, 0, None, "Цвет"),
+        ("material", "Материал", "text", "master", 0, 0, None, "Материал"),
+        ("country_of_origin", "Страна производства", "text", "master", 0, 0, None, "Страна производства"),
+        ("wheel_diameter_inch", "Диаметр колеса", "number", "master", 0, 0, "inch", "Диаметр колеса в дюймах"),
+        ("frame_size", "Размер рамы", "text", "master", 0, 0, None, "Размер рамы"),
+        ("brake_type", "Тип тормоза", "text", "master", 0, 0, None, "Тип тормоза"),
+        ("age_group", "Возрастная группа", "text", "master", 0, 0, None, "Возрастная группа"),
+        ("gender", "Пол", "text", "master", 0, 0, None, "Пол"),
+        ("main_image", "Главное фото", "text", "master", 0, 0, None, "Главное фото"),
+        ("gallery_images", "Галерея фото", "json", "master", 0, 1, None, "Дополнительные фото"),
+    ]
+
+    for code, name, data_type, scope, is_required, is_multi_value, unit, description in rows:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO attribute_definitions
+            (code, name, data_type, scope, entity_type, is_required, is_multi_value, unit, description)
+            VALUES (?, ?, ?, ?, 'product', ?, ?, ?, ?)
+            """,
+            (code, name, data_type, scope, is_required, is_multi_value, unit, description),
+        )
+
+
+def _seed_channels(conn: sqlite3.Connection) -> None:
+    rows = [
+        ("detmir", "Детский Мир"),
+        ("ozon", "Ozon"),
+        ("wildberries", "Wildberries"),
+        ("sportmaster", "Спортмастер"),
+        ("mvideo", "М.Видео"),
+    ]
+    for channel_code, channel_name in rows:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO channel_profiles (channel_code, channel_name, is_active)
+            VALUES (?, ?, 1)
+            """,
+            (channel_code, channel_name),
+        )
+
+
 def init_db(conn: sqlite3.Connection) -> None:
     _ensure_products_table(conn)
     _ensure_duplicate_table(conn)
     _ensure_product_intake_table(conn)
     _ensure_category_defaults_table(conn)
+    _ensure_attribute_tables(conn)
+    _ensure_channel_tables(conn)
+
     _seed_category_defaults(conn)
+    _seed_attribute_definitions(conn)
+    _seed_channels(conn)
+
     conn.commit()
