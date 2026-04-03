@@ -29,7 +29,6 @@ REQUIRED_PRODUCT_COLUMNS: dict[str, str] = {
     "normalized_name": "TEXT",
     "created_at": "TEXT DEFAULT CURRENT_TIMESTAMP",
     "updated_at": "TEXT",
-    # PIM master / intake extensions
     "supplier_name": "TEXT",
     "supplier_article": "TEXT",
     "internal_article": "TEXT",
@@ -233,14 +232,24 @@ def _ensure_attribute_tables(conn: sqlite3.Connection) -> None:
             locale TEXT,
             channel_code TEXT,
             created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-            updated_at TEXT,
-            UNIQUE(product_id, attribute_code, COALESCE(channel_code, ''), COALESCE(locale, ''))
+            updated_at TEXT
         )
         """
     )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_pav_product ON product_attribute_values(product_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_pav_attr ON product_attribute_values(attribute_code)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_pav_channel ON product_attribute_values(channel_code)")
+    conn.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_pav_unique
+        ON product_attribute_values(
+            product_id,
+            attribute_code,
+            IFNULL(channel_code, ''),
+            IFNULL(locale, '')
+        )
+        """
+    )
 
 
 def _ensure_channel_tables(conn: sqlite3.Connection) -> None:
@@ -268,13 +277,22 @@ def _ensure_channel_tables(conn: sqlite3.Connection) -> None:
             sort_order INTEGER DEFAULT 100,
             notes TEXT,
             created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-            updated_at TEXT,
-            UNIQUE(channel_code, COALESCE(category_code, ''), attribute_code)
+            updated_at TEXT
         )
         """
     )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_car_channel ON channel_attribute_requirements(channel_code)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_car_category ON channel_attribute_requirements(category_code)")
+    conn.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_car_unique
+        ON channel_attribute_requirements(
+            channel_code,
+            IFNULL(category_code, ''),
+            attribute_code
+        )
+        """
+    )
 
     conn.execute(
         """
@@ -288,13 +306,22 @@ def _ensure_channel_tables(conn: sqlite3.Connection) -> None:
             transform_rule TEXT,
             is_required INTEGER DEFAULT 0,
             created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-            updated_at TEXT,
-            UNIQUE(channel_code, COALESCE(category_code, ''), target_field)
+            updated_at TEXT
         )
         """
     )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_cmr_channel ON channel_mapping_rules(channel_code)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_cmr_category ON channel_mapping_rules(category_code)")
+    conn.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_cmr_unique
+        ON channel_mapping_rules(
+            channel_code,
+            IFNULL(category_code, ''),
+            target_field
+        )
+        """
+    )
 
 
 def _seed_category_defaults(conn: sqlite3.Connection) -> None:
