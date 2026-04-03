@@ -144,8 +144,8 @@ def set_product_attribute_value(
         FROM product_attribute_values
         WHERE product_id = ?
           AND attribute_code = ?
-          AND COALESCE(channel_code, '') = COALESCE(?, '')
-          AND COALESCE(locale, '') = COALESCE(?, '')
+          AND IFNULL(channel_code, '') = IFNULL(?, '')
+          AND IFNULL(locale, '') = IFNULL(?, '')
         """,
         (product_id, attribute_code, channel_code, locale),
     ).fetchone()
@@ -271,8 +271,8 @@ def delete_product_attribute_value(
         DELETE FROM product_attribute_values
         WHERE product_id = ?
           AND attribute_code = ?
-          AND COALESCE(channel_code, '') = COALESCE(?, '')
-          AND COALESCE(locale, '') = COALESCE(?, '')
+          AND IFNULL(channel_code, '') = IFNULL(?, '')
+          AND IFNULL(locale, '') = IFNULL(?, '')
         """,
         (product_id, attribute_code, channel_code, locale),
     )
@@ -289,19 +289,40 @@ def upsert_channel_attribute_requirement(
     notes: str | None = None,
 ) -> None:
     now = _now()
-    conn.execute(
+
+    existing = conn.execute(
         """
-        INSERT INTO channel_attribute_requirements
-        (channel_code, category_code, attribute_code, is_required, sort_order, notes, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(channel_code, COALESCE(category_code, ''), attribute_code) DO UPDATE SET
-            is_required = excluded.is_required,
-            sort_order = excluded.sort_order,
-            notes = excluded.notes,
-            updated_at = excluded.updated_at
+        SELECT id
+        FROM channel_attribute_requirements
+        WHERE channel_code = ?
+          AND IFNULL(category_code, '') = IFNULL(?, '')
+          AND attribute_code = ?
         """,
-        (channel_code, category_code, attribute_code, int(is_required), int(sort_order), notes, now, now),
-    )
+        (channel_code, category_code, attribute_code),
+    ).fetchone()
+
+    if existing:
+        conn.execute(
+            """
+            UPDATE channel_attribute_requirements
+            SET is_required = ?,
+                sort_order = ?,
+                notes = ?,
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (int(is_required), int(sort_order), notes, now, existing["id"]),
+        )
+    else:
+        conn.execute(
+            """
+            INSERT INTO channel_attribute_requirements
+            (channel_code, category_code, attribute_code, is_required, sort_order, notes, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (channel_code, category_code, attribute_code, int(is_required), int(sort_order), notes, now, now),
+        )
+
     conn.commit()
 
 
@@ -350,30 +371,51 @@ def upsert_channel_mapping_rule(
     is_required: int = 0,
 ) -> None:
     now = _now()
-    conn.execute(
+
+    existing = conn.execute(
         """
-        INSERT INTO channel_mapping_rules
-        (channel_code, category_code, target_field, source_type, source_name, transform_rule, is_required, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(channel_code, COALESCE(category_code, ''), target_field) DO UPDATE SET
-            source_type = excluded.source_type,
-            source_name = excluded.source_name,
-            transform_rule = excluded.transform_rule,
-            is_required = excluded.is_required,
-            updated_at = excluded.updated_at
+        SELECT id
+        FROM channel_mapping_rules
+        WHERE channel_code = ?
+          AND IFNULL(category_code, '') = IFNULL(?, '')
+          AND target_field = ?
         """,
-        (
-            channel_code,
-            category_code,
-            target_field,
-            source_type,
-            source_name,
-            transform_rule,
-            int(is_required),
-            now,
-            now,
-        ),
-    )
+        (channel_code, category_code, target_field),
+    ).fetchone()
+
+    if existing:
+        conn.execute(
+            """
+            UPDATE channel_mapping_rules
+            SET source_type = ?,
+                source_name = ?,
+                transform_rule = ?,
+                is_required = ?,
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (source_type, source_name, transform_rule, int(is_required), now, existing["id"]),
+        )
+    else:
+        conn.execute(
+            """
+            INSERT INTO channel_mapping_rules
+            (channel_code, category_code, target_field, source_type, source_name, transform_rule, is_required, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                channel_code,
+                category_code,
+                target_field,
+                source_type,
+                source_name,
+                transform_rule,
+                int(is_required),
+                now,
+                now,
+            ),
+        )
+
     conn.commit()
 
 
