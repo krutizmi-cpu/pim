@@ -10,6 +10,26 @@ def _to_float(value):
         return None
 
 
+def _normalize_media_list(value):
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [str(v).strip() for v in value if str(v).strip()]
+    text = str(value).strip()
+    if not text:
+        return []
+    if text.startswith('[') and text.endswith(']'):
+        try:
+            import json
+            parsed = json.loads(text)
+            if isinstance(parsed, list):
+                return [str(v).strip() for v in parsed if str(v).strip()]
+        except Exception:
+            pass
+    parts = [x.strip() for x in text.replace(';', ',').split(',')]
+    return [p for p in parts if p]
+
+
 def apply_transform(value, transform_rule: str | None):
     if transform_rule in (None, ""):
         return value
@@ -43,5 +63,17 @@ def apply_transform(value, transform_rule: str | None):
         return rule.split(":", 1)[1] + ("" if value is None else str(value))
     if rule.startswith("suffix:"):
         return ("" if value is None else str(value)) + rule.split(":", 1)[1]
+
+    media = _normalize_media_list(value)
+    if rule == "first_image":
+        return media[0] if media else None
+    if rule == "join_images":
+        return ", ".join(media) if media else None
+    if rule.startswith("image_"):
+        try:
+            idx = int(rule.split("_", 1)[1]) - 1
+            return media[idx] if 0 <= idx < len(media) else None
+        except Exception:
+            return None
 
     return value

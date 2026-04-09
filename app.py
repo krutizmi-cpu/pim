@@ -675,7 +675,7 @@ def show_template_tab():
     defs = list_attribute_definitions(conn)
     source_options = [("column", c) for c in [
         "article", "name", "barcode", "brand", "description", "weight", "length", "width", "height",
-        "package_length", "package_width", "package_height", "gross_weight", "image_url", "category", "supplier_name", "supplier_article"
+        "package_length", "package_width", "package_height", "gross_weight", "image_url", "category", "supplier_name", "supplier_article", "media_gallery"
     ]] + [("attribute", d["code"]) for d in defs]
 
     if uploaded is not None:
@@ -705,7 +705,7 @@ def show_template_tab():
 
         st.markdown("### Ручная правка матчинга")
         manual_rows = []
-        transform_options = ["", "cm_to_mm", "mm_to_cm", "m_to_cm", "kg_to_g", "g_to_kg", "inch_to_cm", "lower", "upper", "strip"]
+        transform_options = ["", "cm_to_mm", "mm_to_cm", "m_to_cm", "kg_to_g", "g_to_kg", "inch_to_cm", "lower", "upper", "strip", "first_image", "join_images", "image_1", "image_2", "image_3", "image_4", "image_5"]
         for idx, match in enumerate(matches):
             c1, c2, c3, c4 = st.columns([2, 2, 2, 2])
             with c1:

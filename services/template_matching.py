@@ -132,6 +132,26 @@ def build_product_value_map(conn, product_id: int) -> dict[str, object]:
             value = row["value_text"]
         value_map[row["attribute_code"]] = value
 
+    media_rows = conn.execute(
+        """
+        SELECT value_text, value_json
+        FROM product_attribute_values
+        WHERE product_id = ?
+          AND attribute_code IN ('gallery_images', 'main_image')
+        ORDER BY id
+        """,
+        (int(product_id),),
+    ).fetchall()
+    media_values = []
+    for row in media_rows:
+        if row["value_json"]:
+            media_values.append(row["value_json"])
+        elif row["value_text"]:
+            media_values.append(row["value_text"])
+    if product.get("image_url"):
+        media_values.insert(0, product.get("image_url"))
+    value_map["media_gallery"] = media_values
+
     return value_map
 
 
