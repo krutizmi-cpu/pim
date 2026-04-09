@@ -21,7 +21,7 @@ from services.catalog_service import import_catalog_from_excel
 from services.duplicate_service import refresh_duplicates_for_product
 from services.source_tracking import get_field_sources, save_field_source
 from services.supplier_parser import fetch_supplier_page, extract_supplier_data, normalize_supplier_data
-from services.template_matching import auto_match_template_columns, fill_template_dataframe, dataframe_to_excel_bytes
+from services.template_matching import auto_match_template_columns, apply_saved_mapping_rules, fill_template_dataframe, dataframe_to_excel_bytes
 
 st.set_page_config(page_title="PIM", page_icon="📦", layout="wide")
 
@@ -608,8 +608,19 @@ def show_template_tab():
     st.subheader("Клиентский шаблон")
     conn = get_db()
 
+    t1, t2 = st.columns([1, 1])
+    with t1:
+        channel_code = st.text_input("Код клиента / канала", value="onlinetrade", key="template_channel_code")
+    with t2:
+        category_code = st.text_input("Категория шаблона", value="", key="template_category_code")
+
     uploaded = st.file_uploader("Загрузить Excel-шаблон клиента", type=["xlsx", "xls"], key="client_template")
     product_df = load_products(conn, limit=1000)
+    defs = list_attribute_definitions(conn)
+    source_options = [("column", c) for c in [
+        "article", "name", "barcode", "brand", "description", "weight", "length", "width", "height",
+        "package_length", "package_width", "package_height", "gross_weight", "image_url", "category", "supplier_name", "supplier_article"
+    ]] + [("attribute", d["code"]) for d in defs]
 
     if uploaded is not None:
         template_df = pd.read_excel(uploaded)
@@ -617,11 +628,56 @@ def show_template_tab():
         st.dataframe(pd.DataFrame({"template_column": list(template_df.columns)}), use_container_width=True, hide_index=True)
 
         matches = auto_match_template_columns(conn, list(template_df.columns))
+        matches = apply_saved_mapping_rules(conn, matches, channel_code=channel_code, category_code=category_code or None)
         match_df = pd.DataFrame(matches)
         st.markdown("### Автоматический матчинг")
         st.dataframe(match_df, use_container_width=True, hide_index=True)
 
-        unmatched = match_df[match_df["status"] == "unmatched"] if not match_df.empty else pd.DataFrame()
+        st.markdown("### Ручная правка матчинга")
+        manual_rows = []
+        for idx, match in enumerate(matches):
+            c1, c2, c3 = st.columns([2, 2, 2])
+            with c1:
+                st.text_input("Колонка", value=match["template_column"], disabled=True, key=f"tmpl_col_{idx}")
+            with c2:
+                source_type = st.selectbox(
+                    "Тип источника",
+                    options=["attribute", "column", "skip"],
+                    index=( ["attribute", "column", "skip"].index(match["source_type"]) if match["source_type"] in ["attribute", "column"] else 2 ),
+                    key=f"tmpl_type_{idx}",
+                )
+            with c3:
+                allowed_names = [name for stype, name in source_options if stype == source_type] if source_type != "skip" else [""]
+                current_name = match["source_name"] if match["source_name"] in allowed_names else (allowed_names[0] if allowed_names else "")
+                source_name = st.selectbox("Источник", options=allowed_names, index=(allowed_names.index(current_name) if current_name in allowed_names else 0), key=f"tmpl_name_{idx}") if allowed_names else st.text_input("Источник", value="", key=f"tmpl_name_{idx}")
+            manual_rows.append({
+                "template_column": match["template_column"],
+                "status": "matched" if source_type != "skip" else "unmatched",
+                "source_type": None if source_type == "skip" else source_type,
+                "source_name": None if source_type == "skip" else source_name,
+                "matched_by": "manual" if source_type != "skip" else None,
+            })
+
+        if st.button("Сохранить mapping rules", type="primary"):
+            saved = 0
+            for row in manual_rows:
+                if row["status"] != "matched":
+                    continue
+                upsert_channel_mapping_rule(
+                    conn=conn,
+                    channel_code=channel_code,
+                    category_code=category_code or None,
+                    target_field=row["template_column"],
+                    source_type=row["source_type"],
+                    source_name=row["source_name"],
+                    transform_rule=None,
+                    is_required=0,
+                )
+                saved += 1
+            st.success(f"Сохранено mapping rules: {saved}")
+
+        manual_df = pd.DataFrame(manual_rows)
+        unmatched = manual_df[manual_df["status"] == "unmatched"] if not manual_df.empty else pd.DataFrame()
         if not unmatched.empty:
             st.warning(f"Не сматчено колонок: {len(unmatched)}")
             st.dataframe(unmatched, use_container_width=True, hide_index=True)
@@ -634,12 +690,12 @@ def show_template_tab():
             )
 
             if selected_ids:
-                filled_df = fill_template_dataframe(conn, template_df, selected_ids, matches)
+                filled_df = fill_template_dataframe(conn, template_df, selected_ids, manual_rows)
                 st.markdown("### Предпросмотр заполнения")
                 st.dataframe(filled_df, use_container_width=True, hide_index=True)
 
                 gap_rows = []
-                for _, row in match_df.iterrows():
+                for _, row in manual_df.iterrows():
                     if row["status"] != "matched":
                         gap_rows.append({"template_column": row["template_column"], "reason": "Нет матчинга"})
                         continue
@@ -653,7 +709,7 @@ def show_template_tab():
                 st.download_button(
                     "Скачать заполненный шаблон",
                     data=dataframe_to_excel_bytes(filled_df),
-                    file_name="filled_client_template.xlsx",
+                    file_name=f"filled_{channel_code or 'client'}_template.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 )
 

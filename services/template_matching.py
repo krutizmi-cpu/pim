@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from services.attribute_service import list_attribute_definitions
+from services.attribute_service import list_attribute_definitions, list_channel_mapping_rules
 
 
 BASE_PRODUCT_FIELD_ALIASES = {
@@ -74,6 +74,30 @@ def auto_match_template_columns(conn, columns: list[str]) -> list[dict]:
             )
 
     return matches
+
+
+def apply_saved_mapping_rules(conn, matches: list[dict], channel_code: str, category_code: str | None = None) -> list[dict]:
+    rules = list_channel_mapping_rules(conn, channel_code=channel_code, category_code=category_code)
+    if not rules:
+        return matches
+
+    rule_map = {r["target_field"]: r for r in rules}
+    updated = []
+    for match in matches:
+        rule = rule_map.get(match["template_column"])
+        if rule:
+            updated.append(
+                {
+                    "template_column": match["template_column"],
+                    "status": "matched",
+                    "source_type": rule["source_type"],
+                    "source_name": rule["source_name"],
+                    "matched_by": "saved_rule",
+                }
+            )
+        else:
+            updated.append(match)
+    return updated
 
 
 def build_product_value_map(conn, product_id: int) -> dict[str, object]:
