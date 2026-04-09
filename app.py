@@ -23,6 +23,7 @@ from services.source_tracking import get_field_sources, save_field_source, get_l
 from services.source_priority import can_overwrite_field
 from services.supplier_parser import fetch_supplier_page, extract_supplier_data, normalize_supplier_data
 from services.template_matching import auto_match_template_columns, apply_saved_mapping_rules, fill_template_dataframe, apply_client_validated_values, dataframe_to_excel_bytes
+from services.template_profiles import save_template_profile, list_template_profiles, get_template_profile_columns
 
 st.set_page_config(page_title="PIM", page_icon="📦", layout="wide")
 
@@ -657,6 +658,18 @@ def show_template_tab():
     with t2:
         category_code = st.text_input("Категория шаблона", value="", key="template_category_code")
 
+    p1, p2 = st.columns([1, 1])
+    with p1:
+        profile_name = st.text_input("Имя профиля шаблона", value=f"{channel_code}_default")
+    with p2:
+        existing_profiles = list_template_profiles(conn, channel_code=channel_code or None)
+        profile_options = [None] + [p["id"] for p in existing_profiles]
+        selected_profile_id = st.selectbox(
+            "Загрузить сохранённый профиль",
+            options=profile_options,
+            format_func=lambda x: "-- нет --" if x is None else next((f"{p['profile_name']} (#{p['id']})" for p in existing_profiles if p['id'] == x), str(x)),
+        )
+
     uploaded = st.file_uploader("Загрузить Excel-шаблон клиента", type=["xlsx", "xls"], key="client_template")
     product_df = load_products(conn, limit=1000)
     defs = list_attribute_definitions(conn)
@@ -672,6 +685,19 @@ def show_template_tab():
 
         matches = auto_match_template_columns(conn, list(template_df.columns))
         matches = apply_saved_mapping_rules(conn, matches, channel_code=channel_code, category_code=category_code or None)
+        if selected_profile_id:
+            profile_columns = get_template_profile_columns(conn, int(selected_profile_id))
+            profile_map = {c["template_column"]: c for c in profile_columns}
+            matches = [
+                {
+                    "template_column": m["template_column"],
+                    "status": "matched" if profile_map.get(m["template_column"], {}).get("source_name") else m["status"],
+                    "source_type": profile_map.get(m["template_column"], {}).get("source_type", m["source_type"]),
+                    "source_name": profile_map.get(m["template_column"], {}).get("source_name", m["source_name"]),
+                    "matched_by": "template_profile" if profile_map.get(m["template_column"]) else m["matched_by"],
+                }
+                for m in matches
+            ]
         match_df = pd.DataFrame(matches)
         st.markdown("### Автоматический матчинг")
         st.dataframe(match_df, use_container_width=True, hide_index=True)
@@ -701,23 +727,36 @@ def show_template_tab():
                 "matched_by": "manual" if source_type != "skip" else None,
             })
 
-        if st.button("Сохранить mapping rules", type="primary"):
-            saved = 0
-            for row in manual_rows:
-                if row["status"] != "matched":
-                    continue
-                upsert_channel_mapping_rule(
+        s1, s2 = st.columns(2)
+        with s1:
+            if st.button("Сохранить mapping rules", type="primary"):
+                saved = 0
+                for row in manual_rows:
+                    if row["status"] != "matched":
+                        continue
+                    upsert_channel_mapping_rule(
+                        conn=conn,
+                        channel_code=channel_code,
+                        category_code=category_code or None,
+                        target_field=row["template_column"],
+                        source_type=row["source_type"],
+                        source_name=row["source_name"],
+                        transform_rule=None,
+                        is_required=0,
+                    )
+                    saved += 1
+                st.success(f"Сохранено mapping rules: {saved}")
+        with s2:
+            if st.button("Сохранить профиль шаблона"):
+                profile_id = save_template_profile(
                     conn=conn,
+                    profile_name=profile_name,
                     channel_code=channel_code,
                     category_code=category_code or None,
-                    target_field=row["template_column"],
-                    source_type=row["source_type"],
-                    source_name=row["source_name"],
-                    transform_rule=None,
-                    is_required=0,
+                    file_name=getattr(uploaded, 'name', None),
+                    columns=manual_rows,
                 )
-                saved += 1
-            st.success(f"Сохранено mapping rules: {saved}")
+                st.success(f"Профиль шаблона сохранён: #{profile_id}")
 
         manual_df = pd.DataFrame(manual_rows)
         unmatched = manual_df[manual_df["status"] == "unmatched"] if not manual_df.empty else pd.DataFrame()

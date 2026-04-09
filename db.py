@@ -281,6 +281,40 @@ def _ensure_product_data_sources_table(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_pds_field_name ON product_data_sources(field_name)")
 
 
+def _ensure_template_profile_tables(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS template_profiles (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            profile_name TEXT NOT NULL,
+            channel_code TEXT NOT NULL,
+            category_code TEXT,
+            file_name TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_tp_channel_code ON template_profiles(channel_code)")
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS template_profile_columns (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            profile_id INTEGER NOT NULL,
+            template_column TEXT NOT NULL,
+            source_type TEXT,
+            source_name TEXT,
+            matched_by TEXT,
+            sort_order INTEGER DEFAULT 100,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_tpc_profile_id ON template_profile_columns(profile_id)")
+
+
 def _ensure_channel_tables(conn: sqlite3.Connection) -> None:
     conn.execute(
         """
@@ -445,6 +479,7 @@ def init_db(conn: sqlite3.Connection) -> None:
     _ensure_category_defaults_table(conn)
     _ensure_attribute_tables(conn)
     _ensure_product_data_sources_table(conn)
+    _ensure_template_profile_tables(conn)
     _ensure_channel_tables(conn)
 
     _seed_category_defaults(conn)
