@@ -19,7 +19,7 @@ from services.attribute_service import (
 )
 from services.catalog_service import import_catalog_from_excel
 from services.duplicate_service import refresh_duplicates_for_product
-from services.source_tracking import get_field_sources, save_field_source
+from services.source_tracking import get_field_sources, save_field_source, get_latest_field_source, field_is_manual
 from services.supplier_parser import fetch_supplier_page, extract_supplier_data, normalize_supplier_data
 from services.template_matching import auto_match_template_columns, apply_saved_mapping_rules, fill_template_dataframe, dataframe_to_excel_bytes
 
@@ -168,6 +168,25 @@ def save_product(conn, product_id: int, payload: dict):
             product_id,
         ),
     )
+    tracked_fields = [
+        "article", "internal_article", "supplier_article", "name", "brand", "supplier_name", "barcode",
+        "category", "base_category", "subcategory", "wheel_diameter_inch", "supplier_url", "uom",
+        "weight", "length", "width", "height", "package_length", "package_width", "package_height",
+        "gross_weight", "image_url", "description", "tnved_code"
+    ]
+    for field_name in tracked_fields:
+        value = payload.get(field_name)
+        if value not in (None, ""):
+            save_field_source(
+                conn=conn,
+                product_id=product_id,
+                field_name=field_name,
+                source_type="manual",
+                source_value_raw=value,
+                source_url=None,
+                confidence=1.0,
+                is_manual=True,
+            )
     conn.commit()
 
 
@@ -299,6 +318,7 @@ def enrich_product_from_supplier(conn, product_id: int, force: bool = False) -> 
         parsed = normalize_supplier_data(raw_data)
 
         updates = {}
+        skipped_manual_fields = []
         fields = ["description", "image_url", "weight", "length", "width", "height", "package_length", "package_width", "package_height", "gross_weight"]
         for field in fields:
             source_field = field
@@ -307,6 +327,9 @@ def enrich_product_from_supplier(conn, product_id: int, force: bool = False) -> 
             new_value = parsed.get(source_field)
             old_value = product[field] if field in product.keys() else None
             if new_value is None:
+                continue
+            if field_is_manual(conn, product_id, field) and not force:
+                skipped_manual_fields.append(field)
                 continue
             if old_value not in (None, "", 0, 0.0) and not force:
                 continue
@@ -382,12 +405,14 @@ def enrich_product_from_supplier(conn, product_id: int, force: bool = False) -> 
             )
 
         conn.commit()
+        skipped_msg = f", пропущено ручных полей: {len(skipped_manual_fields)}" if skipped_manual_fields else ""
         return {
             "ok": True,
-            "message": f"Обогащение завершено, обновлено полей: {len(updates)}, атрибутов сохранено: {attributes_saved}",
+            "message": f"Обогащение завершено, обновлено полей: {len(updates)}, атрибутов сохранено: {attributes_saved}{skipped_msg}",
             "updates": updates,
             "attributes": parsed.get("attributes", {}),
             "image_urls": parsed.get("image_urls", []),
+            "skipped_manual_fields": skipped_manual_fields,
         }
     except Exception as e:
         conn.execute(
@@ -525,7 +550,21 @@ def show_product_tab():
             st.success("Сохранено")
             st.rerun()
 
-    st.markdown("### Источники данных")
+    st.markdown("### Источники ключевых полей")
+    key_fields = ["name", "brand", "description", "weight", "length", "width", "height", "package_length", "package_width", "package_height", "gross_weight", "image_url"]
+    source_summary = []
+    for field_name in key_fields:
+        src = get_latest_field_source(conn, int(product_id), field_name)
+        source_summary.append({
+            "field_name": field_name,
+            "source_type": src.get("source_type") if src else None,
+            "is_manual": bool(src.get("is_manual")) if src else False,
+            "confidence": src.get("confidence") if src else None,
+            "created_at": src.get("created_at") if src else None,
+        })
+    st.dataframe(pd.DataFrame(source_summary), use_container_width=True, hide_index=True)
+
+    st.markdown("### Все источники данных")
     sources = get_field_sources(conn, int(product_id))
     if sources:
         st.dataframe(pd.DataFrame(sources), use_container_width=True, hide_index=True)

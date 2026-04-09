@@ -272,6 +272,7 @@ def _ensure_product_data_sources_table(conn: sqlite3.Connection) -> None:
             source_value_raw TEXT,
             source_url TEXT,
             confidence REAL,
+            is_manual INTEGER DEFAULT 0,
             created_at TEXT DEFAULT CURRENT_TIMESTAMP
         )
         """
