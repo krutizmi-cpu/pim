@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import pandas as pd
 import sqlite3
@@ -156,6 +157,7 @@ class ImportResult:
     created: int
     updated: int
     duplicates: list[dict[str, Any]]
+    batch_id: str
 
 
 def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -299,6 +301,7 @@ def import_catalog_from_excel(conn: sqlite3.Connection, excel_path: Path) -> Imp
     created = 0
     updated = 0
     duplicates: list[dict[str, Any]] = []
+    batch_id = uuid4().hex
 
     for _, row in normalized.iterrows():
         article = _to_text(row.get("article"))
@@ -352,7 +355,8 @@ def import_catalog_from_excel(conn: sqlite3.Connection, excel_path: Path) -> Imp
                     wheel_diameter_inch = ?,
                     enrichment_status = ?,
                     enrichment_comment = ?,
-                    updated_at = ?
+                    updated_at = ?,
+                    import_batch_id = ?
                 WHERE article = ?
                 """,
                 (
@@ -379,6 +383,7 @@ def import_catalog_from_excel(conn: sqlite3.Connection, excel_path: Path) -> Imp
                     product_data["enrichment_status"],
                     product_data["enrichment_comment"],
                     now,
+                    batch_id,
                     article_key,
                 ),
             )
@@ -413,9 +418,10 @@ def import_catalog_from_excel(conn: sqlite3.Connection, excel_path: Path) -> Imp
                     subcategory,
                     wheel_diameter_inch,
                     created_at,
-                    updated_at
+                    updated_at,
+                    import_batch_id
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     product_data["article"],
@@ -444,6 +450,7 @@ def import_catalog_from_excel(conn: sqlite3.Connection, excel_path: Path) -> Imp
                     product_data["wheel_diameter_inch"],
                     now,
                     now,
+                    batch_id,
                 ),
             )
             product_id = int(cur.lastrowid)
@@ -466,4 +473,5 @@ def import_catalog_from_excel(conn: sqlite3.Connection, excel_path: Path) -> Imp
         created=created,
         updated=updated,
         duplicates=unique_duplicates,
+        batch_id=batch_id,
     )

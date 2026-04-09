@@ -19,6 +19,8 @@ from services.attribute_service import (
 )
 from services.catalog_service import import_catalog_from_excel
 from services.duplicate_service import refresh_duplicates_for_product
+from services.source_tracking import get_field_sources, save_field_source
+from services.supplier_parser import fetch_supplier_page, extract_supplier_data, normalize_supplier_data
 
 st.set_page_config(page_title="PIM", page_icon="📦", layout="wide")
 
@@ -35,6 +37,7 @@ def load_products(
     category: str = "",
     supplier: str = "",
     limit: int = 200,
+    import_batch_id: str = "",
 ) -> pd.DataFrame:
     where = []
     params = []
@@ -52,6 +55,10 @@ def load_products(
         where.append("supplier_name = ?")
         params.append(supplier)
 
+    if import_batch_id:
+        where.append("import_batch_id = ?")
+        params.append(import_batch_id)
+
     sql = """
         SELECT
             id,
@@ -61,6 +68,7 @@ def load_products(
             name,
             brand,
             supplier_name,
+            supplier_url,
             barcode,
             category,
             base_category,
@@ -76,7 +84,9 @@ def load_products(
             gross_weight,
             enrichment_status,
             enrichment_comment,
+            supplier_parse_status,
             duplicate_status,
+            import_batch_id,
             updated_at
         FROM products
     """
@@ -179,10 +189,18 @@ def show_import_tab():
         if st.button("Импортировать", type="primary"):
             conn = get_db()
             result = import_catalog_from_excel(conn, temp_path)
+            batch_df = load_products(conn, limit=1000, import_batch_id=result.batch_id)
             conn.close()
+            st.session_state["last_import_batch_id"] = result.batch_id
             st.success(
                 f"Импорт завершён. Всего: {result.imported}, создано: {result.created}, обновлено: {result.updated}, дублей: {len(result.duplicates)}"
             )
+
+            st.markdown("### Последняя загруженная партия")
+            if not batch_df.empty:
+                st.dataframe(batch_df, use_container_width=True, hide_index=True)
+            else:
+                st.info("В текущей партии нет отображаемых записей")
 
             if result.duplicates:
                 st.dataframe(pd.DataFrame(result.duplicates), use_container_width=True)
@@ -191,7 +209,7 @@ def show_import_tab():
 def show_catalog_tab():
     conn = get_db()
 
-    c1, c2, c3, c4 = st.columns([2, 1, 1, 1])
+    c1, c2, c3, c4, c5 = st.columns([2, 1, 1, 1, 1])
     with c1:
         search = st.text_input("Поиск", placeholder="Название / артикул / штрихкод")
     with c2:
@@ -199,14 +217,20 @@ def show_catalog_tab():
     with c3:
         supplier = st.text_input("Поставщик")
     with c4:
-        limit = st.number_input("Лимит", min_value=50, max_value=1000, value=200, step=50)
+        limit = st.number_input("Показать записей", min_value=50, max_value=1000, value=200, step=50)
+    with c5:
+        only_last_batch = st.checkbox("Только последняя загрузка", value=False)
 
-    df = load_products(conn, search=search, category=category, supplier=supplier, limit=int(limit))
+    batch_id = st.session_state.get("last_import_batch_id") if only_last_batch else ""
+    df = load_products(conn, search=search, category=category, supplier=supplier, limit=int(limit), import_batch_id=batch_id or "")
 
     if df.empty:
         st.info("Нет товаров")
         conn.close()
         return
+
+    if batch_id:
+        st.caption("Показана только последняя загруженная партия")
 
     st.download_button(
         "Скачать выборку Excel",
@@ -218,14 +242,27 @@ def show_catalog_tab():
     ids = df["id"].tolist()
     selected_id = st.selectbox("Открыть карточку товара", ids, format_func=lambda x: f"ID {x}")
 
-    if st.button("Обновить дубли по текущей выборке"):
-        total = 0
-        progress = st.progress(0)
-        for i, pid in enumerate(ids, start=1):
-            refresh_duplicates_for_product(conn, int(pid))
-            total += 1
-            progress.progress(i / len(ids))
-        st.success(f"Проверка дублей завершена: {total} товаров")
+    b1, b2 = st.columns(2)
+    with b1:
+        if st.button("Обновить дубли по текущей выборке"):
+            total = 0
+            progress = st.progress(0)
+            for i, pid in enumerate(ids, start=1):
+                refresh_duplicates_for_product(conn, int(pid))
+                total += 1
+                progress.progress(i / len(ids))
+            st.success(f"Проверка дублей завершена: {total} товаров")
+    with b2:
+        if st.button("Обогатить поставщика по текущей выборке"):
+            total = 0
+            progress = st.progress(0)
+            for i, pid in enumerate(ids, start=1):
+                product_row = get_product(conn, int(pid))
+                if product_row and product_row["supplier_url"]:
+                    enrich_product_from_supplier(conn, int(pid), force=False)
+                    total += 1
+                progress.progress(i / len(ids))
+            st.success(f"Обогащение поставщика завершено: обработано {total} товаров")
 
     st.dataframe(df, use_container_width=True, hide_index=True)
 
@@ -233,6 +270,93 @@ def show_catalog_tab():
         st.session_state["selected_product_id"] = int(selected_id)
 
     conn.close()
+
+
+def enrich_product_from_supplier(conn, product_id: int, force: bool = False) -> dict:
+    product = get_product(conn, product_id)
+    if not product:
+        return {"ok": False, "message": "Товар не найден"}
+
+    supplier_url = (product["supplier_url"] or "").strip() if product["supplier_url"] else ""
+    if not supplier_url:
+        return {"ok": False, "message": "У товара нет supplier_url"}
+
+    try:
+        html = fetch_supplier_page(supplier_url)
+        raw_data = extract_supplier_data(html, supplier_url)
+        parsed = normalize_supplier_data(raw_data)
+
+        updates = {}
+        fields = ["description", "image_url", "weight", "length", "width", "height"]
+        for field in fields:
+            new_value = parsed.get(field)
+            old_value = product[field] if field in product.keys() else None
+            if new_value is None:
+                continue
+            if old_value not in (None, "", 0, 0.0) and not force:
+                continue
+            updates[field] = new_value
+
+        if updates:
+            set_clause = ", ".join([f"{k} = ?" for k in updates.keys()])
+            params = list(updates.values()) + ["success", None, product_id]
+            conn.execute(
+                f"""
+                UPDATE products
+                SET {set_clause},
+                    supplier_parse_status = ?,
+                    supplier_parse_comment = ?,
+                    supplier_last_parsed_at = CURRENT_TIMESTAMP,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                params,
+            )
+            for field_name, value in updates.items():
+                save_field_source(
+                    conn=conn,
+                    product_id=product_id,
+                    field_name=field_name,
+                    source_type="supplier_page",
+                    source_value_raw=value,
+                    source_url=supplier_url,
+                    confidence=0.7,
+                )
+        else:
+            conn.execute(
+                """
+                UPDATE products
+                SET supplier_parse_status = ?,
+                    supplier_parse_comment = ?,
+                    supplier_last_parsed_at = CURRENT_TIMESTAMP,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                ("success", "Новых данных для записи не найдено", product_id),
+            )
+
+        conn.commit()
+        return {
+            "ok": True,
+            "message": f"Обогащение завершено, обновлено полей: {len(updates)}",
+            "updates": updates,
+            "attributes": parsed.get("attributes", {}),
+            "image_urls": parsed.get("image_urls", []),
+        }
+    except Exception as e:
+        conn.execute(
+            """
+            UPDATE products
+            SET supplier_parse_status = ?,
+                supplier_parse_comment = ?,
+                supplier_last_parsed_at = CURRENT_TIMESTAMP,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            ("error", str(e)[:500], product_id),
+        )
+        conn.commit()
+        return {"ok": False, "message": str(e)}
 
 
 def show_product_tab():
@@ -250,6 +374,36 @@ def show_product_tab():
         return
 
     st.subheader(f"Карточка товара #{product['id']}")
+
+    ctop1, ctop2 = st.columns([1, 1])
+    with ctop1:
+        if st.button("Спарсить поставщика", type="primary"):
+            result = enrich_product_from_supplier(conn, int(product_id), force=False)
+            if result["ok"]:
+                st.success(result["message"])
+                if result.get("updates"):
+                    st.json(result["updates"])
+                st.rerun()
+            else:
+                st.error(result["message"])
+    with ctop2:
+        if st.button("Перезаполнить из поставщика"):
+            result = enrich_product_from_supplier(conn, int(product_id), force=True)
+            if result["ok"]:
+                st.success(result["message"])
+                if result.get("updates"):
+                    st.json(result["updates"])
+                st.rerun()
+            else:
+                st.error(result["message"])
+
+    parse_status = product["supplier_parse_status"] if "supplier_parse_status" in product.keys() else None
+    parse_comment = product["supplier_parse_comment"] if "supplier_parse_comment" in product.keys() else None
+    parsed_at = product["supplier_last_parsed_at"] if "supplier_last_parsed_at" in product.keys() else None
+    if parse_status or parsed_at:
+        st.caption(f"Статус парсинга: {parse_status or '-'} | Последний запуск: {parsed_at or '-'}")
+        if parse_comment:
+            st.caption(f"Комментарий: {parse_comment}")
 
     with st.form("product_form"):
         c1, c2, c3 = st.columns(3)
@@ -324,6 +478,13 @@ def show_product_tab():
             refresh_duplicates_for_product(conn, int(product_id))
             st.success("Сохранено")
             st.rerun()
+
+    st.markdown("### Источники данных")
+    sources = get_field_sources(conn, int(product_id))
+    if sources:
+        st.dataframe(pd.DataFrame(sources), use_container_width=True, hide_index=True)
+    else:
+        st.caption("Источники данных пока не записаны")
 
     conn.close()
 

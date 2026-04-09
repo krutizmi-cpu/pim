@@ -40,6 +40,10 @@ REQUIRED_PRODUCT_COLUMNS: dict[str, str] = {
     "model": "TEXT",
     "base_category": "TEXT",
     "tnved_code": "TEXT",
+    "import_batch_id": "TEXT",
+    "supplier_last_parsed_at": "TEXT",
+    "supplier_parse_status": "TEXT",
+    "supplier_parse_comment": "TEXT",
 }
 
 
@@ -92,7 +96,11 @@ def _ensure_products_table(conn: sqlite3.Connection) -> None:
             brand TEXT,
             model TEXT,
             base_category TEXT,
-            tnved_code TEXT
+            tnved_code TEXT,
+            import_batch_id TEXT,
+            supplier_last_parsed_at TEXT,
+            supplier_parse_status TEXT,
+            supplier_parse_comment TEXT
         )
         """
     )
@@ -122,6 +130,7 @@ def _ensure_products_table(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_products_barcode ON products(barcode)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_products_supplier_article ON products(supplier_article)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_products_internal_article ON products(internal_article)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_products_import_batch_id ON products(import_batch_id)")
 
 
 def _ensure_duplicate_table(conn: sqlite3.Connection) -> None:
@@ -250,6 +259,25 @@ def _ensure_attribute_tables(conn: sqlite3.Connection) -> None:
         )
         """
     )
+
+
+def _ensure_product_data_sources_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS product_data_sources (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            product_id INTEGER NOT NULL,
+            field_name TEXT NOT NULL,
+            source_type TEXT NOT NULL,
+            source_value_raw TEXT,
+            source_url TEXT,
+            confidence REAL,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_pds_product_id ON product_data_sources(product_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_pds_field_name ON product_data_sources(field_name)")
 
 
 def _ensure_channel_tables(conn: sqlite3.Connection) -> None:
@@ -415,6 +443,7 @@ def init_db(conn: sqlite3.Connection) -> None:
     _ensure_product_intake_table(conn)
     _ensure_category_defaults_table(conn)
     _ensure_attribute_tables(conn)
+    _ensure_product_data_sources_table(conn)
     _ensure_channel_tables(conn)
 
     _seed_category_defaults(conn)
