@@ -14,9 +14,13 @@ HEADERS = {
 
 DIMENSION_PATTERNS = {
     "weight": [r"вес[^\d]{0,20}(\d+[\.,]?\d*)\s*(кг|г)", r"weight[^\d]{0,20}(\d+[\.,]?\d*)\s*(kg|g)"],
+    "gross_weight": [r"вес\s*брутто[^\d]{0,20}(\d+[\.,]?\d*)\s*(кг|г)", r"gross\s*weight[^\d]{0,20}(\d+[\.,]?\d*)\s*(kg|g)"],
     "length": [r"длина[^\d]{0,20}(\d+[\.,]?\d*)\s*(мм|см|м)", r"length[^\d]{0,20}(\d+[\.,]?\d*)\s*(mm|cm|m)"],
     "width": [r"ширина[^\d]{0,20}(\d+[\.,]?\d*)\s*(мм|см|м)", r"width[^\d]{0,20}(\d+[\.,]?\d*)\s*(mm|cm|m)"],
     "height": [r"высота[^\d]{0,20}(\d+[\.,]?\d*)\s*(мм|см|м)", r"height[^\d]{0,20}(\d+[\.,]?\d*)\s*(mm|cm|m)"],
+    "package_length": [r"длина\s*упаковки[^\d]{0,20}(\d+[\.,]?\d*)\s*(мм|см|м)", r"package\s*length[^\d]{0,20}(\d+[\.,]?\d*)\s*(mm|cm|m)"],
+    "package_width": [r"ширина\s*упаковки[^\d]{0,20}(\d+[\.,]?\d*)\s*(мм|см|м)", r"package\s*width[^\d]{0,20}(\d+[\.,]?\d*)\s*(mm|cm|m)"],
+    "package_height": [r"высота\s*упаковки[^\d]{0,20}(\d+[\.,]?\d*)\s*(мм|см|м)", r"package\s*height[^\d]{0,20}(\d+[\.,]?\d*)\s*(mm|cm|m)"],
 }
 
 
@@ -101,9 +105,13 @@ def extract_supplier_data(html: str, url: str | None = None) -> dict[str, Any]:
         "image_urls": image_urls,
         "attributes": {},
         "weight": None,
+        "gross_weight": None,
         "length": None,
         "width": None,
         "height": None,
+        "package_length": None,
+        "package_width": None,
+        "package_height": None,
     }
 
     for field, patterns in DIMENSION_PATTERNS.items():
@@ -113,7 +121,7 @@ def extract_supplier_data(html: str, url: str | None = None) -> dict[str, Any]:
                 continue
             value = _to_float(match.group(1))
             unit = match.group(2)
-            if field == "weight":
+            if field in ("weight", "gross_weight"):
                 result[field] = _convert_weight(value, unit)
             else:
                 result[field] = _convert_dimension(value, unit)
@@ -138,9 +146,13 @@ def normalize_supplier_data(raw_data: dict[str, Any]) -> dict[str, Any]:
         "description": raw_data.get("description") or raw_data.get("title"),
         "image_url": None,
         "weight": raw_data.get("weight"),
+        "gross_weight": raw_data.get("gross_weight"),
         "length": raw_data.get("length"),
         "width": raw_data.get("width"),
         "height": raw_data.get("height"),
+        "package_length": raw_data.get("package_length"),
+        "package_width": raw_data.get("package_width"),
+        "package_height": raw_data.get("package_height"),
         "attributes": raw_data.get("attributes") or {},
         "image_urls": raw_data.get("image_urls") or [],
     }

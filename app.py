@@ -209,7 +209,7 @@ def show_import_tab():
 def show_catalog_tab():
     conn = get_db()
 
-    c1, c2, c3, c4, c5 = st.columns([2, 1, 1, 1, 1])
+    c1, c2, c3, c4, c5, c6 = st.columns([2, 1, 1, 1, 1, 1])
     with c1:
         search = st.text_input("Поиск", placeholder="Название / артикул / штрихкод")
     with c2:
@@ -220,9 +220,20 @@ def show_catalog_tab():
         limit = st.number_input("Показать записей", min_value=50, max_value=1000, value=200, step=50)
     with c5:
         only_last_batch = st.checkbox("Только последняя загрузка", value=False)
+    with c6:
+        parse_filter = st.selectbox("Парсинг", ["Все", "Есть supplier_url", "Не парсено", "Ошибка", "Успех"], index=0)
 
     batch_id = st.session_state.get("last_import_batch_id") if only_last_batch else ""
     df = load_products(conn, search=search, category=category, supplier=supplier, limit=int(limit), import_batch_id=batch_id or "")
+    if not df.empty:
+        if parse_filter == "Есть supplier_url":
+            df = df[df["supplier_url"].notna() & (df["supplier_url"].astype(str).str.strip() != "")]
+        elif parse_filter == "Не парсено":
+            df = df[df["supplier_parse_status"].isna() | (df["supplier_parse_status"].astype(str).str.strip() == "")]
+        elif parse_filter == "Ошибка":
+            df = df[df["supplier_parse_status"] == "error"]
+        elif parse_filter == "Успех":
+            df = df[df["supplier_parse_status"] == "success"]
 
     if df.empty:
         st.info("Нет товаров")
@@ -287,15 +298,49 @@ def enrich_product_from_supplier(conn, product_id: int, force: bool = False) -> 
         parsed = normalize_supplier_data(raw_data)
 
         updates = {}
-        fields = ["description", "image_url", "weight", "length", "width", "height"]
+        fields = ["description", "image_url", "weight", "length", "width", "height", "package_length", "package_width", "package_height", "gross_weight"]
         for field in fields:
-            new_value = parsed.get(field)
+            source_field = field
+            if field == "gross_weight":
+                source_field = "gross_weight"
+            new_value = parsed.get(source_field)
             old_value = product[field] if field in product.keys() else None
             if new_value is None:
                 continue
             if old_value not in (None, "", 0, 0.0) and not force:
                 continue
             updates[field] = new_value
+
+        attributes_saved = 0
+        for attr_name, attr_value in (parsed.get("attributes") or {}).items():
+            clean_code = str(attr_name).strip().lower()
+            clean_code = "_".join("".join(ch if ch.isalnum() else " " for ch in clean_code).split())
+            if not clean_code:
+                continue
+            existing_def = conn.execute(
+                "SELECT code FROM attribute_definitions WHERE code = ?",
+                (clean_code,),
+            ).fetchone()
+            if not existing_def:
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO attribute_definitions
+                    (code, name, data_type, scope, entity_type, is_required, is_multi_value, unit, description, created_at, updated_at)
+                    VALUES (?, ?, 'text', 'master', 'product', 0, 0, NULL, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                    """,
+                    (clean_code, str(attr_name).strip(), f"Автосоздано из supplier page: {supplier_url}"),
+                )
+            set_product_attribute_value(conn, product_id, clean_code, str(attr_value))
+            save_field_source(
+                conn=conn,
+                product_id=product_id,
+                field_name=f"attr:{clean_code}",
+                source_type="supplier_page",
+                source_value_raw=attr_value,
+                source_url=supplier_url,
+                confidence=0.6,
+            )
+            attributes_saved += 1
 
         if updates:
             set_clause = ", ".join([f"{k} = ?" for k in updates.keys()])
@@ -338,7 +383,7 @@ def enrich_product_from_supplier(conn, product_id: int, force: bool = False) -> 
         conn.commit()
         return {
             "ok": True,
-            "message": f"Обогащение завершено, обновлено полей: {len(updates)}",
+            "message": f"Обогащение завершено, обновлено полей: {len(updates)}, атрибутов сохранено: {attributes_saved}",
             "updates": updates,
             "attributes": parsed.get("attributes", {}),
             "image_urls": parsed.get("image_urls", []),
