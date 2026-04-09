@@ -46,8 +46,8 @@ def save_template_profile(
         conn.execute(
             """
             INSERT INTO template_profile_columns
-            (profile_id, template_column, source_type, source_name, matched_by, sort_order, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            (profile_id, template_column, source_type, source_name, matched_by, transform_rule, sort_order, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 profile_id,
@@ -55,6 +55,7 @@ def save_template_profile(
                 col.get("source_type"),
                 col.get("source_name"),
                 col.get("matched_by"),
+                col.get("transform_rule"),
                 idx,
                 now,
                 now,

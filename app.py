@@ -695,6 +695,7 @@ def show_template_tab():
                     "source_type": profile_map.get(m["template_column"], {}).get("source_type", m["source_type"]),
                     "source_name": profile_map.get(m["template_column"], {}).get("source_name", m["source_name"]),
                     "matched_by": "template_profile" if profile_map.get(m["template_column"]) else m["matched_by"],
+                    "transform_rule": profile_map.get(m["template_column"], {}).get("transform_rule"),
                 }
                 for m in matches
             ]
@@ -704,8 +705,9 @@ def show_template_tab():
 
         st.markdown("### Ручная правка матчинга")
         manual_rows = []
+        transform_options = ["", "cm_to_mm", "mm_to_cm", "m_to_cm", "kg_to_g", "g_to_kg", "inch_to_cm", "lower", "upper", "strip"]
         for idx, match in enumerate(matches):
-            c1, c2, c3 = st.columns([2, 2, 2])
+            c1, c2, c3, c4 = st.columns([2, 2, 2, 2])
             with c1:
                 st.text_input("Колонка", value=match["template_column"], disabled=True, key=f"tmpl_col_{idx}")
             with c2:
@@ -719,12 +721,16 @@ def show_template_tab():
                 allowed_names = [name for stype, name in source_options if stype == source_type] if source_type != "skip" else [""]
                 current_name = match["source_name"] if match["source_name"] in allowed_names else (allowed_names[0] if allowed_names else "")
                 source_name = st.selectbox("Источник", options=allowed_names, index=(allowed_names.index(current_name) if current_name in allowed_names else 0), key=f"tmpl_name_{idx}") if allowed_names else st.text_input("Источник", value="", key=f"tmpl_name_{idx}")
+            with c4:
+                current_transform = match.get("transform_rule") if match.get("transform_rule") in transform_options else ""
+                transform_rule = st.selectbox("Transform", options=transform_options, index=transform_options.index(current_transform), key=f"tmpl_transform_{idx}")
             manual_rows.append({
                 "template_column": match["template_column"],
                 "status": "matched" if source_type != "skip" else "unmatched",
                 "source_type": None if source_type == "skip" else source_type,
                 "source_name": None if source_type == "skip" else source_name,
                 "matched_by": "manual" if source_type != "skip" else None,
+                "transform_rule": transform_rule or None,
             })
 
         s1, s2 = st.columns(2)
@@ -741,7 +747,7 @@ def show_template_tab():
                         target_field=row["template_column"],
                         source_type=row["source_type"],
                         source_name=row["source_name"],
-                        transform_rule=None,
+                        transform_rule=row.get("transform_rule"),
                         is_required=0,
                     )
                     saved += 1

@@ -306,6 +306,7 @@ def _ensure_template_profile_tables(conn: sqlite3.Connection) -> None:
             source_type TEXT,
             source_name TEXT,
             matched_by TEXT,
+            transform_rule TEXT,
             sort_order INTEGER DEFAULT 100,
             created_at TEXT DEFAULT CURRENT_TIMESTAMP,
             updated_at TEXT

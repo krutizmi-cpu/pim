@@ -8,6 +8,7 @@ import pandas as pd
 from services.attribute_service import list_attribute_definitions, list_channel_mapping_rules, set_product_attribute_value
 from services.source_priority import can_overwrite_field
 from services.source_tracking import save_field_source
+from services.transforms import apply_transform
 
 
 BASE_PRODUCT_FIELD_ALIASES = {
@@ -95,9 +96,12 @@ def apply_saved_mapping_rules(conn, matches: list[dict], channel_code: str, cate
                     "source_type": rule["source_type"],
                     "source_name": rule["source_name"],
                     "matched_by": "saved_rule",
+                    "transform_rule": rule.get("transform_rule"),
                 }
             )
         else:
+            if "transform_rule" not in match:
+                match["transform_rule"] = None
             updated.append(match)
     return updated
 
@@ -141,7 +145,7 @@ def fill_template_dataframe(conn, template_df: pd.DataFrame, product_ids: list[i
             if match["status"] != "matched":
                 row_data[col] = None
                 continue
-            row_data[col] = value_map.get(match["source_name"])
+            row_data[col] = apply_transform(value_map.get(match["source_name"]), match.get("transform_rule"))
         rows.append(row_data)
     return pd.DataFrame(rows)
 
