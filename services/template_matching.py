@@ -5,7 +5,9 @@ from pathlib import Path
 
 import pandas as pd
 
-from services.attribute_service import list_attribute_definitions, list_channel_mapping_rules
+from services.attribute_service import list_attribute_definitions, list_channel_mapping_rules, set_product_attribute_value
+from services.source_priority import can_overwrite_field
+from services.source_tracking import save_field_source
 
 
 BASE_PRODUCT_FIELD_ALIASES = {
@@ -142,6 +144,60 @@ def fill_template_dataframe(conn, template_df: pd.DataFrame, product_ids: list[i
             row_data[col] = value_map.get(match["source_name"])
         rows.append(row_data)
     return pd.DataFrame(rows)
+
+
+def apply_client_validated_values(conn, product_ids: list[int], matches: list[dict], channel_code: str | None = None) -> dict:
+    applied = 0
+    skipped = 0
+
+    for product_id in product_ids:
+        value_map = build_product_value_map(conn, product_id)
+        for match in matches:
+            if match.get("status") != "matched":
+                continue
+            field_name = match.get("source_name")
+            source_type = match.get("source_type")
+            if not field_name or not source_type:
+                continue
+            value = value_map.get(field_name)
+            if value in (None, ""):
+                continue
+
+            if source_type == "column":
+                if not can_overwrite_field(conn, product_id, field_name, "client_validated", force=False):
+                    skipped += 1
+                    continue
+                conn.execute(
+                    f"UPDATE products SET {field_name} = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                    (value, int(product_id)),
+                )
+                save_field_source(
+                    conn=conn,
+                    product_id=product_id,
+                    field_name=field_name,
+                    source_type="client_validated",
+                    source_value_raw=value,
+                    source_url=channel_code,
+                    confidence=0.95,
+                    is_manual=False,
+                )
+                applied += 1
+            elif source_type == "attribute":
+                set_product_attribute_value(conn, int(product_id), field_name, value, channel_code=channel_code)
+                save_field_source(
+                    conn=conn,
+                    product_id=product_id,
+                    field_name=f"attr:{field_name}",
+                    source_type="client_validated",
+                    source_value_raw=value,
+                    source_url=channel_code,
+                    confidence=0.95,
+                    is_manual=False,
+                )
+                applied += 1
+
+    conn.commit()
+    return {"applied": applied, "skipped": skipped}
 
 
 def dataframe_to_excel_bytes(df: pd.DataFrame, sheet_name: str = "template") -> bytes:

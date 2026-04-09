@@ -22,7 +22,7 @@ from services.duplicate_service import refresh_duplicates_for_product
 from services.source_tracking import get_field_sources, save_field_source, get_latest_field_source, field_is_manual
 from services.source_priority import can_overwrite_field
 from services.supplier_parser import fetch_supplier_page, extract_supplier_data, normalize_supplier_data
-from services.template_matching import auto_match_template_columns, apply_saved_mapping_rules, fill_template_dataframe, dataframe_to_excel_bytes
+from services.template_matching import auto_match_template_columns, apply_saved_mapping_rules, fill_template_dataframe, apply_client_validated_values, dataframe_to_excel_bytes
 
 st.set_page_config(page_title="PIM", page_icon="📦", layout="wide")
 
@@ -783,12 +783,18 @@ def show_template_tab():
                             st.session_state["selected_product_id"] = int(action_product_id)
                             st.success(f"Товар #{action_product_id} выбран, открой вкладку Карточка")
 
-                st.download_button(
-                    "Скачать заполненный шаблон",
-                    data=dataframe_to_excel_bytes(filled_df),
-                    file_name=f"filled_{channel_code or 'client'}_template.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                )
+                a1, a2 = st.columns(2)
+                with a1:
+                    if st.button("Подтвердить значения как client_validated"):
+                        result = apply_client_validated_values(conn, selected_ids, manual_rows, channel_code=channel_code or None)
+                        st.success(f"Применено: {result['applied']}, пропущено по приоритету: {result['skipped']}")
+                with a2:
+                    st.download_button(
+                        "Скачать заполненный шаблон",
+                        data=dataframe_to_excel_bytes(filled_df),
+                        file_name=f"filled_{channel_code or 'client'}_template.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    )
 
     conn.close()
 
