@@ -695,16 +695,50 @@ def show_template_tab():
                 st.dataframe(filled_df, use_container_width=True, hide_index=True)
 
                 gap_rows = []
+                gap_actions = []
                 for _, row in manual_df.iterrows():
                     if row["status"] != "matched":
                         gap_rows.append({"template_column": row["template_column"], "reason": "Нет матчинга"})
                         continue
                     if filled_df[row["template_column"]].isna().all():
                         gap_rows.append({"template_column": row["template_column"], "reason": "У выбранных товаров нет данных"})
+                        for product_id in selected_ids:
+                            product_row = get_product(conn, int(product_id))
+                            can_supplier = bool(product_row and product_row["supplier_url"])
+                            gap_actions.append({
+                                "product_id": product_id,
+                                "product_name": product_row["name"] if product_row else None,
+                                "template_column": row["template_column"],
+                                "can_supplier_enrich": can_supplier,
+                            })
 
                 if gap_rows:
                     st.markdown("### Gap-анализ")
                     st.dataframe(pd.DataFrame(gap_rows), use_container_width=True, hide_index=True)
+
+                if gap_actions:
+                    st.markdown("### Быстрые действия по gap")
+                    action_df = pd.DataFrame(gap_actions)
+                    st.dataframe(action_df, use_container_width=True, hide_index=True)
+
+                    action_product_id = st.selectbox(
+                        "Выбери товар для быстрого действия",
+                        options=sorted(set([x["product_id"] for x in gap_actions])),
+                        format_func=lambda x: f"ID {x} | {next((g['product_name'] for g in gap_actions if g['product_id'] == x), x)}",
+                    )
+                    a1, a2 = st.columns(2)
+                    with a1:
+                        if st.button("Обогатить товар из supplier", key="gap_supplier_enrich"):
+                            result = enrich_product_from_supplier(conn, int(action_product_id), force=False)
+                            if result["ok"]:
+                                st.success(result["message"])
+                                st.rerun()
+                            else:
+                                st.error(result["message"])
+                    with a2:
+                        if st.button("Открыть товар в карточке", key="gap_open_product"):
+                            st.session_state["selected_product_id"] = int(action_product_id)
+                            st.success(f"Товар #{action_product_id} выбран, открой вкладку Карточка")
 
                 st.download_button(
                     "Скачать заполненный шаблон",
