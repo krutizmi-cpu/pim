@@ -20,6 +20,7 @@ from services.attribute_service import (
 from services.catalog_service import import_catalog_from_excel
 from services.duplicate_service import refresh_duplicates_for_product
 from services.source_tracking import get_field_sources, save_field_source, get_latest_field_source, field_is_manual
+from services.source_priority import can_overwrite_field
 from services.supplier_parser import fetch_supplier_page, extract_supplier_data, normalize_supplier_data
 from services.template_matching import auto_match_template_columns, apply_saved_mapping_rules, fill_template_dataframe, dataframe_to_excel_bytes
 
@@ -329,6 +330,9 @@ def enrich_product_from_supplier(conn, product_id: int, force: bool = False) -> 
             if new_value is None:
                 continue
             if field_is_manual(conn, product_id, field) and not force:
+                skipped_manual_fields.append(field)
+                continue
+            if not can_overwrite_field(conn, product_id, field, "supplier_page", force=force):
                 skipped_manual_fields.append(field)
                 continue
             if old_value not in (None, "", 0, 0.0) and not force:

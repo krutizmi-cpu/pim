@@ -4,6 +4,9 @@ import sqlite3
 from datetime import datetime
 from difflib import SequenceMatcher
 
+from services.source_priority import can_overwrite_field
+from services.source_tracking import save_field_source
+
 
 def estimate_logistics(conn: sqlite3.Connection, product_id: int) -> dict | None:
     product = conn.execute(
@@ -53,25 +56,35 @@ def estimate_logistics(conn: sqlite3.Connection, product_id: int) -> dict | None
     }
 
     now = datetime.utcnow().isoformat(timespec="seconds")
-    conn.execute(
-        """
-        UPDATE products
-        SET package_length = COALESCE(package_length, ?),
-            package_width = COALESCE(package_width, ?),
-            package_height = COALESCE(package_height, ?),
-            gross_weight = COALESCE(gross_weight, ?),
-            is_estimated_logistics = 1,
-            updated_at = ?
-        WHERE id = ?
-        """,
-        (
-            avg["package_length"],
-            avg["package_width"],
-            avg["package_height"],
-            avg["gross_weight"],
-            now,
-            product_id,
-        ),
-    )
+    updates = {}
+    for field_name in ["package_length", "package_width", "package_height", "gross_weight"]:
+        if can_overwrite_field(conn, product_id, field_name, "default", force=False):
+            updates[field_name] = avg[field_name]
+
+    if updates:
+        set_clause = ", ".join([f"{k} = COALESCE({k}, ?)" for k in updates.keys()])
+        params = list(updates.values()) + [now, product_id]
+        conn.execute(
+            f"""
+            UPDATE products
+            SET {set_clause},
+                is_estimated_logistics = 1,
+                updated_at = ?
+            WHERE id = ?
+            """,
+            params,
+        )
+        for field_name, value in updates.items():
+            save_field_source(
+                conn=conn,
+                product_id=product_id,
+                field_name=field_name,
+                source_type="default",
+                source_value_raw=value,
+                source_url=None,
+                confidence=0.4,
+                is_manual=False,
+            )
+
     conn.commit()
     return avg
