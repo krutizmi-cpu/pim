@@ -21,6 +21,7 @@ from services.catalog_service import import_catalog_from_excel
 from services.duplicate_service import refresh_duplicates_for_product
 from services.source_tracking import get_field_sources, save_field_source
 from services.supplier_parser import fetch_supplier_page, extract_supplier_data, normalize_supplier_data
+from services.template_matching import auto_match_template_columns, fill_template_dataframe, dataframe_to_excel_bytes
 
 st.set_page_config(page_title="PIM", page_icon="📦", layout="wide")
 
@@ -603,6 +604,62 @@ def show_attributes_tab():
     conn.close()
 
 
+def show_template_tab():
+    st.subheader("Клиентский шаблон")
+    conn = get_db()
+
+    uploaded = st.file_uploader("Загрузить Excel-шаблон клиента", type=["xlsx", "xls"], key="client_template")
+    product_df = load_products(conn, limit=1000)
+
+    if uploaded is not None:
+        template_df = pd.read_excel(uploaded)
+        st.markdown("### Колонки шаблона")
+        st.dataframe(pd.DataFrame({"template_column": list(template_df.columns)}), use_container_width=True, hide_index=True)
+
+        matches = auto_match_template_columns(conn, list(template_df.columns))
+        match_df = pd.DataFrame(matches)
+        st.markdown("### Автоматический матчинг")
+        st.dataframe(match_df, use_container_width=True, hide_index=True)
+
+        unmatched = match_df[match_df["status"] == "unmatched"] if not match_df.empty else pd.DataFrame()
+        if not unmatched.empty:
+            st.warning(f"Не сматчено колонок: {len(unmatched)}")
+            st.dataframe(unmatched, use_container_width=True, hide_index=True)
+
+        if not product_df.empty:
+            selected_ids = st.multiselect(
+                "Выбери товары для заполнения шаблона",
+                options=product_df["id"].tolist(),
+                format_func=lambda x: f"ID {x} | {product_df.loc[product_df['id'] == x, 'name'].iloc[0]}",
+            )
+
+            if selected_ids:
+                filled_df = fill_template_dataframe(conn, template_df, selected_ids, matches)
+                st.markdown("### Предпросмотр заполнения")
+                st.dataframe(filled_df, use_container_width=True, hide_index=True)
+
+                gap_rows = []
+                for _, row in match_df.iterrows():
+                    if row["status"] != "matched":
+                        gap_rows.append({"template_column": row["template_column"], "reason": "Нет матчинга"})
+                        continue
+                    if filled_df[row["template_column"]].isna().all():
+                        gap_rows.append({"template_column": row["template_column"], "reason": "У выбранных товаров нет данных"})
+
+                if gap_rows:
+                    st.markdown("### Gap-анализ")
+                    st.dataframe(pd.DataFrame(gap_rows), use_container_width=True, hide_index=True)
+
+                st.download_button(
+                    "Скачать заполненный шаблон",
+                    data=dataframe_to_excel_bytes(filled_df),
+                    file_name="filled_client_template.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
+
+    conn.close()
+
+
 def show_channels_tab():
     conn = get_db()
 
@@ -685,8 +742,8 @@ def show_channels_tab():
 def main():
     st.title("📦 PIM")
 
-    tab1, tab2, tab3, tab4, tab5 = st.tabs(
-        ["Импорт", "Каталог", "Карточка", "Атрибуты", "Каналы"]
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
+        ["Импорт", "Каталог", "Карточка", "Атрибуты", "Клиентский шаблон", "Каналы"]
     )
 
     with tab1:
@@ -702,6 +759,9 @@ def main():
         show_attributes_tab()
 
     with tab5:
+        show_template_tab()
+
+    with tab6:
         show_channels_tab()
 
 

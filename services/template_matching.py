@@ -1,0 +1,127 @@
+from __future__ import annotations
+
+from io import BytesIO
+from pathlib import Path
+
+import pandas as pd
+
+from services.attribute_service import list_attribute_definitions
+
+
+BASE_PRODUCT_FIELD_ALIASES = {
+    "article": ["артикул", "sku", "vendor code", "код товара"],
+    "name": ["название", "наименование", "товар", "name", "title"],
+    "barcode": ["штрихкод", "ean", "barcode"],
+    "brand": ["бренд", "brand", "марка"],
+    "description": ["описание", "description"],
+    "weight": ["вес", "weight"],
+    "length": ["длина", "length"],
+    "width": ["ширина", "width"],
+    "height": ["высота", "height"],
+    "package_length": ["длина упаковки", "упаковка длина", "глубина упаковки"],
+    "package_width": ["ширина упаковки", "упаковка ширина"],
+    "package_height": ["высота упаковки", "упаковка высота"],
+    "gross_weight": ["вес брутто", "вес в упаковке", "gross weight"],
+    "image_url": ["фото", "изображение", "image", "main image"],
+}
+
+
+def normalize_key(value: str) -> str:
+    return " ".join(str(value).strip().lower().replace("_", " ").split())
+
+
+def build_candidate_map(conn) -> dict[str, tuple[str, str, str]]:
+    result: dict[str, tuple[str, str, str]] = {}
+
+    for field_name, aliases in BASE_PRODUCT_FIELD_ALIASES.items():
+        for alias in aliases:
+            result[normalize_key(alias)] = ("column", field_name, alias)
+
+    for attr in list_attribute_definitions(conn):
+        result[normalize_key(attr["name"])] = ("attribute", attr["code"], attr["name"])
+        result[normalize_key(attr["code"])] = ("attribute", attr["code"], attr["name"])
+
+    return result
+
+
+def auto_match_template_columns(conn, columns: list[str]) -> list[dict]:
+    candidate_map = build_candidate_map(conn)
+    matches: list[dict] = []
+
+    for col in columns:
+        norm = normalize_key(col)
+        matched = candidate_map.get(norm)
+        if matched:
+            source_type, source_name, matched_by = matched
+            matches.append(
+                {
+                    "template_column": col,
+                    "status": "matched",
+                    "source_type": source_type,
+                    "source_name": source_name,
+                    "matched_by": matched_by,
+                }
+            )
+        else:
+            matches.append(
+                {
+                    "template_column": col,
+                    "status": "unmatched",
+                    "source_type": None,
+                    "source_name": None,
+                    "matched_by": None,
+                }
+            )
+
+    return matches
+
+
+def build_product_value_map(conn, product_id: int) -> dict[str, object]:
+    product = conn.execute("SELECT * FROM products WHERE id = ?", (int(product_id),)).fetchone()
+    if not product:
+        return {}
+
+    value_map = dict(product)
+
+    rows = conn.execute(
+        """
+        SELECT pav.attribute_code, pav.value_text, pav.value_number, pav.value_boolean, pav.value_json
+        FROM product_attribute_values pav
+        WHERE pav.product_id = ?
+        """,
+        (int(product_id),),
+    ).fetchall()
+
+    for row in rows:
+        value = row["value_number"]
+        if value is None:
+            value = row["value_boolean"]
+        if value is None:
+            value = row["value_json"]
+        if value is None:
+            value = row["value_text"]
+        value_map[row["attribute_code"]] = value
+
+    return value_map
+
+
+def fill_template_dataframe(conn, template_df: pd.DataFrame, product_ids: list[int], matches: list[dict]) -> pd.DataFrame:
+    rows: list[dict] = []
+    for product_id in product_ids:
+        value_map = build_product_value_map(conn, product_id)
+        row_data = {}
+        for match in matches:
+            col = match["template_column"]
+            if match["status"] != "matched":
+                row_data[col] = None
+                continue
+            row_data[col] = value_map.get(match["source_name"])
+        rows.append(row_data)
+    return pd.DataFrame(rows)
+
+
+def dataframe_to_excel_bytes(df: pd.DataFrame, sheet_name: str = "template") -> bytes:
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name=sheet_name)
+    return output.getvalue()
