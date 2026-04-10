@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pandas as pd
 import streamlit as st
+from openpyxl import load_workbook
 
 from db import get_connection, init_db
 from services.attribute_service import (
@@ -22,10 +23,10 @@ from services.duplicate_service import refresh_duplicates_for_product
 from services.source_tracking import get_field_sources, save_field_source, get_latest_field_source, field_is_manual
 from services.source_priority import can_overwrite_field
 from services.supplier_parser import fetch_supplier_page, extract_supplier_data, normalize_supplier_data
-from services.template_matching import auto_match_template_columns, apply_saved_mapping_rules, fill_template_dataframe, apply_client_validated_values, dataframe_to_excel_bytes
+from services.template_matching import auto_match_template_columns, apply_saved_mapping_rules, fill_template_dataframe, apply_client_validated_values, fill_template_workbook_bytes, dataframe_to_excel_bytes, detect_template_data_start_row
 from services.template_profiles import save_template_profile, list_template_profiles, get_template_profile_columns
 from services.readiness_service import analyze_template_readiness
-from services.ozon_api_service import is_configured, sync_category_tree, list_cached_categories, sync_category_attributes, list_cached_attributes, import_cached_attributes_to_pim, suggest_mappings_for_cached_attributes, save_suggested_mappings, analyze_product_ozon_coverage
+from services.ozon_api_service import is_configured, sync_category_tree, list_cached_categories, sync_category_attributes, list_cached_attributes, import_cached_attributes_to_pim, suggest_mappings_for_cached_attributes, save_suggested_mappings, analyze_product_ozon_coverage, ensure_ozon_master_attributes, build_product_ozon_payload, materialize_product_ozon_attributes
 
 st.set_page_config(page_title="PIM", page_icon="📦", layout="wide")
 
@@ -769,7 +770,38 @@ def show_template_tab():
     ]] + [("attribute", d["code"]) for d in defs]
 
     if uploaded is not None:
-        template_df = pd.read_excel(uploaded)
+        uploaded_bytes = uploaded.getvalue()
+        workbook = load_workbook(BytesIO(uploaded_bytes), read_only=True, data_only=False)
+        template_sheet_options = workbook.sheetnames
+        workbook.close()
+
+        template_sheet_name = st.selectbox(
+            "Лист шаблона",
+            options=template_sheet_options,
+            index=(template_sheet_options.index("Товары") if "Товары" in template_sheet_options else 0),
+            key="template_sheet_name",
+        )
+        suggested_data_start_row = detect_template_data_start_row(uploaded_bytes, sheet_name=template_sheet_name)
+
+        tcfg1, tcfg2 = st.columns(2)
+        with tcfg1:
+            template_data_start_row = st.number_input(
+                "Строка начала данных",
+                min_value=2,
+                max_value=100000,
+                value=int(suggested_data_start_row),
+                step=1,
+                key="template_data_start_row",
+            )
+        with tcfg2:
+            preserve_template_workbook = st.checkbox(
+                "Сохранять исходную структуру Excel",
+                value=True,
+                help="Оставляет исходные листы, шапку, справочники и форматирование клиентского файла.",
+                key="preserve_template_workbook",
+            )
+
+        template_df = pd.read_excel(BytesIO(uploaded_bytes), sheet_name=template_sheet_name)
         matches = auto_match_template_columns(conn, list(template_df.columns))
         matches = apply_saved_mapping_rules(conn, matches, channel_code=channel_code, category_code=category_code or None)
         if selected_profile_id:
@@ -921,10 +953,18 @@ def show_template_tab():
                             result = apply_client_validated_values(conn, selected_ids, manual_rows, channel_code=channel_code or None)
                             st.success(f"Применено: {result['applied']}, пропущено по приоритету: {result['skipped']}")
                     with a2:
+                        export_bytes = fill_template_workbook_bytes(
+                            conn,
+                            uploaded_bytes,
+                            selected_ids,
+                            manual_rows,
+                            sheet_name=template_sheet_name,
+                            data_start_row=int(template_data_start_row),
+                        ) if preserve_template_workbook else dataframe_to_excel_bytes(filled_df, sheet_name=template_sheet_name)
                         st.download_button(
                             "Скачать заполненный шаблон",
-                            data=dataframe_to_excel_bytes(filled_df),
-                            file_name=f"filled_{channel_code or 'client'}_template.xlsx",
+                            data=export_bytes,
+                            file_name=f"filled_{Path(getattr(uploaded, 'name', 'client_template.xlsx')).name}",
                             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                         )
 
@@ -1074,10 +1114,12 @@ def show_ozon_tab():
             if attributes:
                 attr_df = pd.DataFrame(attributes)
                 required_count = int(attr_df["is_required"].fillna(0).astype(int).sum()) if "is_required" in attr_df.columns else 0
-                m1, m2, m3 = st.columns(3)
+                master_seed = ensure_ozon_master_attributes(conn)
+                m1, m2, m3, m4 = st.columns(4)
                 m1.metric("Атрибутов в кэше", int(len(attr_df)))
                 m2.metric("Обязательных", required_count)
                 m3.metric("Справочники", int((attr_df["dictionary_id"].fillna(0).astype(float) > 0).sum()) if "dictionary_id" in attr_df.columns else 0)
+                m4.metric("Базовых master-атрибутов", int(master_seed["total"]))
 
                 a1, a2 = st.columns(2)
                 with a1:
@@ -1125,26 +1167,55 @@ def show_ozon_tab():
                         format_func=lambda x: next((f"ID {r['id']} | {r['article'] or '-'} | {r['name'] or '-'}" for r in product_rows if int(r['id']) == int(x)), str(x)),
                         key="ozon_coverage_product_id",
                     )
-                    if st.button("Проверить покрытие товара под Ozon"):
-                        coverage = analyze_product_ozon_coverage(
-                            conn,
-                            product_id=int(selected_product_id),
-                            description_category_id=int(selected_row["description_category_id"]),
-                            type_id=int(selected_row["type_id"]),
-                        )
-                        summary = coverage["summary"]
-                        cc1, cc2, cc3, cc4 = st.columns(4)
-                        cc1.metric("Ready %", int(summary["readiness_pct"]))
-                        cc2.metric("Required всего", int(summary["required_total"]))
-                        cc3.metric("Required закрыто", int(summary["required_covered"]))
-                        cc4.metric("Required пусто", int(summary["required_missing"]))
-                        if summary["readiness_pct"] == 100:
-                            st.success("Обязательные Ozon-атрибуты по этой категории закрыты.")
-                        else:
-                            st.warning("Не все обязательные Ozon-атрибуты закрыты. Ниже видно, что именно отсутствует.")
-                        coverage_df = pd.DataFrame(coverage["rows"])
-                        if not coverage_df.empty:
-                            st.dataframe(coverage_df, use_container_width=True, hide_index=True)
+                    preview_rows = build_product_ozon_payload(
+                        conn,
+                        product_id=int(selected_product_id),
+                        description_category_id=int(selected_row["description_category_id"]),
+                        type_id=int(selected_row["type_id"]),
+                        required_only=False,
+                    )
+                    if preview_rows:
+                        preview_df = pd.DataFrame(preview_rows)
+                        p1, p2, p3 = st.columns(3)
+                        p1.metric("Готово к автозаполнению", int((preview_df["status"] == "ready").sum()))
+                        p2.metric("Пусто после маппинга", int((preview_df["status"] == "empty").sum()))
+                        p3.metric("Required ready", int(((preview_df["status"] == "ready") & (preview_df["is_required"] == 1)).sum()))
+
+                        action1, action2 = st.columns(2)
+                        with action1:
+                            if st.button("Проверить покрытие товара под Ozon"):
+                                coverage = analyze_product_ozon_coverage(
+                                    conn,
+                                    product_id=int(selected_product_id),
+                                    description_category_id=int(selected_row["description_category_id"]),
+                                    type_id=int(selected_row["type_id"]),
+                                )
+                                summary = coverage["summary"]
+                                cc1, cc2, cc3, cc4 = st.columns(4)
+                                cc1.metric("Ready %", int(summary["readiness_pct"]))
+                                cc2.metric("Required всего", int(summary["required_total"]))
+                                cc3.metric("Required закрыто", int(summary["required_covered"]))
+                                cc4.metric("Required пусто", int(summary["required_missing"]))
+                                if summary["readiness_pct"] == 100:
+                                    st.success("Обязательные Ozon-атрибуты по этой категории закрыты.")
+                                else:
+                                    st.warning("Не все обязательные Ozon-атрибуты закрыты. Ниже видно, что именно отсутствует.")
+                                coverage_df = pd.DataFrame(coverage["rows"])
+                                if not coverage_df.empty:
+                                    st.dataframe(coverage_df, use_container_width=True, hide_index=True)
+                        with action2:
+                            if st.button("Заполнить Ozon-атрибуты из мастер-карточки"):
+                                result = materialize_product_ozon_attributes(
+                                    conn,
+                                    product_id=int(selected_product_id),
+                                    description_category_id=int(selected_row["description_category_id"]),
+                                    type_id=int(selected_row["type_id"]),
+                                    required_only=False,
+                                )
+                                st.success(f"Записано Ozon-значений: {result['applied']}, пустых пропущено: {result['skipped_empty']}. category_code={result['category_code']}")
+
+                        st.markdown("### Preview полуавтозаполнения Ozon")
+                        st.dataframe(preview_df[[c for c in ["attribute_id", "name", "is_required", "source_type", "source_name", "transform_rule", "status", "value"] if c in preview_df.columns]], use_container_width=True, hide_index=True)
             else:
                 st.info("По этой категории атрибуты ещё не загружались.")
     else:

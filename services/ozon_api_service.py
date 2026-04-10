@@ -7,7 +7,8 @@ from typing import Any
 
 import httpx
 
-from services.attribute_service import list_channel_mapping_rules, upsert_channel_mapping_rule
+from services.attribute_service import list_channel_mapping_rules, set_product_attribute_value, upsert_channel_mapping_rule
+from services.source_tracking import save_field_source
 from services.template_matching import build_product_value_map
 from services.transforms import apply_transform
 
@@ -320,11 +321,62 @@ def import_cached_attributes_to_pim(
     return {"imported": imported, "required": required, "category_code": category_code}
 
 
+MASTER_ATTRIBUTE_DEFAULTS = [
+    {"code": "hashtags", "name": "Хештеги", "data_type": "text", "description": "Ключевые хештеги для маркетплейса"},
+    {"code": "rich_content_json", "name": "Rich-контент JSON", "data_type": "json", "description": "Rich-контент в JSON для маркетплейсов"},
+    {"code": "side_wheels_included", "name": "Боковые колеса в комплекте", "data_type": "boolean", "description": "Есть ли боковые колёса в комплекте"},
+    {"code": "factory_pack_count", "name": "Количество заводских упаковок", "data_type": "number", "description": "Сколько заводских упаковок у товара"},
+    {"code": "unit_count", "name": "Количество товара в УЕИ", "data_type": "number", "description": "Количество в условной единице измерения"},
+    {"code": "min_wholesale_qty", "name": "Минимальное количество оптом", "data_type": "number", "description": "Минимальное количество для опта"},
+    {"code": "package_type", "name": "Тип упаковки", "data_type": "text", "description": "Тип потребительской или транспортной упаковки"},
+    {"code": "delivery_form", "name": "Форма поставки", "data_type": "text", "description": "Форма поставки товара"},
+    {"code": "wheel_type", "name": "Вид колес", "data_type": "text", "description": "Тип колёс велосипеда"},
+    {"code": "rim_type", "name": "Вид обода", "data_type": "text", "description": "Тип обода"},
+    {"code": "wheel_count", "name": "Количество колес", "data_type": "number", "description": "Количество колёс"},
+    {"code": "equipment", "name": "Комплектация", "data_type": "text", "description": "Комплектация товара"},
+    {"code": "bike_suspension", "name": "Амортизация велосипеда", "data_type": "text", "description": "Тип амортизации велосипеда"},
+    {"code": "bike_type", "name": "Вид велосипеда", "data_type": "text", "description": "Вид велосипеда"},
+    {"code": "child_bike_type", "name": "Вид детского велосипеда", "data_type": "text", "description": "Подтип детского велосипеда"},
+    {"code": "protection", "name": "Защита", "data_type": "text", "description": "Защитные элементы и защита"},
+    {"code": "speed_count", "name": "Количество скоростей велосипеда", "data_type": "number", "description": "Количество скоростей"},
+    {"code": "fork_type", "name": "Конструкция вилки", "data_type": "text", "description": "Конструкция вилки"},
+    {"code": "max_load_kg", "name": "Макс. нагрузка, кг", "data_type": "number", "description": "Максимальная нагрузка в кг"},
+    {"code": "drive_type", "name": "Привод велосипеда", "data_type": "text", "description": "Тип привода велосипеда"},
+    {"code": "handlebar_adjustment", "name": "Регулировка руля", "data_type": "text", "description": "Регулировка руля"},
+    {"code": "seat_adjustment", "name": "Регулировка сидения", "data_type": "text", "description": "Регулировка сидения"},
+    {"code": "adjustments", "name": "Регулировки и настройки", "data_type": "text", "description": "Прочие регулировки и настройки"},
+    {"code": "recommended_height_cm", "name": "Рекомендуемый рост, см", "data_type": "text", "description": "Рекомендуемый рост пользователя"},
+    {"code": "steering_column_type", "name": "Конструкция рулевой колонки", "data_type": "text", "description": "Конструкция рулевой колонки"},
+    {"code": "handlebar_type", "name": "Конструкция руля", "data_type": "text", "description": "Тип или конструкция руля"},
+    {"code": "rear_brake", "name": "Задний тормоз", "data_type": "text", "description": "Тип заднего тормоза"},
+    {"code": "front_brake", "name": "Передний тормоз", "data_type": "text", "description": "Тип переднего тормоза"},
+    {"code": "bike_part_type", "name": "Вид запчасти, аксессуара для велосипеда", "data_type": "text", "description": "Тип велосипедной запчасти или аксессуара"},
+    {"code": "brake_system_type", "name": "Вид тормозной системы", "data_type": "text", "description": "Тип тормозной системы"},
+    {"code": "drive_component_type", "name": "Вид элемента велосипедного привода", "data_type": "text", "description": "Тип элемента привода"},
+    {"code": "quantity_pcs", "name": "Количество, шт", "data_type": "number", "description": "Количество штук"},
+    {"code": "tool_purpose", "name": "Назначение инструмента", "data_type": "text", "description": "Назначение инструмента"},
+    {"code": "compatible_with", "name": "Подходит к", "data_type": "text", "description": "Совместимость товара"},
+    {"code": "shelf_life_days", "name": "Срок годности в днях", "data_type": "number", "description": "Срок годности в днях"},
+    {"code": "thickness_mm", "name": "Толщина, мм", "data_type": "number", "description": "Толщина в мм"},
+    {"code": "teeth_count", "name": "Число зубьев", "data_type": "number", "description": "Количество зубьев"},
+    {"code": "pdf_url", "name": "Документ PDF", "data_type": "text", "description": "Ссылка на PDF-документ"},
+    {"code": "pdf_file_name", "name": "Название файла PDF", "data_type": "text", "description": "Название PDF файла"},
+    {"code": "merge_similar_items", "name": "Объединить в похожие товары", "data_type": "boolean", "description": "Флаг объединения в похожие товары"},
+    {"code": "ozon_video_title", "name": "Ozon Видео название", "data_type": "text", "description": "Название видео для Ozon"},
+    {"code": "ozon_video_url", "name": "Ozon Видео ссылка", "data_type": "text", "description": "Ссылка на видео для Ozon"},
+    {"code": "ozon_video_products", "name": "Ozon Видео товары", "data_type": "text", "description": "Связанные товары на видео"},
+    {"code": "ozon_video_cover_url", "name": "Ozon Видеообложка ссылка", "data_type": "text", "description": "Ссылка на обложку видео"},
+    {"code": "dimensions_mm", "name": "Размеры, мм", "data_type": "text", "description": "Размеры товара в мм"},
+]
+
+
 KNOWN_OZON_MAPPING_RULES = [
     (("бренд",), "column", "brand", None),
-    (("название модели", "модель"), "column", "name", None),
+    (("название модели", "модель"), "attribute", "model", None),
+    (("название",), "column", "name", None),
     (("аннотация", "описание"), "column", "description", None),
     (("штрихкод",), "column", "barcode", None),
+    (("код продавца",), "column", "article", None),
     (("вес с упаковкой",), "column", "gross_weight", "kg_to_g"),
     (("вес товара", "вес в собранном состоянии"), "column", "weight", "kg_to_g"),
     (("длина упаковки",), "column", "package_length", "cm_to_mm"),
@@ -337,16 +389,105 @@ KNOWN_OZON_MAPPING_RULES = [
     (("материал",), "attribute", "material", None),
     (("пол",), "attribute", "gender", None),
     (("возраст",), "attribute", "age_group", None),
-    (("диаметр колес", "диаметр колёс"), "column", "wheel_diameter_inch", None),
-    (("страна производства",), "attribute", "country_of_origin", None),
+    (("диаметр колес", "диаметр колёс"), "attribute", "wheel_diameter_inch", None),
+    (("страна производства", "страна изготовитель"), "attribute", "country_of_origin", None),
     (("тн вэд",), "column", "tnved_code", None),
     (("фото", "изображ"), "column", "media_gallery", "first_image"),
     (("тип",), "column", "subcategory", None),
+    (("гарантийный срок",), "attribute", "warranty_months", None),
+    (("количество заводских упаковок",), "attribute", "factory_pack_count", None),
+    (("количество товара в уеи",), "attribute", "unit_count", None),
+    (("минимальное количество оптом",), "attribute", "min_wholesale_qty", None),
+    (("упаковка",), "attribute", "package_type", None),
+    (("форма поставки",), "attribute", "delivery_form", None),
+    (("вид колес",), "attribute", "wheel_type", None),
+    (("вид обода",), "attribute", "rim_type", None),
+    (("количество колес",), "attribute", "wheel_count", None),
+    (("комплектация",), "attribute", "equipment", None),
+    (("амортизация велосипеда",), "attribute", "bike_suspension", None),
+    (("вид детского велосипеда",), "attribute", "child_bike_type", None),
+    (("вид велосипеда",), "attribute", "bike_type", None),
+    (("вид запчасти",), "attribute", "bike_part_type", None),
+    (("вид тормозной системы",), "attribute", "brake_system_type", None),
+    (("вид элемента велосипедного привода",), "attribute", "drive_component_type", None),
+    (("защита",), "attribute", "protection", None),
+    (("количество скоростей",), "attribute", "speed_count", None),
+    (("конструкция вилки",), "attribute", "fork_type", None),
+    (("макс. нагрузка",), "attribute", "max_load_kg", None),
+    (("привод велосипеда",), "attribute", "drive_type", None),
+    (("размер рамы",), "attribute", "frame_size", None),
+    (("регулировка руля",), "attribute", "handlebar_adjustment", None),
+    (("регулировка сидения",), "attribute", "seat_adjustment", None),
+    (("регулировки и настройки",), "attribute", "adjustments", None),
+    (("рекомендуемый рост",), "attribute", "recommended_height_cm", None),
+    (("конструкция рулевой колонки",), "attribute", "steering_column_type", None),
+    (("конструкция руля",), "attribute", "handlebar_type", None),
+    (("задний тормоз",), "attribute", "rear_brake", None),
+    (("передний тормоз",), "attribute", "front_brake", None),
+    (("количество, шт",), "attribute", "quantity_pcs", None),
+    (("назначение инструмента",), "attribute", "tool_purpose", None),
+    (("подходит к",), "attribute", "compatible_with", None),
+    (("срок годности в днях",), "attribute", "shelf_life_days", None),
+    (("толщина, мм",), "attribute", "thickness_mm", None),
+    (("число зубьев",), "attribute", "teeth_count", None),
+    (("боковые колеса",), "attribute", "side_wheels_included", None),
+    (("rich контент",), "attribute", "rich_content_json", None),
+    (("#хештеги", "хештеги"), "attribute", "hashtags", None),
+    (("документ pdf",), "attribute", "pdf_url", None),
+    (("название файла pdf",), "attribute", "pdf_file_name", None),
+    (("объединить в похожие товары",), "attribute", "merge_similar_items", None),
+    (("озон.видео: название",), "attribute", "ozon_video_title", None),
+    (("озон.видео: ссылка",), "attribute", "ozon_video_url", None),
+    (("озон.видео: товары на видео",), "attribute", "ozon_video_products", None),
+    (("озон.видеообложка: ссылка",), "attribute", "ozon_video_cover_url", None),
+    (("размеры, мм",), "attribute", "dimensions_mm", None),
 ]
 
 
 def _normalize_name(value: str | None) -> str:
-    return " ".join((value or "").strip().lower().replace("ё", "е").replace("_", " ").split())
+    return " ".join((value or "").strip().lower().replace("ё", "е").replace("_", " ").replace("-", " ").split())
+
+
+
+def ensure_ozon_master_attributes(conn: sqlite3.Connection) -> dict[str, Any]:
+    inserted = 0
+    for item in MASTER_ATTRIBUTE_DEFAULTS:
+        existed = conn.execute("SELECT 1 FROM attribute_definitions WHERE code = ?", (item["code"],)).fetchone()
+        conn.execute(
+            """
+            INSERT INTO attribute_definitions
+            (code, name, data_type, scope, entity_type, is_required, is_multi_value, unit, description, created_at, updated_at)
+            VALUES (?, ?, ?, 'master', 'product', 0, 0, NULL, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            ON CONFLICT(code) DO UPDATE SET
+                name = excluded.name,
+                data_type = excluded.data_type,
+                description = excluded.description,
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            (item["code"], item["name"], item["data_type"], item.get("description")),
+        )
+        if not existed:
+            inserted += 1
+    conn.commit()
+    return {"inserted": inserted, "total": len(MASTER_ATTRIBUTE_DEFAULTS)}
+
+
+
+def _product_columns(conn: sqlite3.Connection) -> set[str]:
+    rows = conn.execute("PRAGMA table_info(products)").fetchall()
+    return {str(r[1]) for r in rows} | {"media_gallery"}
+
+
+
+def _source_exists(conn: sqlite3.Connection, source_type: str | None, source_name: str | None) -> bool:
+    if not source_type or not source_name:
+        return False
+    if source_type == "column":
+        return source_name in _product_columns(conn)
+    if source_type == "attribute":
+        row = conn.execute("SELECT 1 FROM attribute_definitions WHERE code = ?", (str(source_name),)).fetchone()
+        return bool(row)
+    return False
 
 
 
@@ -355,6 +496,7 @@ def suggest_mappings_for_cached_attributes(
     description_category_id: int,
     type_id: int,
 ) -> list[dict[str, Any]]:
+    ensure_ozon_master_attributes(conn)
     attributes = list_cached_attributes(conn, description_category_id=int(description_category_id), type_id=int(type_id), limit=5000)
     category_code = f"ozon:{int(description_category_id)}:{int(type_id)}"
     existing_rules = {
@@ -373,14 +515,14 @@ def suggest_mappings_for_cached_attributes(
         matched_by = None
 
         existing = existing_rules.get(target_field)
-        if existing:
+        if existing and _source_exists(conn, existing.get("source_type"), existing.get("source_name")):
             source_type = existing.get("source_type")
             source_name = existing.get("source_name")
             transform_rule = existing.get("transform_rule")
             matched_by = "saved_rule"
         else:
             for needles, candidate_source_type, candidate_source_name, candidate_transform in KNOWN_OZON_MAPPING_RULES:
-                if any(needle in normalized for needle in needles):
+                if any(needle in normalized for needle in needles) and _source_exists(conn, candidate_source_type, candidate_source_name):
                     source_type = candidate_source_type
                     source_name = candidate_source_name
                     transform_rule = candidate_transform
@@ -472,4 +614,83 @@ def analyze_product_ozon_coverage(
             "readiness_pct": readiness,
         },
         "rows": rows,
+    }
+
+
+
+def build_product_ozon_payload(
+    conn: sqlite3.Connection,
+    product_id: int,
+    description_category_id: int,
+    type_id: int,
+    required_only: bool = False,
+) -> list[dict[str, Any]]:
+    suggestions = suggest_mappings_for_cached_attributes(conn, description_category_id, type_id)
+    value_map = build_product_value_map(conn, int(product_id))
+    rows: list[dict[str, Any]] = []
+    for row in suggestions:
+        if required_only and not row.get("is_required"):
+            continue
+        if row.get("status") != "matched":
+            continue
+        source_name = row.get("source_name")
+        value = apply_transform(value_map.get(source_name), row.get("transform_rule")) if source_name else None
+        rows.append(
+            {
+                "target_field": row.get("target_field"),
+                "attribute_id": row.get("attribute_id"),
+                "name": row.get("name"),
+                "is_required": int(bool(row.get("is_required"))),
+                "source_type": row.get("source_type"),
+                "source_name": source_name,
+                "transform_rule": row.get("transform_rule"),
+                "value": value,
+                "status": "ready" if value not in (None, "", [], {}) else "empty",
+            }
+        )
+    return rows
+
+
+
+def materialize_product_ozon_attributes(
+    conn: sqlite3.Connection,
+    product_id: int,
+    description_category_id: int,
+    type_id: int,
+    required_only: bool = False,
+) -> dict[str, Any]:
+    import_cached_attributes_to_pim(conn, description_category_id, type_id)
+    payload_rows = build_product_ozon_payload(conn, product_id, description_category_id, type_id, required_only=required_only)
+    category_code = f"ozon:{int(description_category_id)}:{int(type_id)}"
+    applied = 0
+    skipped_empty = 0
+    for row in payload_rows:
+        value = row.get("value")
+        if value in (None, "", [], {}):
+            skipped_empty += 1
+            continue
+        set_product_attribute_value(
+            conn,
+            product_id=int(product_id),
+            attribute_code=str(row["target_field"]),
+            value=value,
+            channel_code="ozon",
+        )
+        save_field_source(
+            conn=conn,
+            product_id=int(product_id),
+            field_name=f"attr:{row['target_field']}",
+            source_type="ozon_autofill",
+            source_value_raw=value,
+            source_url=category_code,
+            confidence=0.85,
+            is_manual=False,
+        )
+        applied += 1
+    conn.commit()
+    return {
+        "applied": applied,
+        "skipped_empty": skipped_empty,
+        "category_code": category_code,
+        "rows": payload_rows,
     }
