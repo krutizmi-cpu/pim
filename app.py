@@ -25,6 +25,7 @@ from services.supplier_parser import fetch_supplier_page, extract_supplier_data,
 from services.template_matching import auto_match_template_columns, apply_saved_mapping_rules, fill_template_dataframe, apply_client_validated_values, dataframe_to_excel_bytes
 from services.template_profiles import save_template_profile, list_template_profiles, get_template_profile_columns
 from services.readiness_service import analyze_template_readiness
+from services.ozon_api_service import is_configured, sync_category_tree, list_cached_categories, sync_category_attributes, list_cached_attributes
 
 st.set_page_config(page_title="PIM", page_icon="📦", layout="wide")
 
@@ -1011,6 +1012,77 @@ def show_template_tab():
     conn.close()
 
 
+def show_ozon_tab():
+    conn = get_db()
+    st.subheader("Ozon")
+    st.caption("Ozon для нас, это эталон структуры и атрибутов. Здесь синхронизируем дерево категорий и характеристики категорий в локальный кэш PIM.")
+
+    c1, c2 = st.columns(2)
+    with c1:
+        client_id = st.text_input("Ozon Client ID", value="")
+    with c2:
+        api_key = st.text_input("Ozon API Key", value="", type="password")
+
+    configured = is_configured(client_id or None, api_key or None)
+    if configured:
+        st.success("Ozon-креды заданы, можно синхронизировать дерево и атрибуты.")
+    else:
+        st.warning("Ozon-креды не заданы в этой сессии. Можно вставить их сюда вручную и сразу выполнить sync.")
+
+    top1, top2 = st.columns(2)
+    with top1:
+        if st.button("Синхронизировать дерево категорий Ozon", type="primary", disabled=not configured):
+            result = sync_category_tree(conn, client_id=client_id or None, api_key=api_key or None)
+            st.success(f"Дерево категорий обновлено, записей: {result['total']}")
+            st.rerun()
+    with top2:
+        category_limit = st.number_input("Сколько категорий показать", min_value=50, max_value=2000, value=200, step=50)
+
+    categories = list_cached_categories(conn, limit=int(category_limit))
+    if categories:
+        cat_df = pd.DataFrame(categories)
+        st.markdown("### Кэш категорий Ozon")
+        st.dataframe(cat_df[[c for c in ["description_category_id", "category_name", "full_path", "type_id", "type_name", "disabled", "fetched_at"] if c in cat_df.columns]], use_container_width=True, hide_index=True)
+
+        valid_rows = [row for row in categories if row.get("description_category_id") and row.get("type_id")]
+        if valid_rows:
+            category_options = [f"{row['full_path']} | cat={row['description_category_id']} | type={row['type_id']}" for row in valid_rows]
+            selected_category_label = st.selectbox("Категория Ozon для загрузки атрибутов", options=category_options)
+            selected_row = valid_rows[category_options.index(selected_category_label)]
+
+            a1, a2 = st.columns(2)
+            with a1:
+                if st.button("Синхронизировать атрибуты выбранной категории", disabled=not configured):
+                    result = sync_category_attributes(
+                        conn,
+                        description_category_id=int(selected_row["description_category_id"]),
+                        type_id=int(selected_row["type_id"]),
+                        client_id=client_id or None,
+                        api_key=api_key or None,
+                    )
+                    st.success(f"Атрибуты обновлены: всего {result['total']}, обязательных {result['required']}")
+                    st.rerun()
+            with a2:
+                attr_limit = st.number_input("Сколько атрибутов показать", min_value=50, max_value=2000, value=300, step=50)
+
+            attributes = list_cached_attributes(
+                conn,
+                description_category_id=int(selected_row["description_category_id"]),
+                type_id=int(selected_row["type_id"]),
+                limit=int(attr_limit),
+            )
+            if attributes:
+                attr_df = pd.DataFrame(attributes)
+                st.markdown("### Атрибуты выбранной категории")
+                st.dataframe(attr_df[[c for c in ["attribute_id", "name", "group_name", "type", "dictionary_id", "is_required", "is_collection", "max_value_count", "fetched_at"] if c in attr_df.columns]], use_container_width=True, hide_index=True)
+            else:
+                st.info("По этой категории атрибуты ещё не загружались.")
+    else:
+        st.info("Кэш категорий пока пуст. Сначала синхронизируй дерево Ozon.")
+
+    conn.close()
+
+
 def show_channels_tab():
     conn = get_db()
     st.subheader("Каналы")
@@ -1108,8 +1180,8 @@ def main():
             """
         )
 
-    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
-        ["📥 Импорт", "📚 Каталог", "🧾 Карточка", "🧩 Атрибуты", "🧠 Клиентский шаблон", "⚙️ Каналы"]
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(
+        ["📥 Импорт", "📚 Каталог", "🧾 Карточка", "🧩 Атрибуты", "🧠 Клиентский шаблон", "🛒 Ozon", "⚙️ Каналы"]
     )
 
     with tab1:
@@ -1128,6 +1200,9 @@ def main():
         show_template_tab()
 
     with tab6:
+        show_ozon_tab()
+
+    with tab7:
         show_channels_tab()
 
 

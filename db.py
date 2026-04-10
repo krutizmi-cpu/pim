@@ -316,6 +316,69 @@ def _ensure_template_profile_tables(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_tpc_profile_id ON template_profile_columns(profile_id)")
 
 
+def _ensure_ozon_tables(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS ozon_category_cache (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            description_category_id INTEGER,
+            category_name TEXT,
+            full_path TEXT,
+            type_id INTEGER,
+            type_name TEXT,
+            disabled INTEGER DEFAULT 0,
+            children_count INTEGER DEFAULT 0,
+            raw_json TEXT,
+            fetched_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    existing_cat_cols = _table_columns(conn, "ozon_category_cache")
+    if "full_path" not in existing_cat_cols:
+        conn.execute("ALTER TABLE ozon_category_cache ADD COLUMN full_path TEXT")
+    if "children_count" not in existing_cat_cols:
+        conn.execute("ALTER TABLE ozon_category_cache ADD COLUMN children_count INTEGER DEFAULT 0")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_ozon_cat_desc ON ozon_category_cache(description_category_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_ozon_cat_type ON ozon_category_cache(type_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_ozon_cat_path ON ozon_category_cache(full_path)"
+    )
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS ozon_attribute_cache (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            description_category_id INTEGER NOT NULL,
+            type_id INTEGER NOT NULL,
+            attribute_id INTEGER NOT NULL,
+            name TEXT,
+            description TEXT,
+            type TEXT,
+            group_id INTEGER,
+            group_name TEXT,
+            dictionary_id INTEGER,
+            is_required INTEGER DEFAULT 0,
+            is_collection INTEGER DEFAULT 0,
+            max_value_count INTEGER,
+            category_dependent INTEGER DEFAULT 0,
+            raw_json TEXT,
+            fetched_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_ozon_attr_desc_type ON ozon_attribute_cache(description_category_id, type_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_ozon_attr_attr_id ON ozon_attribute_cache(attribute_id)"
+    )
+
+
+
 def _ensure_channel_tables(conn: sqlite3.Connection) -> None:
     conn.execute(
         """
@@ -481,6 +544,7 @@ def init_db(conn: sqlite3.Connection) -> None:
     _ensure_attribute_tables(conn)
     _ensure_product_data_sources_table(conn)
     _ensure_template_profile_tables(conn)
+    _ensure_ozon_tables(conn)
     _ensure_channel_tables(conn)
 
     _seed_category_defaults(conn)
