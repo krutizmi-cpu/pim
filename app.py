@@ -24,6 +24,7 @@ from services.source_priority import can_overwrite_field
 from services.supplier_parser import fetch_supplier_page, extract_supplier_data, normalize_supplier_data
 from services.template_matching import auto_match_template_columns, apply_saved_mapping_rules, fill_template_dataframe, apply_client_validated_values, dataframe_to_excel_bytes
 from services.template_profiles import save_template_profile, list_template_profiles, get_template_profile_columns
+from services.readiness_service import analyze_template_readiness
 
 st.set_page_config(page_title="PIM", page_icon="📦", layout="wide")
 
@@ -197,6 +198,29 @@ def export_current_df(df: pd.DataFrame):
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         df.to_excel(writer, index=False, sheet_name="products")
     return output.getvalue()
+
+
+def render_template_readiness(filled_df: pd.DataFrame, manual_rows: list[dict]) -> None:
+    readiness = analyze_template_readiness(filled_df, manual_rows)
+    summary = readiness["summary"]
+
+    st.markdown("### Readiness шаблона")
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Средняя готовность", f"{summary['avg_readiness']}%")
+    c2.metric("Matched колонок", summary["matched_columns"])
+    c3.metric("Unmatched колонок", summary["unmatched_columns"])
+    c4.metric("Готово", summary["ready_rows"])
+    c5.metric("Нужно добить", summary["partial_rows"] + summary["blocked_rows"])
+
+    coverage_df = pd.DataFrame(readiness["column_coverage"])
+    if not coverage_df.empty:
+        st.caption("Покрытие по колонкам шаблона")
+        st.dataframe(coverage_df, use_container_width=True, hide_index=True)
+
+    row_df = pd.DataFrame(readiness["row_readiness"])
+    if not row_df.empty:
+        st.caption("Строки, где ещё есть пробелы")
+        st.dataframe(row_df.head(200), use_container_width=True, hide_index=True)
 
 
 def show_import_tab():
@@ -781,6 +805,7 @@ def show_template_tab():
                 filled_df = fill_template_dataframe(conn, template_df, selected_ids, manual_rows)
                 st.markdown("### Предпросмотр заполнения")
                 st.dataframe(filled_df, use_container_width=True, hide_index=True)
+                render_template_readiness(filled_df, manual_rows)
 
                 gap_rows = []
                 gap_actions = []
