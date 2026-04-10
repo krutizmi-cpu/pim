@@ -203,24 +203,62 @@ def export_current_df(df: pd.DataFrame):
 def render_template_readiness(filled_df: pd.DataFrame, manual_rows: list[dict]) -> None:
     readiness = analyze_template_readiness(filled_df, manual_rows)
     summary = readiness["summary"]
+    avg_readiness = int(summary["avg_readiness"])
+    unmatched_columns = int(summary["unmatched_columns"])
+    blocked_rows = int(summary["blocked_rows"])
+    rows_to_fix = int(summary["partial_rows"] + summary["blocked_rows"])
 
-    st.markdown("### Readiness шаблона")
-    c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("Средняя готовность", f"{summary['avg_readiness']}%")
-    c2.metric("Matched колонок", summary["matched_columns"])
-    c3.metric("Unmatched колонок", summary["unmatched_columns"])
-    c4.metric("Готово", summary["ready_rows"])
-    c5.metric("Нужно добить", summary["partial_rows"] + summary["blocked_rows"])
+    st.markdown("### Готовность шаблона")
+
+    if avg_readiness >= 95 and unmatched_columns == 0 and blocked_rows == 0:
+        st.success("Шаблон выглядит почти готовым, критичных дыр не видно.")
+    elif avg_readiness >= 80:
+        st.warning("Шаблон уже в рабочем состоянии, но часть полей и строк ещё нужно добить.")
+    else:
+        st.error("Шаблон пока сырой, сначала лучше закрыть пробелы в матчинге и данных.")
+
+    st.progress(max(0, min(avg_readiness, 100)) / 100)
+
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
+    c1.metric("Средняя готовность", f"{avg_readiness}%")
+    c2.metric("Matched", summary["matched_columns"])
+    c3.metric("Unmatched", unmatched_columns)
+    c4.metric("Готовых строк", summary["ready_rows"])
+    c5.metric("Частично готовы", summary["partial_rows"])
+    c6.metric("Блокеры", blocked_rows)
 
     coverage_df = pd.DataFrame(readiness["column_coverage"])
-    if not coverage_df.empty:
-        st.caption("Покрытие по колонкам шаблона")
-        st.dataframe(coverage_df, use_container_width=True, hide_index=True)
-
     row_df = pd.DataFrame(readiness["row_readiness"])
-    if not row_df.empty:
-        st.caption("Строки, где ещё есть пробелы")
-        st.dataframe(row_df.head(200), use_container_width=True, hide_index=True)
+
+    if not coverage_df.empty:
+        weak_columns = coverage_df[coverage_df["Покрытие, %"] < 100]
+        if not weak_columns.empty:
+            st.caption(f"Колонки, которые требуют внимания: {len(weak_columns)}")
+            st.dataframe(weak_columns.head(15), use_container_width=True, hide_index=True)
+
+    if rows_to_fix > 0:
+        st.caption(f"Строки, которые ещё нужно добить: {rows_to_fix}")
+
+    tab_cov, tab_rows, tab_all = st.tabs(["Проблемные колонки", "Проблемные строки", "Все колонки"])
+    with tab_cov:
+        if not coverage_df.empty:
+            problem_df = coverage_df[coverage_df["Покрытие, %"] < 100]
+            if problem_df.empty:
+                st.success("Все колонки шаблона заполнены на 100%.")
+            else:
+                st.dataframe(problem_df, use_container_width=True, hide_index=True)
+        else:
+            st.info("Пока нет данных для оценки колонок.")
+    with tab_rows:
+        if not row_df.empty:
+            st.dataframe(row_df.head(200), use_container_width=True, hide_index=True)
+        else:
+            st.success("Проблемных строк не найдено.")
+    with tab_all:
+        if not coverage_df.empty:
+            st.dataframe(coverage_df, use_container_width=True, hide_index=True)
+        else:
+            st.info("Пока нет данных для полной сводки.")
 
 
 def show_import_tab():
@@ -674,6 +712,7 @@ def show_attributes_tab():
 
 def show_template_tab():
     st.subheader("Клиентский шаблон")
+    st.caption("Здесь должен быть понятный сценарий: загрузили шаблон, увидели матчинг, поняли дыры, добили данные, скачали готовый файл.")
     conn = get_db()
 
     t1, t2 = st.columns([1, 1])
@@ -704,9 +743,6 @@ def show_template_tab():
 
     if uploaded is not None:
         template_df = pd.read_excel(uploaded)
-        st.markdown("### Колонки шаблона")
-        st.dataframe(pd.DataFrame({"template_column": list(template_df.columns)}), use_container_width=True, hide_index=True)
-
         matches = auto_match_template_columns(conn, list(template_df.columns))
         matches = apply_saved_mapping_rules(conn, matches, channel_code=channel_code, category_code=category_code or None)
         if selected_profile_id:
@@ -723,148 +759,228 @@ def show_template_tab():
                 }
                 for m in matches
             ]
+
         match_df = pd.DataFrame(matches)
-        st.markdown("### Автоматический матчинг")
-        st.dataframe(match_df, use_container_width=True, hide_index=True)
+        matched_count = int((match_df["status"] == "matched").sum()) if not match_df.empty else 0
+        unmatched_count = int((match_df["status"] != "matched").sum()) if not match_df.empty else 0
 
-        st.markdown("### Ручная правка матчинга")
-        manual_rows = []
-        transform_options = ["", "cm_to_mm", "mm_to_cm", "m_to_cm", "kg_to_g", "g_to_kg", "inch_to_cm", "lower", "upper", "strip", "first_image", "join_images", "image_1", "image_2", "image_3", "image_4", "image_5"]
-        for idx, match in enumerate(matches):
-            c1, c2, c3, c4 = st.columns([2, 2, 2, 2])
-            with c1:
-                st.text_input("Колонка", value=match["template_column"], disabled=True, key=f"tmpl_col_{idx}")
-            with c2:
-                source_type = st.selectbox(
-                    "Тип источника",
-                    options=["attribute", "column", "skip"],
-                    index=( ["attribute", "column", "skip"].index(match["source_type"]) if match["source_type"] in ["attribute", "column"] else 2 ),
-                    key=f"tmpl_type_{idx}",
-                )
-            with c3:
-                allowed_names = [name for stype, name in source_options if stype == source_type] if source_type != "skip" else [""]
-                current_name = match["source_name"] if match["source_name"] in allowed_names else (allowed_names[0] if allowed_names else "")
-                source_name = st.selectbox("Источник", options=allowed_names, index=(allowed_names.index(current_name) if current_name in allowed_names else 0), key=f"tmpl_name_{idx}") if allowed_names else st.text_input("Источник", value="", key=f"tmpl_name_{idx}")
-            with c4:
-                current_transform = match.get("transform_rule") if match.get("transform_rule") in transform_options else ""
-                transform_rule = st.selectbox("Transform", options=transform_options, index=transform_options.index(current_transform), key=f"tmpl_transform_{idx}")
-            manual_rows.append({
-                "template_column": match["template_column"],
-                "status": "matched" if source_type != "skip" else "unmatched",
-                "source_type": None if source_type == "skip" else source_type,
-                "source_name": None if source_type == "skip" else source_name,
-                "matched_by": "manual" if source_type != "skip" else None,
-                "transform_rule": transform_rule or None,
-            })
+        st.markdown("### Сводка по шаблону")
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Колонок в шаблоне", len(template_df.columns))
+        c2.metric("Сматчено", matched_count)
+        c3.metric("Не сматчено", unmatched_count)
+        c4.metric("Профилей найдено", len(existing_profiles))
 
-        s1, s2 = st.columns(2)
-        with s1:
-            if st.button("Сохранить mapping rules", type="primary"):
-                saved = 0
-                for row in manual_rows:
-                    if row["status"] != "matched":
-                        continue
-                    upsert_channel_mapping_rule(
+        if unmatched_count == 0:
+            st.success("По матчингу всё хорошо, можно переходить к товарам и preview.")
+        else:
+            st.warning("Есть несматченные колонки. Лучше сначала добить их, чтобы потом не ловить пустоты в выгрузке.")
+
+        tab_match, tab_fill, tab_gap = st.tabs(["1. Матчинг", "2. Заполнение и preview", "3. Gap и действия"])
+
+        with tab_match:
+            st.markdown("### Колонки шаблона")
+            st.dataframe(pd.DataFrame({"template_column": list(template_df.columns)}), use_container_width=True, hide_index=True)
+
+            st.markdown("### Автоматический матчинг")
+            st.dataframe(match_df, use_container_width=True, hide_index=True)
+
+            st.markdown("### Ручная правка матчинга")
+            manual_rows = []
+            transform_options = ["", "cm_to_mm", "mm_to_cm", "m_to_cm", "kg_to_g", "g_to_kg", "inch_to_cm", "lower", "upper", "strip", "first_image", "join_images", "image_1", "image_2", "image_3", "image_4", "image_5"]
+            for idx, match in enumerate(matches):
+                c1, c2, c3, c4 = st.columns([2, 2, 2, 2])
+                with c1:
+                    st.text_input("Колонка", value=match["template_column"], disabled=True, key=f"tmpl_col_{idx}")
+                with c2:
+                    source_type = st.selectbox(
+                        "Тип источника",
+                        options=["attribute", "column", "skip"],
+                        index=( ["attribute", "column", "skip"].index(match["source_type"]) if match["source_type"] in ["attribute", "column"] else 2 ),
+                        key=f"tmpl_type_{idx}",
+                    )
+                with c3:
+                    allowed_names = [name for stype, name in source_options if stype == source_type] if source_type != "skip" else [""]
+                    current_name = match["source_name"] if match["source_name"] in allowed_names else (allowed_names[0] if allowed_names else "")
+                    source_name = st.selectbox("Источник", options=allowed_names, index=(allowed_names.index(current_name) if current_name in allowed_names else 0), key=f"tmpl_name_{idx}") if allowed_names else st.text_input("Источник", value="", key=f"tmpl_name_{idx}")
+                with c4:
+                    current_transform = match.get("transform_rule") if match.get("transform_rule") in transform_options else ""
+                    transform_rule = st.selectbox("Transform", options=transform_options, index=transform_options.index(current_transform), key=f"tmpl_transform_{idx}")
+                manual_rows.append({
+                    "template_column": match["template_column"],
+                    "status": "matched" if source_type != "skip" else "unmatched",
+                    "source_type": None if source_type == "skip" else source_type,
+                    "source_name": None if source_type == "skip" else source_name,
+                    "matched_by": "manual" if source_type != "skip" else None,
+                    "transform_rule": transform_rule or None,
+                })
+
+            manual_df = pd.DataFrame(manual_rows)
+            unmatched = manual_df[manual_df["status"] == "unmatched"] if not manual_df.empty else pd.DataFrame()
+
+            s1, s2 = st.columns(2)
+            with s1:
+                if st.button("Сохранить mapping rules", type="primary"):
+                    saved = 0
+                    for row in manual_rows:
+                        if row["status"] != "matched":
+                            continue
+                        upsert_channel_mapping_rule(
+                            conn=conn,
+                            channel_code=channel_code,
+                            category_code=category_code or None,
+                            target_field=row["template_column"],
+                            source_type=row["source_type"],
+                            source_name=row["source_name"],
+                            transform_rule=row.get("transform_rule"),
+                            is_required=0,
+                        )
+                        saved += 1
+                    st.success(f"Сохранено mapping rules: {saved}")
+            with s2:
+                if st.button("Сохранить профиль шаблона"):
+                    profile_id = save_template_profile(
                         conn=conn,
+                        profile_name=profile_name,
                         channel_code=channel_code,
                         category_code=category_code or None,
-                        target_field=row["template_column"],
-                        source_type=row["source_type"],
-                        source_name=row["source_name"],
-                        transform_rule=row.get("transform_rule"),
-                        is_required=0,
+                        file_name=getattr(uploaded, 'name', None),
+                        columns=manual_rows,
                     )
-                    saved += 1
-                st.success(f"Сохранено mapping rules: {saved}")
-        with s2:
-            if st.button("Сохранить профиль шаблона"):
-                profile_id = save_template_profile(
-                    conn=conn,
-                    profile_name=profile_name,
-                    channel_code=channel_code,
-                    category_code=category_code or None,
-                    file_name=getattr(uploaded, 'name', None),
-                    columns=manual_rows,
+                    st.success(f"Профиль шаблона сохранён: #{profile_id}")
+
+            if not unmatched.empty:
+                st.warning(f"Не сматчено колонок: {len(unmatched)}")
+                st.dataframe(unmatched[["template_column", "status"]], use_container_width=True, hide_index=True)
+            else:
+                st.success("Все колонки шаблона сматчены.")
+
+        with tab_fill:
+            manual_rows = []
+            transform_options = ["", "cm_to_mm", "mm_to_cm", "m_to_cm", "kg_to_g", "g_to_kg", "inch_to_cm", "lower", "upper", "strip", "first_image", "join_images", "image_1", "image_2", "image_3", "image_4", "image_5"]
+            for idx, match in enumerate(matches):
+                source_type = st.session_state.get(f"tmpl_type_{idx}", match.get("source_type") if match.get("source_type") in ["attribute", "column"] else "skip")
+                source_name = st.session_state.get(f"tmpl_name_{idx}", match.get("source_name"))
+                transform_rule = st.session_state.get(f"tmpl_transform_{idx}", match.get("transform_rule") or "")
+                manual_rows.append({
+                    "template_column": match["template_column"],
+                    "status": "matched" if source_type != "skip" else "unmatched",
+                    "source_type": None if source_type == "skip" else source_type,
+                    "source_name": None if source_type == "skip" else source_name,
+                    "matched_by": "manual" if source_type != "skip" else None,
+                    "transform_rule": transform_rule or None,
+                })
+
+            if product_df.empty:
+                st.info("В каталоге пока нет товаров для заполнения шаблона.")
+            else:
+                selected_ids = st.multiselect(
+                    "Выбери товары для заполнения шаблона",
+                    options=product_df["id"].tolist(),
+                    format_func=lambda x: f"ID {x} | {product_df.loc[product_df['id'] == x, 'name'].iloc[0]}",
                 )
-                st.success(f"Профиль шаблона сохранён: #{profile_id}")
 
-        manual_df = pd.DataFrame(manual_rows)
-        unmatched = manual_df[manual_df["status"] == "unmatched"] if not manual_df.empty else pd.DataFrame()
-        if not unmatched.empty:
-            st.warning(f"Не сматчено колонок: {len(unmatched)}")
-            st.dataframe(unmatched, use_container_width=True, hide_index=True)
+                if not selected_ids:
+                    st.info("Выбери товары, и я покажу preview и готовность шаблона.")
+                else:
+                    filled_df = fill_template_dataframe(conn, template_df, selected_ids, manual_rows)
+                    st.markdown("### Предпросмотр заполнения")
+                    st.dataframe(filled_df, use_container_width=True, hide_index=True)
+                    render_template_readiness(filled_df, manual_rows)
 
-        if not product_df.empty:
-            selected_ids = st.multiselect(
-                "Выбери товары для заполнения шаблона",
-                options=product_df["id"].tolist(),
-                format_func=lambda x: f"ID {x} | {product_df.loc[product_df['id'] == x, 'name'].iloc[0]}",
-            )
-
-            if selected_ids:
-                filled_df = fill_template_dataframe(conn, template_df, selected_ids, manual_rows)
-                st.markdown("### Предпросмотр заполнения")
-                st.dataframe(filled_df, use_container_width=True, hide_index=True)
-                render_template_readiness(filled_df, manual_rows)
-
-                gap_rows = []
-                gap_actions = []
-                for _, row in manual_df.iterrows():
-                    if row["status"] != "matched":
-                        gap_rows.append({"template_column": row["template_column"], "reason": "Нет матчинга"})
-                        continue
-                    if filled_df[row["template_column"]].isna().all():
-                        gap_rows.append({"template_column": row["template_column"], "reason": "У выбранных товаров нет данных"})
-                        for product_id in selected_ids:
-                            product_row = get_product(conn, int(product_id))
-                            can_supplier = bool(product_row and product_row["supplier_url"])
-                            gap_actions.append({
-                                "product_id": product_id,
-                                "product_name": product_row["name"] if product_row else None,
-                                "template_column": row["template_column"],
-                                "can_supplier_enrich": can_supplier,
-                            })
-
-                if gap_rows:
-                    st.markdown("### Gap-анализ")
-                    st.dataframe(pd.DataFrame(gap_rows), use_container_width=True, hide_index=True)
-
-                if gap_actions:
-                    st.markdown("### Быстрые действия по gap")
-                    action_df = pd.DataFrame(gap_actions)
-                    st.dataframe(action_df, use_container_width=True, hide_index=True)
-
-                    action_product_id = st.selectbox(
-                        "Выбери товар для быстрого действия",
-                        options=sorted(set([x["product_id"] for x in gap_actions])),
-                        format_func=lambda x: f"ID {x} | {next((g['product_name'] for g in gap_actions if g['product_id'] == x), x)}",
-                    )
                     a1, a2 = st.columns(2)
                     with a1:
-                        if st.button("Обогатить товар из supplier", key="gap_supplier_enrich"):
-                            result = enrich_product_from_supplier(conn, int(action_product_id), force=False)
-                            if result["ok"]:
-                                st.success(result["message"])
-                                st.rerun()
-                            else:
-                                st.error(result["message"])
+                        if st.button("Подтвердить значения как client_validated"):
+                            result = apply_client_validated_values(conn, selected_ids, manual_rows, channel_code=channel_code or None)
+                            st.success(f"Применено: {result['applied']}, пропущено по приоритету: {result['skipped']}")
                     with a2:
-                        if st.button("Открыть товар в карточке", key="gap_open_product"):
-                            st.session_state["selected_product_id"] = int(action_product_id)
-                            st.success(f"Товар #{action_product_id} выбран, открой вкладку Карточка")
+                        st.download_button(
+                            "Скачать заполненный шаблон",
+                            data=dataframe_to_excel_bytes(filled_df),
+                            file_name=f"filled_{channel_code or 'client'}_template.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        )
 
-                a1, a2 = st.columns(2)
-                with a1:
-                    if st.button("Подтвердить значения как client_validated"):
-                        result = apply_client_validated_values(conn, selected_ids, manual_rows, channel_code=channel_code or None)
-                        st.success(f"Применено: {result['applied']}, пропущено по приоритету: {result['skipped']}")
-                with a2:
-                    st.download_button(
-                        "Скачать заполненный шаблон",
-                        data=dataframe_to_excel_bytes(filled_df),
-                        file_name=f"filled_{channel_code or 'client'}_template.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    )
+        with tab_gap:
+            manual_rows = []
+            for idx, match in enumerate(matches):
+                source_type = st.session_state.get(f"tmpl_type_{idx}", match.get("source_type") if match.get("source_type") in ["attribute", "column"] else "skip")
+                source_name = st.session_state.get(f"tmpl_name_{idx}", match.get("source_name"))
+                transform_rule = st.session_state.get(f"tmpl_transform_{idx}", match.get("transform_rule") or "")
+                manual_rows.append({
+                    "template_column": match["template_column"],
+                    "status": "matched" if source_type != "skip" else "unmatched",
+                    "source_type": None if source_type == "skip" else source_type,
+                    "source_name": None if source_type == "skip" else source_name,
+                    "matched_by": "manual" if source_type != "skip" else None,
+                    "transform_rule": transform_rule or None,
+                })
+
+            if product_df.empty:
+                st.info("Сначала нужны товары в каталоге.")
+            else:
+                selected_ids = st.session_state.get("template_selected_ids")
+                selected_ids = st.multiselect(
+                    "Товары для gap-анализа",
+                    options=product_df["id"].tolist(),
+                    default=selected_ids if selected_ids else [],
+                    format_func=lambda x: f"ID {x} | {product_df.loc[product_df['id'] == x, 'name'].iloc[0]}",
+                    key="template_gap_selected_ids",
+                )
+                st.session_state["template_selected_ids"] = selected_ids
+
+                if not selected_ids:
+                    st.info("Выбери товары, чтобы увидеть gap-анализ и быстрые действия.")
+                else:
+                    filled_df = fill_template_dataframe(conn, template_df, selected_ids, manual_rows)
+                    manual_df = pd.DataFrame(manual_rows)
+                    gap_rows = []
+                    gap_actions = []
+                    for _, row in manual_df.iterrows():
+                        if row["status"] != "matched":
+                            gap_rows.append({"template_column": row["template_column"], "reason": "Нет матчинга"})
+                            continue
+                        if filled_df[row["template_column"]].isna().all():
+                            gap_rows.append({"template_column": row["template_column"], "reason": "У выбранных товаров нет данных"})
+                            for product_id in selected_ids:
+                                product_row = get_product(conn, int(product_id))
+                                can_supplier = bool(product_row and product_row["supplier_url"])
+                                gap_actions.append({
+                                    "product_id": product_id,
+                                    "product_name": product_row["name"] if product_row else None,
+                                    "template_column": row["template_column"],
+                                    "can_supplier_enrich": can_supplier,
+                                })
+
+                    if gap_rows:
+                        st.markdown("### Gap-анализ")
+                        st.dataframe(pd.DataFrame(gap_rows), use_container_width=True, hide_index=True)
+                    else:
+                        st.success("Критичных gap по текущему выбору не найдено.")
+
+                    if gap_actions:
+                        st.markdown("### Быстрые действия")
+                        action_df = pd.DataFrame(gap_actions)
+                        st.dataframe(action_df, use_container_width=True, hide_index=True)
+
+                        action_product_id = st.selectbox(
+                            "Выбери товар для быстрого действия",
+                            options=sorted(set([x["product_id"] for x in gap_actions])),
+                            format_func=lambda x: f"ID {x} | {next((g['product_name'] for g in gap_actions if g['product_id'] == x), x)}",
+                        )
+                        a1, a2 = st.columns(2)
+                        with a1:
+                            if st.button("Обогатить товар из supplier", key="gap_supplier_enrich"):
+                                result = enrich_product_from_supplier(conn, int(action_product_id), force=False)
+                                if result["ok"]:
+                                    st.success(result["message"])
+                                    st.rerun()
+                                else:
+                                    st.error(result["message"])
+                        with a2:
+                            if st.button("Открыть товар в карточке", key="gap_open_product"):
+                                st.session_state["selected_product_id"] = int(action_product_id)
+                                st.success(f"Товар #{action_product_id} выбран, открой вкладку Карточка")
 
     conn.close()
 
