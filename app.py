@@ -25,7 +25,7 @@ from services.supplier_parser import fetch_supplier_page, extract_supplier_data,
 from services.template_matching import auto_match_template_columns, apply_saved_mapping_rules, fill_template_dataframe, apply_client_validated_values, dataframe_to_excel_bytes
 from services.template_profiles import save_template_profile, list_template_profiles, get_template_profile_columns
 from services.readiness_service import analyze_template_readiness
-from services.ozon_api_service import is_configured, sync_category_tree, list_cached_categories, sync_category_attributes, list_cached_attributes, import_cached_attributes_to_pim
+from services.ozon_api_service import is_configured, sync_category_tree, list_cached_categories, sync_category_attributes, list_cached_attributes, import_cached_attributes_to_pim, suggest_mappings_for_cached_attributes, save_suggested_mappings, analyze_product_ozon_coverage
 
 st.set_page_config(page_title="PIM", page_icon="📦", layout="wide")
 
@@ -1079,16 +1079,72 @@ def show_ozon_tab():
                 m2.metric("Обязательных", required_count)
                 m3.metric("Справочники", int((attr_df["dictionary_id"].fillna(0).astype(float) > 0).sum()) if "dictionary_id" in attr_df.columns else 0)
 
-                if st.button("Импортировать атрибуты Ozon в PIM"):
-                    result = import_cached_attributes_to_pim(
+                a1, a2 = st.columns(2)
+                with a1:
+                    if st.button("Импортировать атрибуты Ozon в PIM"):
+                        result = import_cached_attributes_to_pim(
+                            conn,
+                            description_category_id=int(selected_row["description_category_id"]),
+                            type_id=int(selected_row["type_id"]),
+                        )
+                        st.success(f"В PIM импортировано {result['imported']} атрибутов, обязательных {result['required']}. category_code={result['category_code']}")
+                with a2:
+                    if st.button("Создать стартовые mapping rules для Ozon"):
+                        result = save_suggested_mappings(
+                            conn,
+                            description_category_id=int(selected_row["description_category_id"]),
+                            type_id=int(selected_row["type_id"]),
+                        )
+                        st.success(f"Сохранено стартовых mapping rules: {result['saved']}. category_code={result['category_code']}")
+
+                mapping_df = pd.DataFrame(
+                    suggest_mappings_for_cached_attributes(
                         conn,
                         description_category_id=int(selected_row["description_category_id"]),
                         type_id=int(selected_row["type_id"]),
                     )
-                    st.success(f"В PIM импортировано {result['imported']} атрибутов, обязательных {result['required']}. category_code={result['category_code']}")
+                )
+                if not mapping_df.empty:
+                    mm1, mm2, mm3 = st.columns(3)
+                    mm1.metric("Matched по эвристике/правилам", int((mapping_df["status"] == "matched").sum()))
+                    mm2.metric("Без маппинга", int((mapping_df["status"] != "matched").sum()))
+                    mm3.metric("Required без маппинга", int(((mapping_df["is_required"] == 1) & (mapping_df["status"] != "matched")).sum()))
+
+                    st.markdown("### Предлагаемые Ozon mapping rules")
+                    st.dataframe(mapping_df[[c for c in ["attribute_id", "name", "group_name", "is_required", "source_type", "source_name", "transform_rule", "matched_by", "status"] if c in mapping_df.columns]], use_container_width=True, hide_index=True)
 
                 st.markdown("### Атрибуты выбранной категории")
                 st.dataframe(attr_df[[c for c in ["attribute_id", "name", "group_name", "type", "dictionary_id", "is_required", "is_collection", "max_value_count", "fetched_at"] if c in attr_df.columns]], use_container_width=True, hide_index=True)
+
+                product_rows = conn.execute("SELECT id, name, article FROM products ORDER BY id DESC LIMIT 500").fetchall()
+                if product_rows:
+                    product_options = [int(r["id"]) for r in product_rows]
+                    selected_product_id = st.selectbox(
+                        "Проверить покрытие конкретного товара под выбранную Ozon-категорию",
+                        options=product_options,
+                        format_func=lambda x: next((f"ID {r['id']} | {r['article'] or '-'} | {r['name'] or '-'}" for r in product_rows if int(r['id']) == int(x)), str(x)),
+                        key="ozon_coverage_product_id",
+                    )
+                    if st.button("Проверить покрытие товара под Ozon"):
+                        coverage = analyze_product_ozon_coverage(
+                            conn,
+                            product_id=int(selected_product_id),
+                            description_category_id=int(selected_row["description_category_id"]),
+                            type_id=int(selected_row["type_id"]),
+                        )
+                        summary = coverage["summary"]
+                        cc1, cc2, cc3, cc4 = st.columns(4)
+                        cc1.metric("Ready %", int(summary["readiness_pct"]))
+                        cc2.metric("Required всего", int(summary["required_total"]))
+                        cc3.metric("Required закрыто", int(summary["required_covered"]))
+                        cc4.metric("Required пусто", int(summary["required_missing"]))
+                        if summary["readiness_pct"] == 100:
+                            st.success("Обязательные Ozon-атрибуты по этой категории закрыты.")
+                        else:
+                            st.warning("Не все обязательные Ozon-атрибуты закрыты. Ниже видно, что именно отсутствует.")
+                        coverage_df = pd.DataFrame(coverage["rows"])
+                        if not coverage_df.empty:
+                            st.dataframe(coverage_df, use_container_width=True, hide_index=True)
             else:
                 st.info("По этой категории атрибуты ещё не загружались.")
     else:
