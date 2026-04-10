@@ -378,6 +378,33 @@ def _ensure_ozon_tables(conn: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_ozon_attr_attr_id ON ozon_attribute_cache(attribute_id)"
     )
 
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS ozon_attribute_value_cache (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            description_category_id INTEGER NOT NULL,
+            type_id INTEGER NOT NULL,
+            attribute_id INTEGER NOT NULL,
+            dictionary_id INTEGER,
+            value_id INTEGER NOT NULL,
+            value TEXT,
+            info TEXT,
+            picture TEXT,
+            raw_json TEXT,
+            fetched_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_ozon_attr_val_key ON ozon_attribute_value_cache(description_category_id, type_id, attribute_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_ozon_attr_val_dict ON ozon_attribute_value_cache(dictionary_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_ozon_attr_val_value_id ON ozon_attribute_value_cache(value_id)"
+    )
+
 
 
 def _ensure_channel_tables(conn: sqlite3.Connection) -> None:

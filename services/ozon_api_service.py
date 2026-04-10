@@ -233,6 +233,159 @@ def list_cached_attributes(
 
 
 
+def sync_attribute_dictionary_values(
+    conn: sqlite3.Connection,
+    description_category_id: int,
+    type_id: int,
+    attribute_id: int,
+    client_id: str | None = None,
+    api_key: str | None = None,
+    language: str = "DEFAULT",
+    page_limit: int = 2000,
+) -> dict[str, Any]:
+    attr_row = conn.execute(
+        """
+        SELECT dictionary_id, name
+        FROM ozon_attribute_cache
+        WHERE description_category_id = ? AND type_id = ? AND attribute_id = ?
+        LIMIT 1
+        """,
+        (int(description_category_id), int(type_id), int(attribute_id)),
+    ).fetchone()
+    dictionary_id = int(attr_row["dictionary_id"]) if attr_row and attr_row["dictionary_id"] is not None else None
+
+    conn.execute(
+        "DELETE FROM ozon_attribute_value_cache WHERE description_category_id = ? AND type_id = ? AND attribute_id = ?",
+        (int(description_category_id), int(type_id), int(attribute_id)),
+    )
+
+    inserted = 0
+    last_value_id = 0
+    while True:
+        payload = {
+            "attribute_id": int(attribute_id),
+            "description_category_id": int(description_category_id),
+            "type_id": int(type_id),
+            "language": language,
+            "limit": int(page_limit),
+        }
+        if last_value_id:
+            payload["last_value_id"] = int(last_value_id)
+
+        response = _post("/v1/description-category/attribute/values", payload, client_id=client_id, api_key=api_key)
+        result = response.get("result") or []
+        for item in result:
+            conn.execute(
+                """
+                INSERT INTO ozon_attribute_value_cache (
+                    description_category_id,
+                    type_id,
+                    attribute_id,
+                    dictionary_id,
+                    value_id,
+                    value,
+                    info,
+                    picture,
+                    raw_json,
+                    fetched_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                """,
+                (
+                    int(description_category_id),
+                    int(type_id),
+                    int(attribute_id),
+                    dictionary_id,
+                    item.get("id"),
+                    item.get("value"),
+                    item.get("info"),
+                    item.get("picture"),
+                    json.dumps(item, ensure_ascii=False),
+                ),
+            )
+            inserted += 1
+            if item.get("id") is not None:
+                last_value_id = int(item.get("id"))
+        has_next = bool(response.get("has_next"))
+        if not has_next or not result:
+            break
+
+    conn.commit()
+    return {
+        "inserted": inserted,
+        "attribute_id": int(attribute_id),
+        "dictionary_id": dictionary_id,
+        "attribute_name": attr_row["name"] if attr_row else None,
+    }
+
+
+
+def list_cached_attribute_values(
+    conn: sqlite3.Connection,
+    description_category_id: int,
+    type_id: int,
+    attribute_id: int,
+    search: str | None = None,
+    limit: int = 500,
+) -> list[dict[str, Any]]:
+    params: list[Any] = [int(description_category_id), int(type_id), int(attribute_id)]
+    sql = """
+        SELECT *
+        FROM ozon_attribute_value_cache
+        WHERE description_category_id = ?
+          AND type_id = ?
+          AND attribute_id = ?
+    """
+    if search:
+        sql += " AND lower(IFNULL(value, '')) LIKE ?"
+        params.append(f"%{str(search).strip().lower()}%")
+    sql += " ORDER BY value LIMIT ?"
+    params.append(int(limit))
+    rows = conn.execute(sql, params).fetchall()
+    return [dict(r) for r in rows]
+
+
+
+def sync_all_category_dictionary_values(
+    conn: sqlite3.Connection,
+    description_category_id: int,
+    type_id: int,
+    client_id: str | None = None,
+    api_key: str | None = None,
+    language: str = "DEFAULT",
+) -> dict[str, Any]:
+    attributes = [
+        row for row in list_cached_attributes(
+            conn,
+            description_category_id=int(description_category_id),
+            type_id=int(type_id),
+            limit=5000,
+        )
+        if int(row.get("dictionary_id") or 0) > 0
+    ]
+    synced_attributes = 0
+    synced_values = 0
+    details: list[dict[str, Any]] = []
+    for row in attributes:
+        result = sync_attribute_dictionary_values(
+            conn,
+            description_category_id=int(description_category_id),
+            type_id=int(type_id),
+            attribute_id=int(row["attribute_id"]),
+            client_id=client_id,
+            api_key=api_key,
+            language=language,
+        )
+        synced_attributes += 1
+        synced_values += int(result.get("inserted") or 0)
+        details.append(result)
+    return {
+        "synced_attributes": synced_attributes,
+        "synced_values": synced_values,
+        "details": details,
+    }
+
+
+
 def _ozon_type_to_local(value: str | None) -> str:
     key = (value or "").strip().lower()
     if key in {"decimal", "integer", "number", "int"}:

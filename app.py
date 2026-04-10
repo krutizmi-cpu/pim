@@ -26,7 +26,7 @@ from services.supplier_parser import fetch_supplier_page, extract_supplier_data,
 from services.template_matching import auto_match_template_columns, apply_saved_mapping_rules, fill_template_dataframe, apply_client_validated_values, fill_template_workbook_bytes, dataframe_to_excel_bytes, detect_template_data_start_row
 from services.template_profiles import save_template_profile, list_template_profiles, get_template_profile_columns
 from services.readiness_service import analyze_template_readiness
-from services.ozon_api_service import is_configured, sync_category_tree, list_cached_categories, sync_category_attributes, list_cached_attributes, import_cached_attributes_to_pim, suggest_mappings_for_cached_attributes, save_suggested_mappings, analyze_product_ozon_coverage, ensure_ozon_master_attributes, build_product_ozon_payload, materialize_product_ozon_attributes
+from services.ozon_api_service import is_configured, sync_category_tree, list_cached_categories, sync_category_attributes, list_cached_attributes, sync_attribute_dictionary_values, sync_all_category_dictionary_values, list_cached_attribute_values, import_cached_attributes_to_pim, suggest_mappings_for_cached_attributes, save_suggested_mappings, analyze_product_ozon_coverage, ensure_ozon_master_attributes, build_product_ozon_payload, materialize_product_ozon_attributes
 
 st.set_page_config(page_title="PIM", page_icon="📦", layout="wide")
 
@@ -1157,6 +1157,64 @@ def show_ozon_tab():
 
                 st.markdown("### Атрибуты выбранной категории")
                 st.dataframe(attr_df[[c for c in ["attribute_id", "name", "group_name", "type", "dictionary_id", "is_required", "is_collection", "max_value_count", "fetched_at"] if c in attr_df.columns]], use_container_width=True, hide_index=True)
+
+                dictionary_attrs = [row for row in attributes if int(row.get("dictionary_id") or 0) > 0]
+                if dictionary_attrs:
+                    st.markdown("### Справочники значений Ozon")
+                    dd1, dd2, dd3 = st.columns(3)
+                    dd1.metric("Dictionary-атрибутов", int(len(dictionary_attrs)))
+                    cached_dict_attr_count = conn.execute(
+                        "SELECT COUNT(DISTINCT attribute_id) FROM ozon_attribute_value_cache WHERE description_category_id = ? AND type_id = ?",
+                        (int(selected_row["description_category_id"]), int(selected_row["type_id"])),
+                    ).fetchone()[0]
+                    cached_dict_value_count = conn.execute(
+                        "SELECT COUNT(*) FROM ozon_attribute_value_cache WHERE description_category_id = ? AND type_id = ?",
+                        (int(selected_row["description_category_id"]), int(selected_row["type_id"])),
+                    ).fetchone()[0]
+                    dd2.metric("Справочников в кэше", int(cached_dict_attr_count or 0))
+                    dd3.metric("Значений в кэше", int(cached_dict_value_count or 0))
+
+                    if st.button("Синхронизировать все справочники категории", disabled=not configured):
+                        result = sync_all_category_dictionary_values(
+                            conn,
+                            description_category_id=int(selected_row["description_category_id"]),
+                            type_id=int(selected_row["type_id"]),
+                            client_id=client_id or None,
+                            api_key=api_key or None,
+                        )
+                        st.success(f"Синхронизировано справочников: {result['synced_attributes']}, значений: {result['synced_values']}")
+
+                    dict_options = [f"{row['name']} | attr={row['attribute_id']} | dict={row['dictionary_id']}" for row in dictionary_attrs]
+                    selected_dict_label = st.selectbox("Dictionary-атрибут", options=dict_options, key="ozon_dict_attr")
+                    selected_dict_row = dictionary_attrs[dict_options.index(selected_dict_label)]
+                    d1, d2 = st.columns(2)
+                    with d1:
+                        if st.button("Синхронизировать значения справочника", disabled=not configured):
+                            result = sync_attribute_dictionary_values(
+                                conn,
+                                description_category_id=int(selected_row["description_category_id"]),
+                                type_id=int(selected_row["type_id"]),
+                                attribute_id=int(selected_dict_row["attribute_id"]),
+                                client_id=client_id or None,
+                                api_key=api_key or None,
+                            )
+                            st.success(f"Значения справочника обновлены: {result['inserted']} | attr={result['attribute_id']} | dict={result['dictionary_id']}")
+                    with d2:
+                        dict_limit = st.number_input("Сколько значений справочника показать", min_value=50, max_value=5000, value=200, step=50, key="ozon_dict_limit")
+                    dict_search = st.text_input("Фильтр по значению справочника", value="", key="ozon_dict_search")
+                    dict_values = list_cached_attribute_values(
+                        conn,
+                        description_category_id=int(selected_row["description_category_id"]),
+                        type_id=int(selected_row["type_id"]),
+                        attribute_id=int(selected_dict_row["attribute_id"]),
+                        search=dict_search or None,
+                        limit=int(dict_limit),
+                    )
+                    if dict_values:
+                        dict_df = pd.DataFrame(dict_values)
+                        st.dataframe(dict_df[[c for c in ["value_id", "value", "info", "picture", "fetched_at"] if c in dict_df.columns]], use_container_width=True, hide_index=True)
+                    else:
+                        st.caption("Значения этого справочника ещё не загружены в кэш.")
 
                 product_rows = conn.execute("SELECT id, name, article FROM products ORDER BY id DESC LIMIT 500").fetchall()
                 if product_rows:
