@@ -338,6 +338,7 @@ def _ensure_ozon_tables(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE ozon_category_cache ADD COLUMN full_path TEXT")
     if "children_count" not in existing_cat_cols:
         conn.execute("ALTER TABLE ozon_category_cache ADD COLUMN children_count INTEGER DEFAULT 0")
+    conn.execute("DROP INDEX IF EXISTS idx_ozon_category_unique")
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_ozon_cat_desc ON ozon_category_cache(description_category_id)"
     )

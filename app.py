@@ -25,7 +25,7 @@ from services.supplier_parser import fetch_supplier_page, extract_supplier_data,
 from services.template_matching import auto_match_template_columns, apply_saved_mapping_rules, fill_template_dataframe, apply_client_validated_values, dataframe_to_excel_bytes
 from services.template_profiles import save_template_profile, list_template_profiles, get_template_profile_columns
 from services.readiness_service import analyze_template_readiness
-from services.ozon_api_service import is_configured, sync_category_tree, list_cached_categories, sync_category_attributes, list_cached_attributes
+from services.ozon_api_service import is_configured, sync_category_tree, list_cached_categories, sync_category_attributes, list_cached_attributes, import_cached_attributes_to_pim
 
 st.set_page_config(page_title="PIM", page_icon="📦", layout="wide")
 
@@ -1073,6 +1073,20 @@ def show_ozon_tab():
             )
             if attributes:
                 attr_df = pd.DataFrame(attributes)
+                required_count = int(attr_df["is_required"].fillna(0).astype(int).sum()) if "is_required" in attr_df.columns else 0
+                m1, m2, m3 = st.columns(3)
+                m1.metric("Атрибутов в кэше", int(len(attr_df)))
+                m2.metric("Обязательных", required_count)
+                m3.metric("Справочники", int((attr_df["dictionary_id"].fillna(0).astype(float) > 0).sum()) if "dictionary_id" in attr_df.columns else 0)
+
+                if st.button("Импортировать атрибуты Ozon в PIM"):
+                    result = import_cached_attributes_to_pim(
+                        conn,
+                        description_category_id=int(selected_row["description_category_id"]),
+                        type_id=int(selected_row["type_id"]),
+                    )
+                    st.success(f"В PIM импортировано {result['imported']} атрибутов, обязательных {result['required']}. category_code={result['category_code']}")
+
                 st.markdown("### Атрибуты выбранной категории")
                 st.dataframe(attr_df[[c for c in ["attribute_id", "name", "group_name", "type", "dictionary_id", "is_required", "is_collection", "max_value_count", "fetched_at"] if c in attr_df.columns]], use_container_width=True, hide_index=True)
             else:
