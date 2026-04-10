@@ -263,6 +263,7 @@ def render_template_readiness(filled_df: pd.DataFrame, manual_rows: list[dict]) 
 
 def show_import_tab():
     st.subheader("Импорт каталога")
+    st.caption("Загрузи Excel поставщика или общий каталог, система создаст или обновит мастер-товары и покажет последнюю партию отдельно.")
     uploaded = st.file_uploader("Excel файл", type=["xlsx", "xls"])
 
     if uploaded is not None:
@@ -279,6 +280,11 @@ def show_import_tab():
             st.success(
                 f"Импорт завершён. Всего: {result.imported}, создано: {result.created}, обновлено: {result.updated}, дублей: {len(result.duplicates)}"
             )
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Импортировано", int(result.imported))
+            c2.metric("Создано", int(result.created))
+            c3.metric("Обновлено", int(result.updated))
+            c4.metric("Дублей", int(len(result.duplicates)))
 
             st.markdown("### Последняя загруженная партия")
             if not batch_df.empty:
@@ -292,6 +298,8 @@ def show_import_tab():
 
 def show_catalog_tab():
     conn = get_db()
+    st.subheader("Каталог")
+    st.caption("Здесь быстрый контроль по каталогу: поиск, последняя загрузка, статус supplier enrichment и переход в карточку товара.")
 
     c1, c2, c3, c4, c5, c6 = st.columns([2, 1, 1, 1, 1, 1])
     with c1:
@@ -326,6 +334,12 @@ def show_catalog_tab():
 
     if batch_id:
         st.caption("Показана только последняя загруженная партия")
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Товаров в выборке", int(len(df)))
+    m2.metric("С supplier_url", int((df["supplier_url"].fillna("").astype(str).str.strip() != "").sum()) if "supplier_url" in df.columns else 0)
+    m3.metric("Парсинг ок", int((df["supplier_parse_status"] == "success").sum()) if "supplier_parse_status" in df.columns else 0)
+    m4.metric("Ошибки парсинга", int((df["supplier_parse_status"] == "error").sum()) if "supplier_parse_status" in df.columns else 0)
 
     st.download_button(
         "Скачать выборку Excel",
@@ -512,6 +526,13 @@ def show_product_tab():
         return
 
     st.subheader(f"Карточка товара #{product['id']}")
+    st.caption("Мастер-карточка должна быть единым источником правды. Здесь можно вручную поправить данные или обогатить их с сайта поставщика.")
+
+    top1, top2, top3, top4 = st.columns(4)
+    top1.metric("Артикул", product["article"] or "-")
+    top2.metric("Бренд", product["brand"] or "-")
+    top3.metric("Категория", product["base_category"] or product["category"] or "-")
+    top4.metric("Поставщик", product["supplier_name"] or "-")
 
     ctop1, ctop2 = st.columns([1, 1])
     with ctop1:
@@ -538,10 +559,14 @@ def show_product_tab():
     parse_status = product["supplier_parse_status"] if "supplier_parse_status" in product.keys() else None
     parse_comment = product["supplier_parse_comment"] if "supplier_parse_comment" in product.keys() else None
     parsed_at = product["supplier_last_parsed_at"] if "supplier_last_parsed_at" in product.keys() else None
-    if parse_status or parsed_at:
-        st.caption(f"Статус парсинга: {parse_status or '-'} | Последний запуск: {parsed_at or '-'}")
-        if parse_comment:
-            st.caption(f"Комментарий: {parse_comment}")
+    if parse_status == "success":
+        st.success(f"Парсинг поставщика прошёл успешно. Последний запуск: {parsed_at or '-'}")
+    elif parse_status == "error":
+        st.error(f"Есть ошибка парсинга поставщика. Последний запуск: {parsed_at or '-'}")
+    elif parsed_at:
+        st.info(f"Парсинг поставщика запускался. Последний запуск: {parsed_at}")
+    if parse_comment:
+        st.caption(f"Комментарий: {parse_comment}")
 
     with st.form("product_form"):
         c1, c2, c3 = st.columns(3)
@@ -618,6 +643,7 @@ def show_product_tab():
             st.rerun()
 
     st.markdown("### Источники ключевых полей")
+    st.caption("Важно видеть, что пришло руками, что от поставщика, и какие значения ещё слабые по источнику.")
     key_fields = ["name", "brand", "description", "weight", "length", "width", "height", "package_length", "package_width", "package_height", "gross_weight", "image_url"]
     source_summary = []
     for field_name in key_fields:
@@ -987,6 +1013,8 @@ def show_template_tab():
 
 def show_channels_tab():
     conn = get_db()
+    st.subheader("Каналы")
+    st.caption("Здесь настраиваются требования и mapping rules для клиентов и каналов. Это служебный слой, который управляет экспортом.")
 
     channels = conn.execute(
         "SELECT channel_code, channel_name, is_active FROM channel_profiles ORDER BY channel_name"
@@ -1066,9 +1094,22 @@ def show_channels_tab():
 
 def main():
     st.title("📦 PIM")
+    st.caption("PIM для контент-отдела: мастер-карточка, обогащение от поставщика, клиентские шаблоны и экспорт без лишнего ручного труда.")
+
+    with st.expander("Как здесь работать", expanded=False):
+        st.markdown(
+            """
+1. **Импорт**: загружаем новый каталог или ассортимент.
+2. **Каталог**: быстро фильтруем товары, смотрим статус supplier enrichment.
+3. **Карточка**: правим мастер-товар и обогащаем его с сайта поставщика.
+4. **Атрибуты**: управляем атрибутным слоем.
+5. **Клиентский шаблон**: матчим поля, смотрим gap, собираем файл клиента.
+6. **Каналы**: настраиваем требования и mapping rules.
+            """
+        )
 
     tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
-        ["Импорт", "Каталог", "Карточка", "Атрибуты", "Клиентский шаблон", "Каналы"]
+        ["📥 Импорт", "📚 Каталог", "🧾 Карточка", "🧩 Атрибуты", "🧠 Клиентский шаблон", "⚙️ Каналы"]
     )
 
     with tab1:
