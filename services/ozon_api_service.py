@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+from difflib import SequenceMatcher
 from typing import Any
 
 import httpx
@@ -11,6 +12,7 @@ from services.attribute_service import list_channel_mapping_rules, set_product_a
 from services.source_tracking import save_field_source
 from services.template_matching import build_product_value_map
 from services.transforms import apply_transform
+from utils.text_normalizer import normalize_text
 
 
 BASE_URL = "https://api-seller.ozon.ru"
@@ -601,6 +603,116 @@ def _normalize_name(value: str | None) -> str:
     return " ".join((value or "").strip().lower().replace("ё", "е").replace("_", " ").replace("-", " ").split())
 
 
+def _to_scalar_string(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, (list, tuple, set)):
+        merged = ", ".join(str(v).strip() for v in value if str(v).strip())
+        return merged.strip()
+    return str(value).strip()
+
+
+def _best_token_for_search(text: str) -> str:
+    tokens = [t for t in normalize_text(text).split() if len(t) >= 3]
+    if not tokens:
+        return ""
+    tokens.sort(key=lambda x: len(x), reverse=True)
+    return tokens[0]
+
+
+def _find_best_dictionary_value(
+    conn: sqlite3.Connection,
+    description_category_id: int,
+    type_id: int,
+    attribute_id: int,
+    raw_value: Any,
+    min_score: float = 0.78,
+) -> dict[str, Any] | None:
+    source_text = _to_scalar_string(raw_value)
+    if not source_text:
+        return None
+
+    exact = conn.execute(
+        """
+        SELECT value_id, value
+        FROM ozon_attribute_value_cache
+        WHERE description_category_id = ?
+          AND type_id = ?
+          AND attribute_id = ?
+          AND lower(trim(IFNULL(value, ''))) = lower(trim(?))
+        LIMIT 1
+        """,
+        (int(description_category_id), int(type_id), int(attribute_id), source_text),
+    ).fetchone()
+    if exact:
+        return {
+            "value_id": int(exact["value_id"]),
+            "value": exact["value"],
+            "score": 1.0,
+            "matched_by": "exact",
+        }
+
+    normalized_source = normalize_text(source_text)
+    if not normalized_source:
+        return None
+
+    token = _best_token_for_search(source_text)
+    if not token:
+        return None
+
+    candidates = conn.execute(
+        """
+        SELECT value_id, value
+        FROM ozon_attribute_value_cache
+        WHERE description_category_id = ?
+          AND type_id = ?
+          AND attribute_id = ?
+          AND lower(IFNULL(value, '')) LIKE ?
+        LIMIT 800
+        """,
+        (int(description_category_id), int(type_id), int(attribute_id), f"%{token.lower()}%"),
+    ).fetchall()
+    if not candidates:
+        return None
+
+    best_score = 0.0
+    best_value_id = None
+    best_value = None
+    best_mode = None
+    for row in candidates:
+        candidate_value = row["value"] or ""
+        normalized_candidate = normalize_text(candidate_value)
+        if not normalized_candidate:
+            continue
+
+        if normalized_candidate == normalized_source:
+            score = 0.99
+            mode = "normalized_exact"
+        elif normalized_candidate in normalized_source or normalized_source in normalized_candidate:
+            ratio = SequenceMatcher(None, normalized_source, normalized_candidate).ratio()
+            score = max(0.90, ratio)
+            mode = "contains"
+        else:
+            score = SequenceMatcher(None, normalized_source, normalized_candidate).ratio()
+            mode = "fuzzy"
+
+        if score > best_score:
+            best_score = score
+            best_value_id = int(row["value_id"])
+            best_value = row["value"]
+            best_mode = mode
+
+    if best_value_id is None or best_score < float(min_score):
+        return None
+
+    return {
+        "value_id": best_value_id,
+        "value": best_value,
+        "score": round(float(best_score), 4),
+        "matched_by": best_mode,
+    }
+
+
 
 def ensure_ozon_master_attributes(conn: sqlite3.Connection) -> dict[str, Any]:
     inserted = 0
@@ -685,6 +797,7 @@ def suggest_mappings_for_cached_attributes(
         suggestions.append(
             {
                 "attribute_id": item.get("attribute_id"),
+                "dictionary_id": item.get("dictionary_id"),
                 "target_field": target_field,
                 "name": attr_name,
                 "group_name": item.get("group_name"),
@@ -732,32 +845,28 @@ def analyze_product_ozon_coverage(
     description_category_id: int,
     type_id: int,
 ) -> dict[str, Any]:
-    suggestions = suggest_mappings_for_cached_attributes(conn, description_category_id, type_id)
-    value_map = build_product_value_map(conn, int(product_id))
-    total_required = 0
-    covered_required = 0
-    rows: list[dict[str, Any]] = []
-
-    for row in suggestions:
-        if not row.get("is_required"):
-            continue
-        total_required += 1
-        source_name = row.get("source_name")
-        value = apply_transform(value_map.get(source_name), row.get("transform_rule")) if source_name else None
-        covered = value not in (None, "", [], {})
-        if covered:
-            covered_required += 1
-        rows.append(
-            {
-                "Ozon атрибут": row.get("name"),
-                "attribute_id": row.get("attribute_id"),
-                "Источник": f"{row.get('source_type') or ''}:{row.get('source_name') or ''}".strip(':'),
-                "Transform": row.get("transform_rule") or "",
-                "Статус": "ok" if covered else ("нет маппинга" if not source_name else "пусто"),
-                "Значение": value,
-            }
-        )
-
+    payload_rows = build_product_ozon_payload(
+        conn,
+        product_id=int(product_id),
+        description_category_id=int(description_category_id),
+        type_id=int(type_id),
+        required_only=True,
+    )
+    total_required = int(len(payload_rows))
+    covered_required = int(sum(1 for row in payload_rows if row.get("status") == "ready"))
+    rows: list[dict[str, Any]] = [
+        {
+            "Ozon атрибут": row.get("name"),
+            "attribute_id": row.get("attribute_id"),
+            "Источник": f"{row.get('source_type') or ''}:{row.get('source_name') or ''}".strip(':'),
+            "Transform": row.get("transform_rule") or "",
+            "Статус": row.get("status"),
+            "Значение": row.get("value"),
+            "dict_value_id": row.get("dictionary_value_id"),
+            "dict_score": row.get("dictionary_match_score"),
+        }
+        for row in payload_rows
+    ]
     readiness = round((covered_required / total_required) * 100) if total_required else 0
     return {
         "summary": {
@@ -788,17 +897,40 @@ def build_product_ozon_payload(
             continue
         source_name = row.get("source_name")
         value = apply_transform(value_map.get(source_name), row.get("transform_rule")) if source_name else None
+        dictionary_id = int(row.get("dictionary_id") or 0)
+        dict_match = None
+        if dictionary_id > 0 and value not in (None, "", [], {}):
+            dict_match = _find_best_dictionary_value(
+                conn=conn,
+                description_category_id=int(description_category_id),
+                type_id=int(type_id),
+                attribute_id=int(row.get("attribute_id")),
+                raw_value=value,
+            )
+            if dict_match:
+                value = dict_match.get("value")
+
+        if value in (None, "", [], {}):
+            status = "empty"
+        elif dictionary_id > 0 and not dict_match:
+            status = "dictionary_unmatched"
+        else:
+            status = "ready"
         rows.append(
             {
                 "target_field": row.get("target_field"),
                 "attribute_id": row.get("attribute_id"),
+                "dictionary_id": dictionary_id if dictionary_id > 0 else None,
                 "name": row.get("name"),
                 "is_required": int(bool(row.get("is_required"))),
                 "source_type": row.get("source_type"),
                 "source_name": source_name,
                 "transform_rule": row.get("transform_rule"),
                 "value": value,
-                "status": "ready" if value not in (None, "", [], {}) else "empty",
+                "status": status,
+                "dictionary_value_id": dict_match.get("value_id") if dict_match else None,
+                "dictionary_match_score": dict_match.get("score") if dict_match else None,
+                "dictionary_match_by": dict_match.get("matched_by") if dict_match else None,
             }
         )
     return rows
@@ -817,8 +949,12 @@ def materialize_product_ozon_attributes(
     category_code = f"ozon:{int(description_category_id)}:{int(type_id)}"
     applied = 0
     skipped_empty = 0
+    skipped_dictionary = 0
     for row in payload_rows:
         value = row.get("value")
+        if row.get("status") == "dictionary_unmatched":
+            skipped_dictionary += 1
+            continue
         if value in (None, "", [], {}):
             skipped_empty += 1
             continue
@@ -831,19 +967,28 @@ def materialize_product_ozon_attributes(
         )
         save_field_source(
             conn=conn,
-            product_id=int(product_id),
-            field_name=f"attr:{row['target_field']}",
-            source_type="ozon_autofill",
-            source_value_raw=value,
-            source_url=category_code,
-            confidence=0.85,
-            is_manual=False,
-        )
+                product_id=int(product_id),
+                field_name=f"attr:{row['target_field']}",
+                source_type="ozon_autofill",
+                source_value_raw=json.dumps(
+                    {
+                        "value": value,
+                        "dictionary_value_id": row.get("dictionary_value_id"),
+                        "dictionary_match_score": row.get("dictionary_match_score"),
+                        "dictionary_match_by": row.get("dictionary_match_by"),
+                    },
+                    ensure_ascii=False,
+                ),
+                source_url=category_code,
+                confidence=0.85,
+                is_manual=False,
+            )
         applied += 1
     conn.commit()
     return {
         "applied": applied,
         "skipped_empty": skipped_empty,
+        "skipped_dictionary": skipped_dictionary,
         "category_code": category_code,
         "rows": payload_rows,
     }

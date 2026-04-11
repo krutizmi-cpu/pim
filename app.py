@@ -1234,10 +1234,11 @@ def show_ozon_tab():
                     )
                     if preview_rows:
                         preview_df = pd.DataFrame(preview_rows)
-                        p1, p2, p3 = st.columns(3)
+                        p1, p2, p3, p4 = st.columns(4)
                         p1.metric("Готово к автозаполнению", int((preview_df["status"] == "ready").sum()))
                         p2.metric("Пусто после маппинга", int((preview_df["status"] == "empty").sum()))
                         p3.metric("Required ready", int(((preview_df["status"] == "ready") & (preview_df["is_required"] == 1)).sum()))
+                        p4.metric("Dictionary не сматчено", int((preview_df["status"] == "dictionary_unmatched").sum()))
 
                         action1, action2 = st.columns(2)
                         with action1:
@@ -1270,10 +1271,36 @@ def show_ozon_tab():
                                     type_id=int(selected_row["type_id"]),
                                     required_only=False,
                                 )
-                                st.success(f"Записано Ozon-значений: {result['applied']}, пустых пропущено: {result['skipped_empty']}. category_code={result['category_code']}")
+                                st.success(
+                                    f"Записано Ozon-значений: {result['applied']}, пустых пропущено: {result['skipped_empty']}, "
+                                    f"dictionary без матчинга: {result.get('skipped_dictionary', 0)}. category_code={result['category_code']}"
+                                )
 
                         st.markdown("### Preview полуавтозаполнения Ozon")
-                        st.dataframe(preview_df[[c for c in ["attribute_id", "name", "is_required", "source_type", "source_name", "transform_rule", "status", "value"] if c in preview_df.columns]], use_container_width=True, hide_index=True)
+                        st.dataframe(
+                            preview_df[
+                                [
+                                    c
+                                    for c in [
+                                        "attribute_id",
+                                        "dictionary_id",
+                                        "name",
+                                        "is_required",
+                                        "source_type",
+                                        "source_name",
+                                        "transform_rule",
+                                        "status",
+                                        "value",
+                                        "dictionary_value_id",
+                                        "dictionary_match_score",
+                                        "dictionary_match_by",
+                                    ]
+                                    if c in preview_df.columns
+                                ]
+                            ],
+                            use_container_width=True,
+                            hide_index=True,
+                        )
             else:
                 st.info("По этой категории атрибуты ещё не загружались.")
     else:
