@@ -81,6 +81,8 @@ def apply_transform(value, transform_rule: str | None):
         return media[0] if media else None
     if rule == "join_images":
         return ", ".join(media) if media else None
+    if rule == "join_images_semicolon":
+        return ";".join(media) if media else None
     if rule.startswith("image_"):
         try:
             idx = int(rule.split("_", 1)[1]) - 1

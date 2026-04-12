@@ -26,7 +26,7 @@ from services.duplicate_service import refresh_duplicates_for_product
 from services.source_tracking import get_field_sources, save_field_source, get_latest_field_source, field_is_manual
 from services.source_priority import can_overwrite_field
 from services.supplier_parser import fetch_supplier_page, extract_supplier_data, normalize_supplier_data
-from services.template_matching import auto_match_template_columns, apply_saved_mapping_rules, fill_template_dataframe, apply_client_validated_values, fill_template_workbook_bytes, dataframe_to_excel_bytes, detect_template_data_start_row
+from services.template_matching import auto_match_template_columns, apply_saved_mapping_rules, fill_template_dataframe, apply_client_validated_values, fill_template_workbook_bytes, dataframe_to_excel_bytes, detect_template_data_start_row, sanitize_template_xlsx_bytes
 from services.template_profiles import save_template_profile, list_template_profiles, get_template_profile_columns
 from services.readiness_service import analyze_template_readiness
 from services.supplier_profiles import list_supplier_profiles, upsert_supplier_profile
@@ -54,6 +54,7 @@ TEMPLATE_TRANSFORM_OPTIONS = [
     "strip",
     "first_image",
     "join_images",
+    "join_images_semicolon",
     "image_1",
     "image_2",
     "image_3",
@@ -1467,7 +1468,8 @@ def show_template_tab():
 
     if uploaded is not None:
         uploaded_bytes = uploaded.getvalue()
-        workbook = load_workbook(BytesIO(uploaded_bytes), read_only=True, data_only=False)
+        safe_uploaded_bytes = sanitize_template_xlsx_bytes(uploaded_bytes)
+        workbook = load_workbook(BytesIO(safe_uploaded_bytes), read_only=True, data_only=False)
         template_sheet_options = workbook.sheetnames
         workbook.close()
 
@@ -1477,7 +1479,7 @@ def show_template_tab():
             index=(template_sheet_options.index("Товары") if "Товары" in template_sheet_options else 0),
             key="template_sheet_name",
         )
-        suggested_data_start_row = detect_template_data_start_row(uploaded_bytes, sheet_name=template_sheet_name)
+        suggested_data_start_row = detect_template_data_start_row(safe_uploaded_bytes, sheet_name=template_sheet_name)
 
         tcfg1, tcfg2 = st.columns(2)
         with tcfg1:
@@ -1497,7 +1499,7 @@ def show_template_tab():
                 key="preserve_template_workbook",
             )
 
-        template_df = pd.read_excel(BytesIO(uploaded_bytes), sheet_name=template_sheet_name)
+        template_df = pd.read_excel(BytesIO(safe_uploaded_bytes), sheet_name=template_sheet_name)
         matches = auto_match_template_columns(conn, list(template_df.columns))
         matches = apply_saved_mapping_rules(conn, matches, channel_code=channel_code, category_code=category_code or None)
         if selected_profile_id:
@@ -1678,7 +1680,7 @@ def show_template_tab():
                     with a2:
                         export_bytes = fill_template_workbook_bytes(
                             conn,
-                            uploaded_bytes,
+                            safe_uploaded_bytes,
                             selected_ids,
                             manual_rows,
                             sheet_name=template_sheet_name,

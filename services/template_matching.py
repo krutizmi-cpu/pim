@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from io import BytesIO
 from pathlib import Path
+import re
+import zipfile
 
 import pandas as pd
 from openpyxl import load_workbook
@@ -68,11 +70,57 @@ SPECIAL_TEMPLATE_MATCHERS = [
     (("exact:description",), "column", "description", "detmir_standard", None),
     (("exact:tnved",), "column", "tnved_code", "detmir_standard", None),
     (("exact:image_links", "exact:image links"), "column", "media_gallery", "detmir_standard", "join_images"),
+    # Wildberries templates (category files)
+    (("exact:артикул продавца",), "column", "article", "wb_standard", None),
+    (("exact:артикул ozon",), "column", "article", "wb_standard", None),
+    (("exact:наименование",), "column", "name", "wb_standard", None),
+    (("exact:категория продавца",), "column", "category", "wb_standard", None),
+    (("exact:бренд",), "column", "brand", "wb_standard", None),
+    (("exact:описание",), "column", "description", "wb_standard", None),
+    (("exact:фото",), "column", "media_gallery", "wb_standard", "join_images_semicolon"),
+    (("exact:баркоды",), "column", "barcode", "wb_standard", None),
+    (("exact:вес с упаковкой (кг)",), "column", "gross_weight", "wb_standard", None),
+    (("exact:вес без упаковки (кг)",), "column", "weight", "wb_standard", None),
+    (("exact:вес товара с упаковкой (г)",), "column", "gross_weight", "wb_standard", "kg_to_g"),
+    (("exact:вес товара без упаковки (г)",), "column", "weight", "wb_standard", "kg_to_g"),
+    (("exact:длина упаковки",), "column", "package_length", "wb_standard", None),
+    (("exact:ширина упаковки",), "column", "package_width", "wb_standard", None),
+    (("exact:высота упаковки",), "column", "package_height", "wb_standard", None),
+    (("exact:длина предмета",), "column", "length", "wb_standard", None),
+    (("exact:ширина предмета",), "column", "width", "wb_standard", None),
+    (("exact:высота предмета",), "column", "height", "wb_standard", None),
+    (("exact:глубина предмета",), "column", "length", "wb_standard", None),
+    (("exact:тнвэд",), "column", "tnved_code", "wb_standard", None),
 ]
 
 
 def normalize_key(value: str) -> str:
     return " ".join(str(value).strip().lower().replace("_", " ").split())
+
+
+def sanitize_template_xlsx_bytes(template_bytes: bytes) -> bytes:
+    """
+    Some client templates (notably some WB files) contain broken dataValidations
+    that make openpyxl/pandas fail to parse. We remove those nodes in-memory.
+    """
+    try:
+        src = BytesIO(template_bytes)
+        with zipfile.ZipFile(src, "r") as zin:
+            out = BytesIO()
+            with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_DEFLATED) as zout:
+                for item in zin.infolist():
+                    data = zin.read(item.filename)
+                    if item.filename.startswith("xl/worksheets/") and item.filename.endswith(".xml"):
+                        try:
+                            text = data.decode("utf-8")
+                            text = re.sub(r"<dataValidations[^>]*>.*?</dataValidations>", "", text, flags=re.S)
+                            data = text.encode("utf-8")
+                        except Exception:
+                            pass
+                    zout.writestr(item, data)
+            return out.getvalue()
+    except Exception:
+        return template_bytes
 
 
 def build_candidate_map(conn) -> tuple[dict[str, tuple[str, str, str]], list[tuple[str, str, str, str]]]:
@@ -316,75 +364,64 @@ def dataframe_to_excel_bytes(df: pd.DataFrame, sheet_name: str = "template") -> 
 
 
 def detect_template_data_start_row(template_bytes: bytes, sheet_name: str | None = None) -> int:
-    workbook = load_workbook(BytesIO(template_bytes), read_only=True, data_only=False)
     try:
-        ws = workbook[sheet_name] if sheet_name and sheet_name in workbook.sheetnames else workbook.active
-        max_scan_rows = min(int(ws.max_row or 1), 120)
-        header_tokens = {
-            "артикул", "article", "sku", "name", "название", "наименование",
-            "barcode", "штрихкод", "бренд", "brand", "описание", "description",
-        }
+        xls = pd.ExcelFile(BytesIO(template_bytes))
+        bytes_to_use = template_bytes
+    except Exception:
+        bytes_to_use = sanitize_template_xlsx_bytes(template_bytes)
+        xls = pd.ExcelFile(BytesIO(bytes_to_use))
+    chosen_sheet = sheet_name if sheet_name and sheet_name in xls.sheet_names else xls.sheet_names[0]
+    probe = pd.read_excel(BytesIO(bytes_to_use), sheet_name=chosen_sheet, header=None, nrows=120)
 
-        candidate_header_row = None
-        best_score = -1
-        for row_idx in range(1, max_scan_rows + 1):
-            values = []
-            for cell in ws[row_idx]:
-                val = cell.value
-                if val is None:
-                    continue
-                text = str(val).strip().lower()
-                if text:
-                    values.append(text)
-            if not values:
-                continue
+    header_tokens = {
+        "артикул", "article", "sku", "name", "название", "наименование",
+        "barcode", "штрихкод", "бренд", "brand", "описание", "description",
+        "артикул продавца", "категория продавца", "артикул wb",
+    }
+    instruction_markers = (
+        "введите",
+        "выберите",
+        "формат",
+        "минимальное кол-во",
+        "максимальное кол-во",
+        "можно выбрать",
+        "присваивается автоматически",
+        "выпадающий список",
+        "это номер или название",
+        "список ссылок",
+        "поставьте значение",
+    )
 
-            score = 0
-            for v in values:
-                if any(token in v for token in header_tokens):
-                    score += 2
-                if len(v) < 50:
-                    score += 1
+    candidate_header_row = None
+    best_score = -1
+    for i in range(len(probe)):
+        values = [str(v).strip().lower() for v in probe.iloc[i].tolist() if str(v).strip() and str(v).strip().lower() != "nan"]
+        if not values:
+            continue
+        score = 0
+        for v in values:
+            if any(token in v for token in header_tokens):
+                score += 3
+            if len(v) <= 80:
+                score += 1
+        if score > best_score and len(values) >= 2:
+            best_score = score
+            candidate_header_row = i + 1  # 1-based
 
-            if score > best_score and len(values) >= 2:
-                best_score = score
-                candidate_header_row = row_idx
+    if candidate_header_row is None:
+        return 2
 
-        if candidate_header_row is None:
-            return 2
-        data_start = int(candidate_header_row + 1)
-        # Skip instruction rows often used in client templates (Detmir/others).
-        instruction_markers = (
-            "введите",
-            "выберите",
-            "формат",
-            "минимальное кол-во",
-            "максимальное кол-во",
-            "можно выбрать",
-            "присваивается автоматически",
-            "выпадающий список",
-        )
-        for row_idx in range(data_start, min(data_start + 8, int(ws.max_row or data_start)) + 1):
-            values = []
-            for cell in ws[row_idx]:
-                if cell.value is None:
-                    continue
-                text = str(cell.value).strip().lower()
-                if text:
-                    values.append(text)
-            if not values:
-                continue
-            if any(any(marker in val for marker in instruction_markers) for val in values):
-                data_start = row_idx + 1
-                continue
-            # If row mostly zero placeholders, it's likely first data row.
-            non_zero = [v for v in values if v not in {"0", "0.0"}]
-            if len(non_zero) <= 2:
-                break
-            break
-        return int(max(2, data_start))
-    finally:
-        workbook.close()
+    data_start = int(candidate_header_row + 1)
+    # Skip post-header instruction rows (WB/Detmir style).
+    for r in range(data_start, min(data_start + 10, len(probe)) + 1):
+        row_values = [str(v).strip().lower() for v in probe.iloc[r - 1].tolist() if str(v).strip() and str(v).strip().lower() != "nan"]
+        if not row_values:
+            continue
+        if any(any(marker in val for marker in instruction_markers) for val in row_values):
+            data_start = r + 1
+            continue
+        break
+    return int(max(2, data_start))
 
 
 def fill_template_workbook_bytes(
@@ -395,10 +432,22 @@ def fill_template_workbook_bytes(
     sheet_name: str | None = None,
     data_start_row: int | None = None,
 ) -> bytes:
-    workbook = load_workbook(BytesIO(template_bytes))
+    safe_template_bytes = template_bytes
+    try:
+        workbook = load_workbook(BytesIO(safe_template_bytes))
+    except Exception:
+        safe_template_bytes = sanitize_template_xlsx_bytes(template_bytes)
+        try:
+            workbook = load_workbook(BytesIO(safe_template_bytes))
+        except Exception:
+            # Fallback for malformed workbook structures (seen in some WB exports).
+            chosen_sheet = sheet_name or "template"
+            template_df = pd.read_excel(BytesIO(safe_template_bytes), sheet_name=sheet_name) if sheet_name else pd.read_excel(BytesIO(safe_template_bytes))
+            filled_df = fill_template_dataframe(conn, template_df, product_ids, matches)
+            return dataframe_to_excel_bytes(filled_df, sheet_name=chosen_sheet)
     ws = workbook[sheet_name] if sheet_name and sheet_name in workbook.sheetnames else workbook.active
 
-    start_row = int(data_start_row or detect_template_data_start_row(template_bytes, sheet_name=ws.title))
+    start_row = int(data_start_row or detect_template_data_start_row(safe_template_bytes, sheet_name=ws.title))
     if start_row < 2:
         start_row = 2
     header_row = start_row - 1
