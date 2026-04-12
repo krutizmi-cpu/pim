@@ -1359,3 +1359,39 @@ def build_bulk_ozon_api_payloads(
             "missing_offer_id": int(missing_offer_id),
         },
     }
+
+
+def build_ozon_attributes_update_request(
+    bulk_payload: dict[str, Any],
+) -> dict[str, Any]:
+    items: list[dict[str, Any]] = []
+    skipped_missing_offer = 0
+    skipped_empty_attrs = 0
+
+    for product in bulk_payload.get("products") or []:
+        offer_id = product.get("offer_id")
+        attributes = product.get("attributes") or []
+        if not offer_id:
+            skipped_missing_offer += 1
+            continue
+        if not attributes:
+            skipped_empty_attrs += 1
+            continue
+
+        items.append(
+            {
+                "offer_id": str(offer_id),
+                "description_category_id": int(product.get("description_category_id")),
+                "type_id": int(product.get("type_id")),
+                "attributes": attributes,
+            }
+        )
+
+    return {
+        "items": items,
+        "summary": {
+            "items_total": int(len(items)),
+            "skipped_missing_offer": int(skipped_missing_offer),
+            "skipped_empty_attrs": int(skipped_empty_attrs),
+        },
+    }

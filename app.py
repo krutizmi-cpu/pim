@@ -27,7 +27,7 @@ from services.supplier_parser import fetch_supplier_page, extract_supplier_data,
 from services.template_matching import auto_match_template_columns, apply_saved_mapping_rules, fill_template_dataframe, apply_client_validated_values, fill_template_workbook_bytes, dataframe_to_excel_bytes, detect_template_data_start_row
 from services.template_profiles import save_template_profile, list_template_profiles, get_template_profile_columns
 from services.readiness_service import analyze_template_readiness
-from services.ozon_api_service import is_configured, sync_category_tree, list_cached_categories, sync_category_attributes, list_cached_attributes, sync_attribute_dictionary_values, sync_all_category_dictionary_values, list_cached_attribute_values, import_cached_attributes_to_pim, suggest_mappings_for_cached_attributes, save_suggested_mappings, analyze_product_ozon_coverage, ensure_ozon_master_attributes, build_product_ozon_payload, materialize_product_ozon_attributes, preview_product_ozon_dictionary_gaps, build_product_ozon_api_attributes, build_bulk_ozon_api_payloads, save_dictionary_override, list_dictionary_overrides, delete_dictionary_override
+from services.ozon_api_service import is_configured, sync_category_tree, list_cached_categories, sync_category_attributes, list_cached_attributes, sync_attribute_dictionary_values, sync_all_category_dictionary_values, list_cached_attribute_values, import_cached_attributes_to_pim, suggest_mappings_for_cached_attributes, save_suggested_mappings, analyze_product_ozon_coverage, ensure_ozon_master_attributes, build_product_ozon_payload, materialize_product_ozon_attributes, preview_product_ozon_dictionary_gaps, build_product_ozon_api_attributes, build_bulk_ozon_api_payloads, build_ozon_attributes_update_request, save_dictionary_override, list_dictionary_overrides, delete_dictionary_override
 
 st.set_page_config(page_title="PIM", page_icon="📦", layout="wide")
 OZON_OFFER_ID_OPTIONS = ["article", "internal_article", "supplier_article"]
@@ -1420,11 +1420,20 @@ def show_ozon_tab():
                                 mime="application/json",
                                 key=f"ozon_bulk_payload_export_{selected_product_id}",
                             )
+                            update_request = build_ozon_attributes_update_request(bulk_payload)
+                            st.download_button(
+                                "Скачать request JSON для /v1/product/attributes/update",
+                                data=json.dumps(update_request, ensure_ascii=False, indent=2).encode("utf-8"),
+                                file_name=f"ozon_attributes_update_request_{int(selected_row['description_category_id'])}_{int(selected_row['type_id'])}.json",
+                                mime="application/json",
+                                key=f"ozon_update_request_export_{selected_product_id}",
+                            )
                             st.caption(
                                 f"Bulk summary: products={bulk_payload.get('summary', {}).get('products_total', 0)}, "
                                 f"included={bulk_payload.get('summary', {}).get('attributes_included', 0)}, "
                                 f"skipped={bulk_payload.get('summary', {}).get('attributes_skipped', 0)}, "
-                                f"missing_offer_id={bulk_payload.get('summary', {}).get('missing_offer_id', 0)}"
+                                f"missing_offer_id={bulk_payload.get('summary', {}).get('missing_offer_id', 0)} | "
+                                f"request_items={update_request.get('summary', {}).get('items_total', 0)}"
                             )
 
                         st.markdown("### Preview полуавтозаполнения Ozon")
