@@ -1225,12 +1225,21 @@ def show_ozon_tab():
                         format_func=lambda x: next((f"ID {r['id']} | {r['article'] or '-'} | {r['name'] or '-'}" for r in product_rows if int(r['id']) == int(x)), str(x)),
                         key="ozon_coverage_product_id",
                     )
+                    dictionary_min_score = st.slider(
+                        "Порог dictionary matching (чем выше, тем строже)",
+                        min_value=0.50,
+                        max_value=0.99,
+                        value=0.78,
+                        step=0.01,
+                        key=f"ozon_dict_min_score_{selected_product_id}",
+                    )
                     preview_rows = build_product_ozon_payload(
                         conn,
                         product_id=int(selected_product_id),
                         description_category_id=int(selected_row["description_category_id"]),
                         type_id=int(selected_row["type_id"]),
                         required_only=False,
+                        dictionary_min_score=float(dictionary_min_score),
                     )
                     if preview_rows:
                         preview_df = pd.DataFrame(preview_rows)
@@ -1248,6 +1257,7 @@ def show_ozon_tab():
                                     product_id=int(selected_product_id),
                                     description_category_id=int(selected_row["description_category_id"]),
                                     type_id=int(selected_row["type_id"]),
+                                    dictionary_min_score=float(dictionary_min_score),
                                 )
                                 summary = coverage["summary"]
                                 cc1, cc2, cc3, cc4 = st.columns(4)
@@ -1270,6 +1280,7 @@ def show_ozon_tab():
                                     description_category_id=int(selected_row["description_category_id"]),
                                     type_id=int(selected_row["type_id"]),
                                     required_only=False,
+                                    dictionary_min_score=float(dictionary_min_score),
                                 )
                                 st.success(
                                     f"Записано Ozon-значений: {result['applied']}, пустых пропущено: {result['skipped_empty']}, "
@@ -1320,6 +1331,7 @@ def show_ozon_tab():
                                 description_category_id=int(selected_row["description_category_id"]),
                                 type_id=int(selected_row["type_id"]),
                                 top_n=int(top_n),
+                                dictionary_min_score=float(dictionary_min_score),
                             )
                             if gap_rows:
                                 gap_df = pd.DataFrame(gap_rows)

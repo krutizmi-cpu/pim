@@ -863,6 +863,7 @@ def analyze_product_ozon_coverage(
     product_id: int,
     description_category_id: int,
     type_id: int,
+    dictionary_min_score: float = 0.78,
 ) -> dict[str, Any]:
     payload_rows = build_product_ozon_payload(
         conn,
@@ -870,6 +871,7 @@ def analyze_product_ozon_coverage(
         description_category_id=int(description_category_id),
         type_id=int(type_id),
         required_only=True,
+        dictionary_min_score=float(dictionary_min_score),
     )
     total_required = int(len(payload_rows))
     covered_required = int(sum(1 for row in payload_rows if row.get("status") == "ready"))
@@ -905,6 +907,7 @@ def build_product_ozon_payload(
     description_category_id: int,
     type_id: int,
     required_only: bool = False,
+    dictionary_min_score: float = 0.78,
 ) -> list[dict[str, Any]]:
     suggestions = suggest_mappings_for_cached_attributes(conn, description_category_id, type_id)
     value_map = build_product_value_map(conn, int(product_id))
@@ -925,6 +928,7 @@ def build_product_ozon_payload(
                 type_id=int(type_id),
                 attribute_id=int(row.get("attribute_id")),
                 raw_value=value,
+                min_score=float(dictionary_min_score),
             )
             if dict_match:
                 value = dict_match.get("value")
@@ -962,9 +966,17 @@ def materialize_product_ozon_attributes(
     description_category_id: int,
     type_id: int,
     required_only: bool = False,
+    dictionary_min_score: float = 0.78,
 ) -> dict[str, Any]:
     import_cached_attributes_to_pim(conn, description_category_id, type_id)
-    payload_rows = build_product_ozon_payload(conn, product_id, description_category_id, type_id, required_only=required_only)
+    payload_rows = build_product_ozon_payload(
+        conn,
+        product_id,
+        description_category_id,
+        type_id,
+        required_only=required_only,
+        dictionary_min_score=float(dictionary_min_score),
+    )
     category_code = f"ozon:{int(description_category_id)}:{int(type_id)}"
     applied = 0
     skipped_empty = 0
@@ -1019,6 +1031,7 @@ def preview_product_ozon_dictionary_gaps(
     description_category_id: int,
     type_id: int,
     top_n: int = 3,
+    dictionary_min_score: float = 0.78,
 ) -> list[dict[str, Any]]:
     payload_rows = build_product_ozon_payload(
         conn=conn,
@@ -1026,6 +1039,7 @@ def preview_product_ozon_dictionary_gaps(
         description_category_id=int(description_category_id),
         type_id=int(type_id),
         required_only=False,
+        dictionary_min_score=float(dictionary_min_score),
     )
     gaps: list[dict[str, Any]] = []
     for row in payload_rows:
