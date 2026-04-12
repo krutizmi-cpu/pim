@@ -235,6 +235,14 @@ def build_ozon_dictionary_overrides_template_excel() -> bytes:
     return output.getvalue()
 
 
+def build_ozon_retry_jobs_template_excel() -> bytes:
+    df = pd.DataFrame({"job_id": [101, 102, 103]})
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="jobs")
+    return output.getvalue()
+
+
 def _cell_to_lookup_text(value) -> str:
     if value is None:
         return ""
@@ -2024,6 +2032,13 @@ def show_ozon_tab():
                                 placeholder="job_id",
                             )
                         with retry_col2:
+                            st.download_button(
+                                "Скачать шаблон job_id",
+                                data=build_ozon_retry_jobs_template_excel(),
+                                file_name="ozon_retry_jobs_template.xlsx",
+                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                key=f"ozon_retry_jobs_template_{selected_product_id}",
+                            )
                             if st.button(
                                 "Массово повторить jobs из Excel",
                                 disabled=(not configured),
@@ -2047,6 +2062,7 @@ def show_ozon_tab():
                                             ok_count = 0
                                             err_count = 0
                                             errors = []
+                                            retry_rows = []
                                             for i, job_id in enumerate(job_ids, start=1):
                                                 result = retry_ozon_update_job(
                                                     conn=conn,
@@ -2056,11 +2072,38 @@ def show_ozon_tab():
                                                 )
                                                 if result.get("ok"):
                                                     ok_count += 1
+                                                    retry_rows.append(
+                                                        {
+                                                            "job_id": int(job_id),
+                                                            "status": "success",
+                                                            "task_id": result.get("task_id"),
+                                                            "error": None,
+                                                        }
+                                                    )
                                                 else:
                                                     err_count += 1
-                                                    errors.append({"job_id": job_id, "error": result.get("message") or "Ошибка"})
+                                                    err_msg = result.get("message") or "Ошибка"
+                                                    errors.append({"job_id": job_id, "error": err_msg})
+                                                    retry_rows.append(
+                                                        {
+                                                            "job_id": int(job_id),
+                                                            "status": "error",
+                                                            "task_id": None,
+                                                            "error": err_msg,
+                                                        }
+                                                    )
                                                 progress.progress(i / len(job_ids))
                                             st.success(f"Массовый retry завершён. Успешно: {ok_count}, с ошибкой: {err_count}.")
+                                            if retry_rows:
+                                                retry_df = pd.DataFrame(retry_rows)
+                                                st.dataframe(retry_df, use_container_width=True, hide_index=True)
+                                                st.download_button(
+                                                    "Скачать результат retry (Excel)",
+                                                    data=dataframe_to_excel_bytes(retry_df, sheet_name="retry_result"),
+                                                    file_name="ozon_retry_result.xlsx",
+                                                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                                    key=f"ozon_retry_result_export_{selected_product_id}",
+                                                )
                                             if parsed_jobs.get("errors"):
                                                 st.dataframe(pd.DataFrame(parsed_jobs.get("errors")), use_container_width=True, hide_index=True)
                                             if errors:
