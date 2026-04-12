@@ -3,7 +3,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+import re
 from typing import Any
+from urllib.parse import quote
 from uuid import uuid4
 
 import pandas as pd
@@ -246,6 +248,38 @@ def _to_text(value: object) -> str | None:
     return text or None
 
 
+def _looks_like_url(value: str) -> bool:
+    text = str(value or "").strip().lower()
+    if not text:
+        return False
+    if text.startswith("http://") or text.startswith("https://"):
+        return True
+    if " " in text:
+        return False
+    # Accept domains like example.com/path
+    return bool(re.match(r"^[a-z0-9][a-z0-9\.\-]+\.[a-z]{2,}.*$", text))
+
+
+def _normalize_supplier_url(value: object) -> str | None:
+    text = _to_text(value)
+    if not text:
+        return None
+    if not _looks_like_url(text):
+        return None
+    if text.lower().startswith("http://") or text.lower().startswith("https://"):
+        return text
+    return f"https://{text}"
+
+
+def _render_url_template(template: str, payload: dict[str, str | None]) -> str:
+    rendered = str(template or "")
+    for key, raw_val in payload.items():
+        safe_val = str(raw_val or "").strip()
+        rendered = rendered.replace("{" + key + "}", safe_val)
+        rendered = rendered.replace("{" + key + "_q}", quote(safe_val, safe=""))
+    return rendered.strip()
+
+
 def _to_float(value: object) -> float | None:
     if value is None or pd.isna(value):
         return None
@@ -475,6 +509,8 @@ def import_catalog_from_excel(
     excel_path: Path,
     sheet_name: str | None = None,
     header_row: int | None = None,
+    default_supplier_name: str | None = None,
+    default_supplier_url_template: str | None = None,
 ) -> ImportResult:
     init_db(conn)
     df = _read_excel_smart(excel_path, sheet_name=sheet_name, header_row=header_row)
@@ -504,6 +540,21 @@ def import_catalog_from_excel(
         product_data = _build_product_dict(row, normalized_name)
         product_data["article"] = article_key
         product_data["internal_article"] = _make_internal_article(article_key, supplier_article)
+        product_data["supplier_url"] = _normalize_supplier_url(product_data.get("supplier_url"))
+        if default_supplier_name and not product_data.get("supplier_name"):
+            product_data["supplier_name"] = str(default_supplier_name).strip()
+        if not product_data.get("supplier_url") and default_supplier_url_template:
+            rendered_url = _render_url_template(
+                str(default_supplier_url_template),
+                {
+                    "article": article_key,
+                    "supplier_article": supplier_article,
+                    "name": name,
+                    "category": _to_text(row.get("category")),
+                    "code": _to_text(row.get("article")) or _to_text(row.get("supplier_article")),
+                },
+            )
+            product_data["supplier_url"] = _normalize_supplier_url(rendered_url)
         product_data = _apply_enrichment(conn, product_data)
 
         exists = conn.execute(

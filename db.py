@@ -40,6 +40,10 @@ REQUIRED_PRODUCT_COLUMNS: dict[str, str] = {
     "brand": "TEXT",
     "model": "TEXT",
     "base_category": "TEXT",
+    "ozon_description_category_id": "INTEGER",
+    "ozon_type_id": "INTEGER",
+    "ozon_category_path": "TEXT",
+    "ozon_category_confidence": "REAL",
     "tnved_code": "TEXT",
     "import_batch_id": "TEXT",
     "supplier_last_parsed_at": "TEXT",
@@ -119,6 +123,10 @@ def _ensure_products_table(conn: sqlite3.Connection) -> None:
             brand TEXT,
             model TEXT,
             base_category TEXT,
+            ozon_description_category_id INTEGER,
+            ozon_type_id INTEGER,
+            ozon_category_path TEXT,
+            ozon_category_confidence REAL,
             tnved_code TEXT,
             import_batch_id TEXT,
             supplier_last_parsed_at TEXT,
@@ -154,6 +162,7 @@ def _ensure_products_table(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_products_supplier_article ON products(supplier_article)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_products_internal_article ON products(internal_article)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_products_import_batch_id ON products(import_batch_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_products_ozon_category ON products(ozon_description_category_id, ozon_type_id)")
 
 
 def _ensure_duplicate_table(conn: sqlite3.Connection) -> None:

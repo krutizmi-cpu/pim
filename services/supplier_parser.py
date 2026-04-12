@@ -68,6 +68,8 @@ def extract_supplier_data(html: str, url: str | None = None) -> dict[str, Any]:
     soup = BeautifulSoup(html, "html.parser")
 
     title = (soup.title.get_text(" ", strip=True) if soup.title else "")
+    h1 = soup.select_one("h1")
+    product_name = h1.get_text(" ", strip=True) if h1 else None
 
     description = None
     meta_desc = soup.find("meta", attrs={"name": "description"})
@@ -99,8 +101,23 @@ def extract_supplier_data(html: str, url: str | None = None) -> dict[str, Any]:
     page_text = soup.get_text(" ", strip=True)
     lowered = page_text.lower()
 
+    category_guess = None
+    breadcrumb_selectors = [
+        "nav.breadcrumbs a",
+        ".breadcrumbs a",
+        "[itemtype*='BreadcrumbList'] a",
+    ]
+    for selector in breadcrumb_selectors:
+        crumbs = [x.get_text(" ", strip=True) for x in soup.select(selector) if x.get_text(" ", strip=True)]
+        if len(crumbs) >= 2:
+            category_guess = crumbs[-1]
+            break
+
     result: dict[str, Any] = {
         "title": title or None,
+        "name": product_name or title or None,
+        "brand": None,
+        "category": category_guess,
         "description": description or None,
         "image_urls": image_urls,
         "attributes": {},
@@ -137,12 +154,33 @@ def extract_supplier_data(html: str, url: str | None = None) -> dict[str, Any]:
             value = cells[1].get_text(" ", strip=True)
             if key and value:
                 result["attributes"][key] = value
+    # Also parse key-value blocks like "Характеристика: значение" from non-table chunks.
+    for node in soup.select("li, p, div"):
+        text = node.get_text(" ", strip=True)
+        if not text or ":" not in text or len(text) > 220:
+            continue
+        left, right = text.split(":", 1)
+        key = left.strip()
+        value = right.strip()
+        if not key or not value or len(key) > 80:
+            continue
+        if key not in result["attributes"]:
+            result["attributes"][key] = value
+
+    brand_keys = {"бренд", "торговая марка", "brand", "производитель", "manufacturer"}
+    for key, value in result["attributes"].items():
+        if str(key).strip().lower() in brand_keys and str(value).strip():
+            result["brand"] = str(value).strip()
+            break
 
     return result
 
 
 def normalize_supplier_data(raw_data: dict[str, Any]) -> dict[str, Any]:
     normalized = {
+        "name": raw_data.get("name") or raw_data.get("title"),
+        "brand": raw_data.get("brand"),
+        "category": raw_data.get("category"),
         "description": raw_data.get("description") or raw_data.get("title"),
         "image_url": None,
         "weight": raw_data.get("weight"),

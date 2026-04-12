@@ -46,12 +46,24 @@ def apply_transform(value, transform_rule: str | None):
         return round(num / 10, 2)
     if rule == "m_to_cm" and num is not None:
         return round(num * 100, 2)
+    if rule == "m_to_mm" and num is not None:
+        return round(num * 1000, 2)
+    if rule == "cm_to_m" and num is not None:
+        return round(num / 100, 4)
+    if rule == "mm_to_m" and num is not None:
+        return round(num / 1000, 4)
     if rule == "kg_to_g" and num is not None:
         return round(num * 1000, 2)
     if rule == "g_to_kg" and num is not None:
         return round(num / 1000, 3)
     if rule == "inch_to_cm" and num is not None:
         return round(num * 2.54, 2)
+    if rule == "cm_to_inch" and num is not None:
+        return round(num / 2.54, 3)
+    if rule == "kg_to_lb" and num is not None:
+        return round(num * 2.20462, 3)
+    if rule == "lb_to_kg" and num is not None:
+        return round(num / 2.20462, 3)
     if rule == "lower":
         return str(value).lower() if value is not None else value
     if rule == "upper":

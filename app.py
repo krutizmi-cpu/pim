@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from io import BytesIO
+import math
 from pathlib import Path
 
 import pandas as pd
@@ -29,9 +30,35 @@ from services.template_matching import auto_match_template_columns, apply_saved_
 from services.template_profiles import save_template_profile, list_template_profiles, get_template_profile_columns
 from services.readiness_service import analyze_template_readiness
 from services.ozon_api_service import is_configured, sync_category_tree, list_cached_categories, sync_category_attributes, list_cached_attributes, sync_attribute_dictionary_values, sync_all_category_dictionary_values, list_cached_attribute_values, import_cached_attributes_to_pim, suggest_mappings_for_cached_attributes, save_suggested_mappings, analyze_product_ozon_coverage, ensure_ozon_master_attributes, build_product_ozon_payload, materialize_product_ozon_attributes, preview_product_ozon_dictionary_gaps, build_product_ozon_api_attributes, build_bulk_ozon_api_payloads, build_ozon_attributes_update_request, submit_ozon_attributes_update, list_ozon_update_jobs, get_ozon_update_job, retry_ozon_update_job, list_ozon_update_job_items, save_dictionary_override, list_dictionary_overrides, delete_dictionary_override
+from services.ozon_category_match import bulk_assign_ozon_categories
 
 st.set_page_config(page_title="PIM", page_icon="📦", layout="wide")
 OZON_OFFER_ID_OPTIONS = ["article", "internal_article", "supplier_article"]
+TEMPLATE_TRANSFORM_OPTIONS = [
+    "",
+    "cm_to_mm",
+    "mm_to_cm",
+    "m_to_cm",
+    "m_to_mm",
+    "cm_to_m",
+    "mm_to_m",
+    "kg_to_g",
+    "g_to_kg",
+    "kg_to_lb",
+    "lb_to_kg",
+    "inch_to_cm",
+    "cm_to_inch",
+    "lower",
+    "upper",
+    "strip",
+    "first_image",
+    "join_images",
+    "image_1",
+    "image_2",
+    "image_3",
+    "image_4",
+    "image_5",
+]
 
 
 def get_db():
@@ -40,16 +67,21 @@ def get_db():
     return conn
 
 
-def load_products(
-    conn,
+def to_attribute_code(name: str) -> str:
+    clean = str(name or "").strip().lower()
+    clean = "_".join("".join(ch if ch.isalnum() else " " for ch in clean).split())
+    return clean[:120]
+
+
+def _build_product_filters(
     search: str = "",
     category: str = "",
     supplier: str = "",
-    limit: int = 200,
     import_batch_id: str = "",
-) -> pd.DataFrame:
+    parse_filter: str = "Все",
+) -> tuple[list[str], list[object]]:
     where = []
-    params = []
+    params: list[object] = []
 
     if search:
         where.append("(name LIKE ? OR article LIKE ? OR barcode LIKE ? OR supplier_article LIKE ?)")
@@ -67,6 +99,58 @@ def load_products(
     if import_batch_id:
         where.append("import_batch_id = ?")
         params.append(import_batch_id)
+
+    if parse_filter == "Есть supplier_url":
+        where.append("supplier_url IS NOT NULL AND TRIM(supplier_url) <> ''")
+    elif parse_filter == "Не парсено":
+        where.append("(supplier_parse_status IS NULL OR TRIM(supplier_parse_status) = '')")
+    elif parse_filter == "Ошибка":
+        where.append("supplier_parse_status = 'error'")
+    elif parse_filter == "Успех":
+        where.append("supplier_parse_status = 'success'")
+
+    return where, params
+
+
+def count_products(
+    conn,
+    search: str = "",
+    category: str = "",
+    supplier: str = "",
+    import_batch_id: str = "",
+    parse_filter: str = "Все",
+) -> int:
+    where, params = _build_product_filters(
+        search=search,
+        category=category,
+        supplier=supplier,
+        import_batch_id=import_batch_id,
+        parse_filter=parse_filter,
+    )
+    sql = "SELECT COUNT(*) AS total FROM products"
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    row = conn.execute(sql, params).fetchone()
+    return int(row["total"]) if row and row["total"] is not None else 0
+
+
+def load_products(
+    conn,
+    search: str = "",
+    category: str = "",
+    supplier: str = "",
+    limit: int = 200,
+    import_batch_id: str = "",
+    parse_filter: str = "Все",
+    offset: int = 0,
+) -> pd.DataFrame:
+    where, params = _build_product_filters(
+        search=search,
+        category=category,
+        supplier=supplier,
+        import_batch_id=import_batch_id,
+        parse_filter=parse_filter,
+    )
 
     sql = """
         SELECT
@@ -95,6 +179,10 @@ def load_products(
             enrichment_comment,
             supplier_parse_status,
             duplicate_status,
+            ozon_description_category_id,
+            ozon_type_id,
+            ozon_category_path,
+            ozon_category_confidence,
             import_batch_id,
             updated_at
         FROM products
@@ -103,8 +191,9 @@ def load_products(
     if where:
         sql += " WHERE " + " AND ".join(where)
 
-    sql += " ORDER BY id DESC LIMIT ?"
+    sql += " ORDER BY id DESC LIMIT ? OFFSET ?"
     params.append(int(limit))
+    params.append(int(offset))
 
     rows = conn.execute(sql, params).fetchall()
     return pd.DataFrame([dict(r) for r in rows]) if rows else pd.DataFrame()
@@ -132,6 +221,10 @@ def save_product(conn, product_id: int, payload: dict):
             subcategory = ?,
             wheel_diameter_inch = ?,
             supplier_url = ?,
+            ozon_description_category_id = ?,
+            ozon_type_id = ?,
+            ozon_category_path = ?,
+            ozon_category_confidence = ?,
             uom = ?,
             weight = ?,
             length = ?,
@@ -161,6 +254,10 @@ def save_product(conn, product_id: int, payload: dict):
             payload.get("subcategory"),
             payload.get("wheel_diameter_inch"),
             payload.get("supplier_url"),
+            payload.get("ozon_description_category_id"),
+            payload.get("ozon_type_id"),
+            payload.get("ozon_category_path"),
+            payload.get("ozon_category_confidence"),
             payload.get("uom"),
             payload.get("weight"),
             payload.get("length"),
@@ -178,7 +275,8 @@ def save_product(conn, product_id: int, payload: dict):
     )
     tracked_fields = [
         "article", "internal_article", "supplier_article", "name", "brand", "supplier_name", "barcode",
-        "category", "base_category", "subcategory", "wheel_diameter_inch", "supplier_url", "uom",
+        "category", "base_category", "subcategory", "wheel_diameter_inch", "supplier_url",
+        "ozon_description_category_id", "ozon_type_id", "ozon_category_path", "ozon_category_confidence", "uom",
         "weight", "length", "width", "height", "package_length", "package_width", "package_height",
         "gross_weight", "image_url", "description", "tnved_code"
     ]
@@ -599,6 +697,29 @@ def show_import_tab():
         key="supplier_import_template",
     )
     uploaded = st.file_uploader("Excel файл", type=["xlsx", "xls"])
+    s1, s2 = st.columns(2)
+    with s1:
+        default_supplier_name = st.text_input(
+            "Поставщик по умолчанию",
+            value=st.session_state.get("import_default_supplier_name", ""),
+            placeholder="Например: Rockbros / SKS",
+            help="Если в файле нет колонки Поставщик, это значение будет проставлено автоматически.",
+        )
+        st.session_state["import_default_supplier_name"] = default_supplier_name
+    with s2:
+        default_supplier_url_template = st.text_input(
+            "Шаблон URL поставщика (опционально)",
+            value=st.session_state.get("import_default_supplier_url_template", ""),
+            placeholder="https://site.ru/product/{supplier_article}",
+            help="Поддерживает {article}, {supplier_article}, {code}, {name}, а также *_q для URL-encoding.",
+        )
+        st.session_state["import_default_supplier_url_template"] = default_supplier_url_template
+    auto_match_ozon_after_import = st.checkbox(
+        "После импорта автоматически привязывать товары к Ozon категориям (эталон)",
+        value=True,
+        help="Работает, если кэш категорий Ozon уже синхронизирован во вкладке Ozon.",
+        key="import_auto_ozon_match",
+    )
 
     if uploaded is not None:
         uploaded_bytes = uploaded.getvalue() if hasattr(uploaded, "getvalue") else uploaded.read()
@@ -667,9 +788,31 @@ def show_import_tab():
                         temp_path,
                         sheet_name=selected_sheet,
                         header_row=selected_header_row_zero,
+                        default_supplier_name=default_supplier_name or None,
+                        default_supplier_url_template=default_supplier_url_template or None,
                     )
                 else:
-                    result = import_catalog_from_excel(conn, temp_path)
+                    result = import_catalog_from_excel(
+                        conn,
+                        temp_path,
+                        default_supplier_name=default_supplier_name or None,
+                        default_supplier_url_template=default_supplier_url_template or None,
+                    )
+                if auto_match_ozon_after_import and result.batch_id:
+                    batch_rows = conn.execute(
+                        "SELECT id FROM products WHERE import_batch_id = ? ORDER BY id DESC LIMIT 20000",
+                        (result.batch_id,),
+                    ).fetchall()
+                    batch_ids = [int(r["id"]) for r in batch_rows]
+                    if batch_ids:
+                        ozon_match_result = bulk_assign_ozon_categories(conn, batch_ids, min_score=0.28, force=False)
+                        if ozon_match_result.get("message"):
+                            st.info(str(ozon_match_result["message"]))
+                        else:
+                            st.caption(
+                                f"Ozon автопривязка: обработано {ozon_match_result['processed']}, "
+                                f"привязано {ozon_match_result['assigned']}, пропущено {ozon_match_result['skipped']}"
+                            )
                 batch_df = load_products(conn, limit=1000, import_batch_id=result.batch_id)
             except sqlite3.OperationalError as e:
                 conn.close()
@@ -714,23 +857,44 @@ def show_catalog_tab():
     with c3:
         supplier = st.text_input("Поставщик")
     with c4:
-        limit = st.number_input("Показать записей", min_value=50, max_value=1000, value=200, step=50)
+        page_size = st.selectbox("Размер страницы", options=[50, 100, 200, 500], index=1)
     with c5:
         only_last_batch = st.checkbox("Только последняя загрузка", value=False)
     with c6:
         parse_filter = st.selectbox("Парсинг", ["Все", "Есть supplier_url", "Не парсено", "Ошибка", "Успех"], index=0)
 
     batch_id = st.session_state.get("last_import_batch_id") if only_last_batch else ""
-    df = load_products(conn, search=search, category=category, supplier=supplier, limit=int(limit), import_batch_id=batch_id or "")
-    if not df.empty:
-        if parse_filter == "Есть supplier_url":
-            df = df[df["supplier_url"].notna() & (df["supplier_url"].astype(str).str.strip() != "")]
-        elif parse_filter == "Не парсено":
-            df = df[df["supplier_parse_status"].isna() | (df["supplier_parse_status"].astype(str).str.strip() == "")]
-        elif parse_filter == "Ошибка":
-            df = df[df["supplier_parse_status"] == "error"]
-        elif parse_filter == "Успех":
-            df = df[df["supplier_parse_status"] == "success"]
+    total_rows = count_products(
+        conn,
+        search=search,
+        category=category,
+        supplier=supplier,
+        import_batch_id=batch_id or "",
+        parse_filter=parse_filter,
+    )
+    total_pages = max(1, int(math.ceil(total_rows / max(int(page_size), 1))))
+    page_options = list(range(1, total_pages + 1))
+    current_page = int(st.session_state.get("catalog_page", 1))
+    if current_page > total_pages:
+        current_page = 1
+    p1, p2, p3 = st.columns([1, 1, 2])
+    with p1:
+        page = st.selectbox("Страница", options=page_options, index=page_options.index(current_page), key="catalog_page")
+    with p2:
+        st.metric("Всего страниц", total_pages)
+    with p3:
+        st.caption(f"Всего товаров по фильтру: {total_rows}")
+    offset = (int(page) - 1) * int(page_size)
+    df = load_products(
+        conn,
+        search=search,
+        category=category,
+        supplier=supplier,
+        limit=int(page_size),
+        offset=int(offset),
+        import_batch_id=batch_id or "",
+        parse_filter=parse_filter,
+    )
 
     if df.empty:
         st.info("Нет товаров")
@@ -740,16 +904,18 @@ def show_catalog_tab():
     if batch_id:
         st.caption("Показана только последняя загруженная партия")
 
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Товаров в выборке", int(len(df)))
-    m2.metric("С supplier_url", int((df["supplier_url"].fillna("").astype(str).str.strip() != "").sum()) if "supplier_url" in df.columns else 0)
-    m3.metric("Парсинг ок", int((df["supplier_parse_status"] == "success").sum()) if "supplier_parse_status" in df.columns else 0)
-    m4.metric("Ошибки парсинга", int((df["supplier_parse_status"] == "error").sum()) if "supplier_parse_status" in df.columns else 0)
+    m1, m2, m3, m4, m5 = st.columns(5)
+    m1.metric("Товаров на странице", int(len(df)))
+    m2.metric("Товаров всего", int(total_rows))
+    m3.metric("С supplier_url", int((df["supplier_url"].fillna("").astype(str).str.strip() != "").sum()) if "supplier_url" in df.columns else 0)
+    m4.metric("Парсинг ок", int((df["supplier_parse_status"] == "success").sum()) if "supplier_parse_status" in df.columns else 0)
+    m5.metric("С Ozon категорией", int((df["ozon_description_category_id"].notna()).sum()) if "ozon_description_category_id" in df.columns else 0)
+    st.caption(f"Показана страница {int(page)} из {total_pages}.")
 
     st.download_button(
-        "Скачать выборку Excel",
+        "Скачать текущую страницу Excel",
         data=export_current_df(df),
-        file_name="pim_products.xlsx",
+        file_name=f"pim_products_page_{int(page)}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 
@@ -767,7 +933,7 @@ def show_catalog_tab():
                 progress.progress(i / len(ids))
             st.success(f"Проверка дублей завершена: {total} товаров")
     with b2:
-        if st.button("Обогатить поставщика по текущей выборке"):
+        if st.button("Обогатить поставщика по текущей странице"):
             total = 0
             progress = st.progress(0)
             for i, pid in enumerate(ids, start=1):
@@ -777,6 +943,23 @@ def show_catalog_tab():
                     total += 1
                 progress.progress(i / len(ids))
             st.success(f"Обогащение поставщика завершено: обработано {total} товаров")
+    cextra1, cextra2 = st.columns(2)
+    with cextra1:
+        if st.button("Автопривязать Ozon категории (текущая страница)"):
+            res = bulk_assign_ozon_categories(conn, [int(x) for x in ids], min_score=0.28, force=False)
+            if res.get("message"):
+                st.info(str(res["message"]))
+            else:
+                st.success(f"Ozon автопривязка: обработано {res['processed']}, привязано {res['assigned']}, пропущено {res['skipped']}")
+            st.rerun()
+    with cextra2:
+        if st.button("Перепривязать Ozon категории (force, текущая страница)"):
+            res = bulk_assign_ozon_categories(conn, [int(x) for x in ids], min_score=0.28, force=True)
+            if res.get("message"):
+                st.info(str(res["message"]))
+            else:
+                st.success(f"Ozon force-привязка: обработано {res['processed']}, привязано {res['assigned']}, пропущено {res['skipped']}")
+            st.rerun()
 
     st.dataframe(df, use_container_width=True, hide_index=True)
 
@@ -802,7 +985,21 @@ def enrich_product_from_supplier(conn, product_id: int, force: bool = False) -> 
 
         updates = {}
         skipped_manual_fields = []
-        fields = ["description", "image_url", "weight", "length", "width", "height", "package_length", "package_width", "package_height", "gross_weight"]
+        fields = [
+            "name",
+            "brand",
+            "category",
+            "description",
+            "image_url",
+            "weight",
+            "length",
+            "width",
+            "height",
+            "package_length",
+            "package_width",
+            "package_height",
+            "gross_weight",
+        ]
         for field in fields:
             source_field = field
             if field == "gross_weight":
@@ -896,11 +1093,13 @@ def enrich_product_from_supplier(conn, product_id: int, force: bool = False) -> 
             )
 
         conn.commit()
+        ozon_match = bulk_assign_ozon_categories(conn, [int(product_id)], min_score=0.28, force=False)
         skipped_msg = f", пропущено ручных полей: {len(skipped_manual_fields)}" if skipped_manual_fields else ""
         skipped_attr_msg = f", пропущено атрибутов по приоритету: {len(skipped_attribute_fields)}" if skipped_attribute_fields else ""
+        ozon_msg = f", Ozon category match: {ozon_match.get('assigned', 0)}" if ozon_match.get("processed") else ""
         return {
             "ok": True,
-            "message": f"Обогащение завершено, обновлено полей: {len(updates)}, атрибутов сохранено: {attributes_saved}{skipped_msg}{skipped_attr_msg}",
+            "message": f"Обогащение завершено, обновлено полей: {len(updates)}, атрибутов сохранено: {attributes_saved}{skipped_msg}{skipped_attr_msg}{ozon_msg}",
             "updates": updates,
             "attributes": parsed.get("attributes", {}),
             "image_urls": parsed.get("image_urls", []),
@@ -967,6 +1166,23 @@ def show_product_tab():
                 st.rerun()
             else:
                 st.error(result["message"])
+    ctop3, ctop4 = st.columns([1, 1])
+    with ctop3:
+        if st.button("Подобрать Ozon категорию"):
+            res = bulk_assign_ozon_categories(conn, [int(product_id)], min_score=0.28, force=False)
+            if res.get("message"):
+                st.info(str(res["message"]))
+            else:
+                st.success(f"Ozon автопривязка: обработано {res['processed']}, привязано {res['assigned']}, пропущено {res['skipped']}")
+            st.rerun()
+    with ctop4:
+        if st.button("Перепривязать Ozon категорию (force)"):
+            res = bulk_assign_ozon_categories(conn, [int(product_id)], min_score=0.28, force=True)
+            if res.get("message"):
+                st.info(str(res["message"]))
+            else:
+                st.success(f"Ozon force-привязка: обработано {res['processed']}, привязано {res['assigned']}, пропущено {res['skipped']}")
+            st.rerun()
 
     parse_status = product["supplier_parse_status"] if "supplier_parse_status" in product.keys() else None
     parse_comment = product["supplier_parse_comment"] if "supplier_parse_comment" in product.keys() else None
@@ -1004,6 +1220,26 @@ def show_product_tab():
             )
             uom = st.text_input("Ед. изм.", value=product["uom"] or "")
             supplier_url = st.text_input("URL поставщика", value=product["supplier_url"] or "")
+            ozon_description_category_id = st.number_input(
+                "Ozon description_category_id",
+                min_value=0,
+                value=int(product["ozon_description_category_id"] or 0),
+                step=1,
+            )
+            ozon_type_id = st.number_input(
+                "Ozon type_id",
+                min_value=0,
+                value=int(product["ozon_type_id"] or 0),
+                step=1,
+            )
+            ozon_category_path = st.text_input("Ozon категория (path)", value=product["ozon_category_path"] or "")
+            ozon_category_confidence = st.number_input(
+                "Уверенность Ozon категории (0..1)",
+                min_value=0.0,
+                max_value=1.0,
+                value=float(product["ozon_category_confidence"] or 0.0),
+                step=0.01,
+            )
             tnved_code = st.text_input("ТН ВЭД", value=product["tnved_code"] or "")
 
         with c3:
@@ -1036,6 +1272,10 @@ def show_product_tab():
                 "subcategory": subcategory or None,
                 "wheel_diameter_inch": wheel_diameter_inch or None,
                 "supplier_url": supplier_url or None,
+                "ozon_description_category_id": int(ozon_description_category_id) if int(ozon_description_category_id) > 0 else None,
+                "ozon_type_id": int(ozon_type_id) if int(ozon_type_id) > 0 else None,
+                "ozon_category_path": ozon_category_path or None,
+                "ozon_category_confidence": float(ozon_category_confidence) if float(ozon_category_confidence) > 0 else None,
                 "uom": uom or None,
                 "weight": weight or None,
                 "length": length or None,
@@ -1152,12 +1392,15 @@ def show_template_tab():
     st.subheader("Клиентский шаблон")
     st.caption("Здесь должен быть понятный сценарий: загрузили шаблон, увидели матчинг, поняли дыры, добили данные, скачали готовый файл.")
     conn = get_db()
+    product_df = load_products(conn, limit=5000)
 
     t1, t2 = st.columns([1, 1])
     with t1:
         channel_code = st.text_input("Код клиента / канала", value="onlinetrade", key="template_channel_code")
     with t2:
-        category_code = st.text_input("Категория шаблона", value="", key="template_category_code")
+        known_categories = [""] + sorted([str(x) for x in product_df["category"].dropna().unique().tolist()]) if "product_df" in locals() else [""]
+        selected_known = st.selectbox("Категория товаров для шаблона (опционально)", options=known_categories, index=0, key="template_category_select")
+        category_code = st.text_input("Категория шаблона/профиля", value=selected_known or "", key="template_category_code")
 
     p1, p2 = st.columns([1, 1])
     with p1:
@@ -1172,7 +1415,6 @@ def show_template_tab():
         )
 
     uploaded = st.file_uploader("Загрузить Excel-шаблон клиента", type=["xlsx", "xls"], key="client_template")
-    product_df = load_products(conn, limit=1000)
     defs = list_attribute_definitions(conn)
     source_options = [("column", c) for c in [
         "article", "name", "barcode", "brand", "description", "weight", "length", "width", "height",
@@ -1256,7 +1498,6 @@ def show_template_tab():
 
             st.markdown("### Ручная правка матчинга")
             manual_rows = []
-            transform_options = ["", "cm_to_mm", "mm_to_cm", "m_to_cm", "kg_to_g", "g_to_kg", "inch_to_cm", "lower", "upper", "strip", "first_image", "join_images", "image_1", "image_2", "image_3", "image_4", "image_5"]
             for idx, match in enumerate(matches):
                 c1, c2, c3, c4 = st.columns([2, 2, 2, 2])
                 with c1:
@@ -1273,8 +1514,13 @@ def show_template_tab():
                     current_name = match["source_name"] if match["source_name"] in allowed_names else (allowed_names[0] if allowed_names else "")
                     source_name = st.selectbox("Источник", options=allowed_names, index=(allowed_names.index(current_name) if current_name in allowed_names else 0), key=f"tmpl_name_{idx}") if allowed_names else st.text_input("Источник", value="", key=f"tmpl_name_{idx}")
                 with c4:
-                    current_transform = match.get("transform_rule") if match.get("transform_rule") in transform_options else ""
-                    transform_rule = st.selectbox("Transform", options=transform_options, index=transform_options.index(current_transform), key=f"tmpl_transform_{idx}")
+                    current_transform = match.get("transform_rule") if match.get("transform_rule") in TEMPLATE_TRANSFORM_OPTIONS else ""
+                    transform_rule = st.selectbox(
+                        "Transform",
+                        options=TEMPLATE_TRANSFORM_OPTIONS,
+                        index=TEMPLATE_TRANSFORM_OPTIONS.index(current_transform),
+                        key=f"tmpl_transform_{idx}",
+                    )
                 manual_rows.append({
                     "template_column": match["template_column"],
                     "status": "matched" if source_type != "skip" else "unmatched",
@@ -1287,7 +1533,7 @@ def show_template_tab():
             manual_df = pd.DataFrame(manual_rows)
             unmatched = manual_df[manual_df["status"] == "unmatched"] if not manual_df.empty else pd.DataFrame()
 
-            s1, s2 = st.columns(2)
+            s1, s2, s3 = st.columns(3)
             with s1:
                 if st.button("Сохранить mapping rules", type="primary"):
                     saved = 0
@@ -1317,6 +1563,30 @@ def show_template_tab():
                         columns=manual_rows,
                     )
                     st.success(f"Профиль шаблона сохранён: #{profile_id}")
+            with s3:
+                if st.button("Добавить несматченные в master-атрибуты"):
+                    created = 0
+                    for idx, row in manual_df.iterrows():
+                        if row["status"] == "matched":
+                            continue
+                        col_name = str(row["template_column"])
+                        code = to_attribute_code(col_name)
+                        if not code:
+                            continue
+                        upsert_attribute_definition(
+                            conn=conn,
+                            code=code,
+                            name=col_name.strip(),
+                            data_type="text",
+                            scope="master",
+                            unit=None,
+                            description=f"Автосоздано из клиентского шаблона: {col_name}",
+                        )
+                        st.session_state[f"tmpl_type_{idx}"] = "attribute"
+                        st.session_state[f"tmpl_name_{idx}"] = code
+                        created += 1
+                    st.success(f"Создано/обновлено master-атрибутов: {created}. Маппинг предзаполнен автоматически.")
+                    st.rerun()
 
             if not unmatched.empty:
                 st.warning(f"Не сматчено колонок: {len(unmatched)}")
@@ -1326,7 +1596,6 @@ def show_template_tab():
 
         with tab_fill:
             manual_rows = []
-            transform_options = ["", "cm_to_mm", "mm_to_cm", "m_to_cm", "kg_to_g", "g_to_kg", "inch_to_cm", "lower", "upper", "strip", "first_image", "join_images", "image_1", "image_2", "image_3", "image_4", "image_5"]
             for idx, match in enumerate(matches):
                 source_type = st.session_state.get(f"tmpl_type_{idx}", match.get("source_type") if match.get("source_type") in ["attribute", "column"] else "skip")
                 source_name = st.session_state.get(f"tmpl_name_{idx}", match.get("source_name"))
@@ -2630,12 +2899,16 @@ def main():
     with st.expander("Как здесь работать", expanded=False):
         st.markdown(
             """
-1. **Импорт**: загружаем новый каталог или ассортимент.
-2. **Каталог**: быстро фильтруем товары, смотрим статус supplier enrichment.
-3. **Карточка**: правим мастер-товар и обогащаем его с сайта поставщика.
-4. **Атрибуты**: управляем атрибутным слоем.
-5. **Клиентский шаблон**: матчим поля, смотрим gap, собираем файл клиента.
-6. **Каналы**: настраиваем требования и mapping rules.
+1. **Импорт**: загрузи Excel, выбери авто/ручной режим, при необходимости задай поставщика и URL-шаблон (`{article}`, `{supplier_article}`), затем выполни импорт.
+2. **Импорт → Ozon**: после импорта можно сразу автопривязать товары к Ozon категориям (если синхронизирован кэш категорий во вкладке Ozon).
+3. **Каталог**: работай постранично (страницы + размер), фильтруй по статусу парсинга, запускай массовый supplier enrichment и Ozon-автопривязку по текущей странице.
+4. **Карточка**: дозаполни вручную, смотри источники данных, запусти парсинг поставщика и проверь/скорректируй Ozon category (id/type/path/confidence).
+5. **Атрибуты**: поддерживай master/channel атрибуты, которые участвуют в автоматчинге шаблонов.
+6. **Клиентский шаблон**: загрузи шаблон клиента, выбери категорию, проверь авто-матчинг, при необходимости поправь руками и сохрани профиль.
+7. **Клиентский шаблон → новые поля**: если в шаблоне есть новые характеристики, кнопка добавит их в master-атрибуты и сразу предложит маппинг.
+8. **Экспорт Excel**: заполни выбранные товары, проверь gap/readiness, выгрузи готовый Excel в исходной структуре клиента.
+9. **Ozon**: синхронизируй дерево/атрибуты, используй Ozon как эталон структуры, импортируй атрибуты в PIM и контролируй покрытие.
+10. **Каналы**: поддерживай channel requirements и mapping rules для повторного безручного экспорта.
             """
         )
 
