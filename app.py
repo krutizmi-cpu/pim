@@ -219,6 +219,22 @@ def build_ozon_product_list_template_excel() -> bytes:
     return output.getvalue()
 
 
+def build_ozon_dictionary_overrides_template_excel() -> bytes:
+    df = pd.DataFrame(
+        {
+            "attribute_id": [85, 8229],
+            "raw_value": ["stels", "bike"],
+            "value_id": [123456, 654321],
+            "value": ["Stels", "Велосипед"],
+            "comment": ["Бренд нормализован", "Тип товара"],
+        }
+    )
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="overrides")
+    return output.getvalue()
+
+
 def _cell_to_lookup_text(value) -> str:
     if value is None:
         return ""
@@ -315,6 +331,63 @@ def resolve_product_ids_from_excel(
         "resolved_count": int(len(set(resolved_ids))),
         "not_found": not_found,
         "not_found_count": int(len(not_found)),
+    }
+
+
+def import_dictionary_overrides_from_excel(
+    conn,
+    file_bytes: bytes,
+    description_category_id: int,
+    type_id: int,
+) -> dict:
+    try:
+        df = pd.read_excel(BytesIO(file_bytes))
+    except Exception as e:
+        return {"ok": False, "message": f"Не удалось прочитать Excel: {e}"}
+
+    required_cols = {"attribute_id", "raw_value", "value_id"}
+    actual_cols = {str(c).strip().lower(): str(c) for c in df.columns}
+    missing = [c for c in required_cols if c not in actual_cols]
+    if missing:
+        return {"ok": False, "message": f"В Excel нет обязательных колонок: {', '.join(missing)}"}
+
+    applied = 0
+    skipped = 0
+    errors = []
+    for idx, row in df.iterrows():
+        try:
+            attribute_id_raw = row[actual_cols["attribute_id"]]
+            raw_value = _cell_to_lookup_text(row[actual_cols["raw_value"]])
+            value_id_raw = row[actual_cols["value_id"]]
+            value = row[actual_cols["value"]] if "value" in actual_cols else None
+            comment = row[actual_cols["comment"]] if "comment" in actual_cols else None
+
+            if not raw_value:
+                skipped += 1
+                continue
+
+            attribute_id = int(float(attribute_id_raw))
+            value_id = int(float(value_id_raw))
+            save_dictionary_override(
+                conn=conn,
+                description_category_id=int(description_category_id),
+                type_id=int(type_id),
+                attribute_id=attribute_id,
+                raw_value=raw_value,
+                value_id=value_id,
+                value=_cell_to_lookup_text(value) if value is not None else None,
+                comment=_cell_to_lookup_text(comment) if comment is not None else None,
+            )
+            applied += 1
+        except Exception as e:
+            skipped += 1
+            errors.append({"row": int(idx) + 2, "error": str(e)})
+
+    return {
+        "ok": True,
+        "applied": int(applied),
+        "skipped": int(skipped),
+        "errors": errors[:100],
     }
 
 
@@ -1800,6 +1873,44 @@ def show_ozon_tab():
                             type_id=int(selected_row["type_id"]),
                             limit=200,
                         )
+                        st.markdown("### Excel: массовый импорт dictionary overrides")
+                        ov1, ov2 = st.columns([2, 1])
+                        with ov1:
+                            overrides_excel = st.file_uploader(
+                                "Загрузи Excel с overrides",
+                                type=["xlsx", "xls"],
+                                key=f"ozon_overrides_excel_{selected_product_id}",
+                            )
+                        with ov2:
+                            st.download_button(
+                                "Скачать шаблон overrides",
+                                data=build_ozon_dictionary_overrides_template_excel(),
+                                file_name="ozon_dictionary_overrides_template.xlsx",
+                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                key=f"ozon_overrides_template_{selected_product_id}",
+                            )
+                            if st.button("Импортировать overrides из Excel", key=f"ozon_import_overrides_{selected_product_id}"):
+                                if overrides_excel is None:
+                                    st.warning("Сначала загрузи Excel файл с overrides.")
+                                else:
+                                    import_result = import_dictionary_overrides_from_excel(
+                                        conn=conn,
+                                        file_bytes=overrides_excel.read(),
+                                        description_category_id=int(selected_row["description_category_id"]),
+                                        type_id=int(selected_row["type_id"]),
+                                    )
+                                    if import_result.get("ok"):
+                                        st.success(
+                                            f"Импорт завершён: применено {import_result.get('applied', 0)}, "
+                                            f"пропущено {import_result.get('skipped', 0)}."
+                                        )
+                                        errors = import_result.get("errors") or []
+                                        if errors:
+                                            st.dataframe(pd.DataFrame(errors), use_container_width=True, hide_index=True)
+                                        st.rerun()
+                                    else:
+                                        st.error(import_result.get("message") or "Не удалось импортировать overrides.")
+
                         if overrides:
                             st.markdown("### Сохранённые dictionary overrides")
                             overrides_df = pd.DataFrame(overrides)
