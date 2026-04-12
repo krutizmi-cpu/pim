@@ -204,6 +204,88 @@ def export_current_df(df: pd.DataFrame):
     return output.getvalue()
 
 
+def _cell_to_lookup_text(value) -> str:
+    if value is None:
+        return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except Exception:
+        pass
+    if isinstance(value, float):
+        if value.is_integer():
+            return str(int(value))
+        return str(value).strip()
+    return str(value).strip()
+
+
+def resolve_product_ids_from_excel(conn, file_bytes: bytes, lookup_field: str) -> dict:
+    try:
+        df = pd.read_excel(BytesIO(file_bytes))
+    except Exception as e:
+        return {"ok": False, "message": f"Не удалось прочитать Excel: {e}"}
+
+    if df.empty:
+        return {"ok": False, "message": "Excel пустой"}
+
+    lookup_aliases = {
+        "id": ["id", "product_id", "товар id", "id товара"],
+        "article": ["article", "артикул", "sku", "vendor code", "код товара"],
+        "internal_article": ["internal_article", "внутренний артикул", "артикул 1с"],
+        "supplier_article": ["supplier_article", "артикул поставщика"],
+    }
+    field = str(lookup_field or "article").strip().lower()
+    aliases = lookup_aliases.get(field, lookup_aliases["article"])
+
+    normalized_columns = {str(c).strip().lower(): str(c) for c in df.columns}
+    selected_column = None
+    for alias in aliases:
+        if alias in normalized_columns:
+            selected_column = normalized_columns[alias]
+            break
+    if not selected_column:
+        selected_column = str(df.columns[0])
+
+    raw_values = [_cell_to_lookup_text(v) for v in df[selected_column].tolist()]
+    values = []
+    seen = set()
+    for v in raw_values:
+        if not v:
+            continue
+        key = v.lower() if field != "id" else v
+        if key in seen:
+            continue
+        seen.add(key)
+        values.append(v)
+
+    resolved_ids = []
+    not_found = []
+    for v in values:
+        row = None
+        if field == "id":
+            try:
+                row = conn.execute("SELECT id FROM products WHERE id = ? LIMIT 1", (int(float(v)),)).fetchone()
+            except Exception:
+                row = None
+        elif field in {"article", "internal_article", "supplier_article"}:
+            row = conn.execute(f"SELECT id FROM products WHERE lower(IFNULL({field}, '')) = lower(?) LIMIT 1", (v,)).fetchone()
+        if row:
+            resolved_ids.append(int(row["id"]))
+        else:
+            not_found.append(v)
+
+    return {
+        "ok": True,
+        "lookup_field": field,
+        "used_column": selected_column,
+        "input_values": int(len(values)),
+        "resolved_ids": sorted(list(set(resolved_ids))),
+        "resolved_count": int(len(set(resolved_ids))),
+        "not_found": not_found,
+        "not_found_count": int(len(not_found)),
+    }
+
+
 def render_template_readiness(filled_df: pd.DataFrame, manual_rows: list[dict]) -> None:
     readiness = analyze_template_readiness(filled_df, manual_rows)
     summary = readiness["summary"]
@@ -1226,7 +1308,7 @@ def show_ozon_tab():
                         st.caption("Значения этого справочника ещё не загружены в кэш.")
 
                 product_rows = conn.execute(
-                    "SELECT id, name, article, internal_article, supplier_article FROM products ORDER BY id DESC LIMIT 500"
+                    "SELECT id, name, article, internal_article, supplier_article FROM products ORDER BY id DESC LIMIT 5000"
                 ).fetchall()
                 if product_rows:
                     product_options = [int(r["id"]) for r in product_rows]
@@ -1244,12 +1326,63 @@ def show_ozon_tab():
                         step=0.01,
                         key=f"ozon_dict_min_score_{selected_product_id}",
                     )
+                    st.markdown("### Excel: список товаров для массовых действий")
+                    excel_col1, excel_col2, excel_col3 = st.columns([1, 2, 1])
+                    with excel_col1:
+                        excel_lookup_field = st.selectbox(
+                            "Поле поиска в Excel",
+                            options=["id", "article", "internal_article", "supplier_article"],
+                            index=1,
+                            key=f"ozon_excel_lookup_{selected_product_id}",
+                        )
+                    with excel_col2:
+                        excel_file = st.file_uploader(
+                            "Загрузи Excel со списком товаров",
+                            type=["xlsx", "xls"],
+                            key=f"ozon_excel_file_{selected_product_id}",
+                        )
+                    bulk_select_key = f"ozon_bulk_product_ids_{selected_product_id}"
+                    if bulk_select_key not in st.session_state:
+                        st.session_state[bulk_select_key] = [int(selected_product_id)]
+                    with excel_col3:
+                        if st.button("Загрузить список из Excel", key=f"ozon_excel_apply_{selected_product_id}"):
+                            if excel_file is None:
+                                st.warning("Сначала загрузи Excel файл.")
+                            else:
+                                parsed = resolve_product_ids_from_excel(conn, excel_file.read(), excel_lookup_field)
+                                st.session_state[f"ozon_excel_parse_{selected_product_id}"] = parsed
+                                if parsed.get("ok"):
+                                    st.session_state[bulk_select_key] = parsed.get("resolved_ids") or [int(selected_product_id)]
+                                    st.success(
+                                        f"Excel обработан: найдено {parsed.get('resolved_count', 0)} из {parsed.get('input_values', 0)} значений."
+                                    )
+                                    st.rerun()
+                                else:
+                                    st.error(parsed.get("message") or "Не удалось обработать Excel.")
+
+                    parse_summary = st.session_state.get(f"ozon_excel_parse_{selected_product_id}")
+                    if parse_summary and parse_summary.get("ok"):
+                        s1, s2, s3 = st.columns(3)
+                        s1.metric("Входных значений", int(parse_summary.get("input_values") or 0))
+                        s2.metric("Найдено товаров", int(parse_summary.get("resolved_count") or 0))
+                        s3.metric("Не найдено", int(parse_summary.get("not_found_count") or 0))
+                        not_found = parse_summary.get("not_found") or []
+                        if not_found:
+                            not_found_df = pd.DataFrame({"not_found_value": not_found})
+                            st.dataframe(not_found_df, use_container_width=True, hide_index=True)
+                            st.download_button(
+                                "Скачать не найденные значения (Excel)",
+                                data=dataframe_to_excel_bytes(not_found_df, sheet_name="not_found"),
+                                file_name="ozon_excel_not_found.xlsx",
+                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                key=f"ozon_not_found_export_{selected_product_id}",
+                            )
+
                     selected_product_ids = st.multiselect(
                         "Товары для массовых действий",
                         options=product_options,
-                        default=[int(selected_product_id)],
                         format_func=lambda x: next((f"ID {r['id']} | {r['article'] or '-'} | {r['name'] or '-'}" for r in product_rows if int(r['id']) == int(x)), str(x)),
-                        key=f"ozon_bulk_product_ids_{selected_product_id}",
+                        key=bulk_select_key,
                     )
                     required_only_mode = st.checkbox(
                         "Работать только с обязательными Ozon-атрибутами (required)",
