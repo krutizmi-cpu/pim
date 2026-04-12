@@ -875,6 +875,7 @@ def analyze_product_ozon_coverage(
     )
     total_required = int(len(payload_rows))
     covered_required = int(sum(1 for row in payload_rows if row.get("status") == "ready"))
+    dictionary_unmatched_required = int(sum(1 for row in payload_rows if row.get("status") == "dictionary_unmatched"))
     rows: list[dict[str, Any]] = [
         {
             "Ozon атрибут": row.get("name"),
@@ -894,6 +895,7 @@ def analyze_product_ozon_coverage(
             "required_total": total_required,
             "required_covered": covered_required,
             "required_missing": total_required - covered_required,
+            "required_dictionary_unmatched": dictionary_unmatched_required,
             "readiness_pct": readiness,
         },
         "rows": rows,

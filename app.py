@@ -1273,6 +1273,7 @@ def show_ozon_tab():
                                 cc2.metric("Required всего", int(summary["required_total"]))
                                 cc3.metric("Required закрыто", int(summary["required_covered"]))
                                 cc4.metric("Required пусто", int(summary["required_missing"]))
+                                st.caption(f"Required dictionary_unmatched: {int(summary.get('required_dictionary_unmatched') or 0)}")
                                 if summary["readiness_pct"] == 100:
                                     st.success("Обязательные Ozon-атрибуты по этой категории закрыты.")
                                 else:
@@ -1322,10 +1323,14 @@ def show_ozon_tab():
                                                 "required_total": int(summary.get("required_total") or 0),
                                                 "required_covered": int(summary.get("required_covered") or 0),
                                                 "required_missing": int(summary.get("required_missing") or 0),
+                                                "required_dictionary_unmatched": int(summary.get("required_dictionary_unmatched") or 0),
                                             }
                                         )
                                         progress.progress(i / len(selected_product_ids))
-                                    report_df = pd.DataFrame(report_rows).sort_values(by=["readiness_pct", "required_missing"], ascending=[False, True])
+                                    report_df = pd.DataFrame(report_rows).sort_values(
+                                        by=["readiness_pct", "required_dictionary_unmatched", "required_missing"],
+                                        ascending=[False, True, True],
+                                    )
                                     st.dataframe(report_df, use_container_width=True, hide_index=True)
                                     st.download_button(
                                         "Скачать отчёт готовности Ozon (Excel)",
