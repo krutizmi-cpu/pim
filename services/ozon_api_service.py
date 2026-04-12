@@ -1114,3 +1114,40 @@ def build_product_ozon_api_attributes(
         "included": int(len(attributes)),
         "skipped": int(skipped),
     }
+
+
+def build_bulk_ozon_api_payloads(
+    conn: sqlite3.Connection,
+    product_ids: list[int],
+    description_category_id: int,
+    type_id: int,
+    required_only: bool = False,
+    dictionary_min_score: float = 0.78,
+) -> dict[str, Any]:
+    products_payload: list[dict[str, Any]] = []
+    total_included = 0
+    total_skipped = 0
+
+    for pid in product_ids:
+        item = build_product_ozon_api_attributes(
+            conn=conn,
+            product_id=int(pid),
+            description_category_id=int(description_category_id),
+            type_id=int(type_id),
+            required_only=required_only,
+            dictionary_min_score=float(dictionary_min_score),
+        )
+        products_payload.append(item)
+        total_included += int(item.get("included") or 0)
+        total_skipped += int(item.get("skipped") or 0)
+
+    return {
+        "description_category_id": int(description_category_id),
+        "type_id": int(type_id),
+        "products": products_payload,
+        "summary": {
+            "products_total": int(len(products_payload)),
+            "attributes_included": int(total_included),
+            "attributes_skipped": int(total_skipped),
+        },
+    }
