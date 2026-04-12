@@ -348,6 +348,25 @@ def _ensure_template_profile_tables(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_tpc_profile_id ON template_profile_columns(profile_id)")
 
 
+def _ensure_supplier_profiles_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS supplier_profiles (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            supplier_name TEXT NOT NULL,
+            base_url TEXT,
+            url_template TEXT,
+            is_active INTEGER DEFAULT 1,
+            notes TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT
+        )
+        """
+    )
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_supplier_profiles_name ON supplier_profiles(supplier_name)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_supplier_profiles_active ON supplier_profiles(is_active)")
+
+
 def _ensure_ozon_tables(conn: sqlite3.Connection) -> None:
     conn.execute(
         """
@@ -673,6 +692,36 @@ def _seed_channels(conn: sqlite3.Connection) -> None:
         )
 
 
+def _seed_supplier_profiles(conn: sqlite3.Connection) -> None:
+    defaults = [
+        (
+            "Веломай",
+            "https://technosite.ru/",
+            "https://technosite.ru/search/?q={article_q}",
+            "Базовый профиль поставщика для ассортимента велосипедов под Детский Мир.",
+        ),
+    ]
+    for supplier_name, base_url, url_template, notes in defaults:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO supplier_profiles (supplier_name, base_url, url_template, is_active, notes, created_at, updated_at)
+            VALUES (?, ?, ?, 1, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            """,
+            (supplier_name, base_url, url_template, notes),
+        )
+        conn.execute(
+            """
+            UPDATE supplier_profiles
+            SET base_url = COALESCE(NULLIF(base_url, ''), ?),
+                url_template = COALESCE(NULLIF(url_template, ''), ?),
+                notes = COALESCE(NULLIF(notes, ''), ?),
+                updated_at = CURRENT_TIMESTAMP
+            WHERE supplier_name = ?
+            """,
+            (base_url, url_template, notes, supplier_name),
+        )
+
+
 def init_db(conn: sqlite3.Connection) -> None:
     _ensure_products_table(conn)
     _ensure_duplicate_table(conn)
@@ -681,11 +730,13 @@ def init_db(conn: sqlite3.Connection) -> None:
     _ensure_attribute_tables(conn)
     _ensure_product_data_sources_table(conn)
     _ensure_template_profile_tables(conn)
+    _ensure_supplier_profiles_table(conn)
     _ensure_ozon_tables(conn)
     _ensure_channel_tables(conn)
 
     _seed_category_defaults(conn)
     _seed_attribute_definitions(conn)
     _seed_channels(conn)
+    _seed_supplier_profiles(conn)
 
     conn.commit()

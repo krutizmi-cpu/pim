@@ -29,6 +29,7 @@ from services.supplier_parser import fetch_supplier_page, extract_supplier_data,
 from services.template_matching import auto_match_template_columns, apply_saved_mapping_rules, fill_template_dataframe, apply_client_validated_values, fill_template_workbook_bytes, dataframe_to_excel_bytes, detect_template_data_start_row
 from services.template_profiles import save_template_profile, list_template_profiles, get_template_profile_columns
 from services.readiness_service import analyze_template_readiness
+from services.supplier_profiles import list_supplier_profiles, upsert_supplier_profile
 from services.ozon_api_service import is_configured, sync_category_tree, list_cached_categories, sync_category_attributes, list_cached_attributes, sync_attribute_dictionary_values, sync_all_category_dictionary_values, list_cached_attribute_values, import_cached_attributes_to_pim, suggest_mappings_for_cached_attributes, save_suggested_mappings, analyze_product_ozon_coverage, ensure_ozon_master_attributes, build_product_ozon_payload, materialize_product_ozon_attributes, preview_product_ozon_dictionary_gaps, build_product_ozon_api_attributes, build_bulk_ozon_api_payloads, build_ozon_attributes_update_request, submit_ozon_attributes_update, list_ozon_update_jobs, get_ozon_update_job, retry_ozon_update_job, list_ozon_update_job_items, save_dictionary_override, list_dictionary_overrides, delete_dictionary_override
 from services.ozon_category_match import bulk_assign_ozon_categories
 
@@ -696,6 +697,22 @@ def show_import_tab():
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         key="supplier_import_template",
     )
+    profiles_conn = get_db()
+    profiles = list_supplier_profiles(profiles_conn, only_active=True)
+    profiles_conn.close()
+    profile_map = {p["supplier_name"]: p for p in profiles}
+    selected_profile_name = st.selectbox(
+        "Профиль поставщика",
+        options=[""] + sorted(profile_map.keys()),
+        key="import_supplier_profile_name",
+        help="Выбери профиль, чтобы автоматически подставить поставщика и URL-шаблон.",
+    )
+    if selected_profile_name:
+        profile = profile_map[selected_profile_name]
+        st.session_state["import_default_supplier_name"] = profile.get("supplier_name") or ""
+        st.session_state["import_default_supplier_url_template"] = profile.get("url_template") or profile.get("base_url") or ""
+        if profile.get("base_url"):
+            st.caption(f"Базовый сайт поставщика: {profile.get('base_url')}")
     uploaded = st.file_uploader("Excel файл", type=["xlsx", "xls"])
     s1, s2 = st.columns(2)
     with s1:
@@ -714,6 +731,31 @@ def show_import_tab():
             help="Поддерживает {article}, {supplier_article}, {code}, {name}, а также *_q для URL-encoding.",
         )
         st.session_state["import_default_supplier_url_template"] = default_supplier_url_template
+    with st.expander("Профили поставщиков", expanded=False):
+        sp1, sp2, sp3 = st.columns([2, 2, 1])
+        with sp1:
+            profile_name_input = st.text_input("Имя профиля", value=default_supplier_name or "", key="supplier_profile_name_input")
+        with sp2:
+            profile_base_url = st.text_input("Базовый URL", value="", key="supplier_profile_base_url")
+        with sp3:
+            save_profile_btn = st.button("Сохранить профиль")
+        profile_url_template = st.text_input(
+            "URL template профиля",
+            value=default_supplier_url_template or "",
+            key="supplier_profile_url_template",
+        )
+        if save_profile_btn and profile_name_input.strip():
+            conn = get_db()
+            profile_id = upsert_supplier_profile(
+                conn=conn,
+                supplier_name=profile_name_input.strip(),
+                base_url=profile_base_url.strip() or None,
+                url_template=profile_url_template.strip() or None,
+                notes="Сохранено из вкладки Импорт",
+                is_active=1,
+            )
+            conn.close()
+            st.success(f"Профиль поставщика сохранён: #{profile_id}")
     auto_match_ozon_after_import = st.checkbox(
         "После импорта автоматически привязывать товары к Ozon категориям (эталон)",
         value=True,
