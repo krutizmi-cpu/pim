@@ -204,6 +204,21 @@ def export_current_df(df: pd.DataFrame):
     return output.getvalue()
 
 
+def build_ozon_product_list_template_excel() -> bytes:
+    df = pd.DataFrame(
+        {
+            "article": ["ART-001", "ART-002"],
+            "internal_article": ["INT-001", "INT-002"],
+            "supplier_article": ["SUP-001", "SUP-002"],
+            "id": [1, 2],
+        }
+    )
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="products")
+    return output.getvalue()
+
+
 def _cell_to_lookup_text(value) -> str:
     if value is None:
         return ""
@@ -219,9 +234,18 @@ def _cell_to_lookup_text(value) -> str:
     return str(value).strip()
 
 
-def resolve_product_ids_from_excel(conn, file_bytes: bytes, lookup_field: str) -> dict:
+def resolve_product_ids_from_excel(
+    conn,
+    file_bytes: bytes,
+    lookup_field: str,
+    sheet_name: str | None = None,
+    column_name: str | None = None,
+) -> dict:
     try:
-        df = pd.read_excel(BytesIO(file_bytes))
+        if sheet_name:
+            df = pd.read_excel(BytesIO(file_bytes), sheet_name=sheet_name)
+        else:
+            df = pd.read_excel(BytesIO(file_bytes))
     except Exception as e:
         return {"ok": False, "message": f"Не удалось прочитать Excel: {e}"}
 
@@ -239,7 +263,15 @@ def resolve_product_ids_from_excel(conn, file_bytes: bytes, lookup_field: str) -
 
     normalized_columns = {str(c).strip().lower(): str(c) for c in df.columns}
     selected_column = None
+    manual_column = (column_name or "").strip()
+    if manual_column:
+        manual_norm = manual_column.lower()
+        selected_column = normalized_columns.get(manual_norm)
+        if not selected_column:
+            return {"ok": False, "message": f"Колонка '{manual_column}' не найдена в Excel."}
     for alias in aliases:
+        if selected_column:
+            break
         if alias in normalized_columns:
             selected_column = normalized_columns[alias]
             break
@@ -1335,6 +1367,18 @@ def show_ozon_tab():
                             index=1,
                             key=f"ozon_excel_lookup_{selected_product_id}",
                         )
+                        excel_sheet_name = st.text_input(
+                            "Лист Excel (опционально)",
+                            value="",
+                            key=f"ozon_excel_sheet_{selected_product_id}",
+                            placeholder="Например: products",
+                        )
+                        excel_column_name = st.text_input(
+                            "Колонка Excel (опционально)",
+                            value="",
+                            key=f"ozon_excel_column_{selected_product_id}",
+                            placeholder="Например: article",
+                        )
                     with excel_col2:
                         excel_file = st.file_uploader(
                             "Загрузи Excel со списком товаров",
@@ -1345,11 +1389,24 @@ def show_ozon_tab():
                     if bulk_select_key not in st.session_state:
                         st.session_state[bulk_select_key] = [int(selected_product_id)]
                     with excel_col3:
+                        st.download_button(
+                            "Скачать шаблон Excel",
+                            data=build_ozon_product_list_template_excel(),
+                            file_name="ozon_products_list_template.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            key=f"ozon_excel_template_{selected_product_id}",
+                        )
                         if st.button("Загрузить список из Excel", key=f"ozon_excel_apply_{selected_product_id}"):
                             if excel_file is None:
                                 st.warning("Сначала загрузи Excel файл.")
                             else:
-                                parsed = resolve_product_ids_from_excel(conn, excel_file.read(), excel_lookup_field)
+                                parsed = resolve_product_ids_from_excel(
+                                    conn,
+                                    excel_file.read(),
+                                    excel_lookup_field,
+                                    sheet_name=excel_sheet_name or None,
+                                    column_name=excel_column_name or None,
+                                )
                                 st.session_state[f"ozon_excel_parse_{selected_product_id}"] = parsed
                                 if parsed.get("ok"):
                                     st.session_state[bulk_select_key] = parsed.get("resolved_ids") or [int(selected_product_id)]
@@ -1366,6 +1423,9 @@ def show_ozon_tab():
                         s1.metric("Входных значений", int(parse_summary.get("input_values") or 0))
                         s2.metric("Найдено товаров", int(parse_summary.get("resolved_count") or 0))
                         s3.metric("Не найдено", int(parse_summary.get("not_found_count") or 0))
+                        st.caption(
+                            f"Использована колонка: {parse_summary.get('used_column')} | Поле lookup: {parse_summary.get('lookup_field')}"
+                        )
                         not_found = parse_summary.get("not_found") or []
                         if not_found:
                             not_found_df = pd.DataFrame({"not_found_value": not_found})
