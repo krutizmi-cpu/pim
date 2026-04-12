@@ -700,6 +700,12 @@ def _seed_supplier_profiles(conn: sqlite3.Connection) -> None:
             "https://technosite.ru/search/?q={article_q}",
             "Базовый профиль поставщика для ассортимента велосипедов под Детский Мир.",
         ),
+        (
+            "Рокви",
+            "https://velocitygroup.ru/?category=velo",
+            "https://velocitygroup.ru/?category=velo&search={article_q}",
+            "Профиль поставщика для ассортимента Rockbros / Moon / SKS.",
+        ),
     ]
     for supplier_name, base_url, url_template, notes in defaults:
         conn.execute(
