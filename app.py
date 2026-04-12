@@ -1234,6 +1234,13 @@ def show_ozon_tab():
                         step=0.01,
                         key=f"ozon_dict_min_score_{selected_product_id}",
                     )
+                    selected_product_ids = st.multiselect(
+                        "Товары для массовых действий",
+                        options=product_options,
+                        default=[int(selected_product_id)],
+                        format_func=lambda x: next((f"ID {r['id']} | {r['article'] or '-'} | {r['name'] or '-'}" for r in product_rows if int(r['id']) == int(x)), str(x)),
+                        key=f"ozon_bulk_product_ids_{selected_product_id}",
+                    )
                     preview_rows = build_product_ozon_payload(
                         conn,
                         product_id=int(selected_product_id),
@@ -1287,6 +1294,72 @@ def show_ozon_tab():
                                     f"Записано Ozon-значений: {result['applied']}, пустых пропущено: {result['skipped_empty']}, "
                                     f"dictionary без матчинга: {result.get('skipped_dictionary', 0)}. category_code={result['category_code']}"
                                 )
+
+                        b1, b2 = st.columns(2)
+                        with b1:
+                            if st.button("Массовая проверка готовности по выбранным товарам"):
+                                if not selected_product_ids:
+                                    st.warning("Выбери хотя бы один товар для массовой проверки.")
+                                else:
+                                    report_rows = []
+                                    progress = st.progress(0)
+                                    for i, pid in enumerate(selected_product_ids, start=1):
+                                        coverage = analyze_product_ozon_coverage(
+                                            conn,
+                                            product_id=int(pid),
+                                            description_category_id=int(selected_row["description_category_id"]),
+                                            type_id=int(selected_row["type_id"]),
+                                            dictionary_min_score=float(dictionary_min_score),
+                                        )
+                                        summary = coverage.get("summary", {})
+                                        product_row = next((r for r in product_rows if int(r["id"]) == int(pid)), None)
+                                        report_rows.append(
+                                            {
+                                                "product_id": int(pid),
+                                                "article": product_row["article"] if product_row else None,
+                                                "name": product_row["name"] if product_row else None,
+                                                "readiness_pct": int(summary.get("readiness_pct") or 0),
+                                                "required_total": int(summary.get("required_total") or 0),
+                                                "required_covered": int(summary.get("required_covered") or 0),
+                                                "required_missing": int(summary.get("required_missing") or 0),
+                                            }
+                                        )
+                                        progress.progress(i / len(selected_product_ids))
+                                    report_df = pd.DataFrame(report_rows).sort_values(by=["readiness_pct", "required_missing"], ascending=[False, True])
+                                    st.dataframe(report_df, use_container_width=True, hide_index=True)
+                                    st.download_button(
+                                        "Скачать отчёт готовности Ozon (Excel)",
+                                        data=dataframe_to_excel_bytes(report_df, sheet_name="ozon_readiness"),
+                                        file_name="ozon_readiness_report.xlsx",
+                                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                        key=f"ozon_readiness_export_{selected_product_id}",
+                                    )
+                        with b2:
+                            if st.button("Массово заполнить Ozon-атрибуты для выбранных"):
+                                if not selected_product_ids:
+                                    st.warning("Выбери хотя бы один товар для массового заполнения.")
+                                else:
+                                    progress = st.progress(0)
+                                    total_applied = 0
+                                    total_skipped_empty = 0
+                                    total_skipped_dict = 0
+                                    for i, pid in enumerate(selected_product_ids, start=1):
+                                        result = materialize_product_ozon_attributes(
+                                            conn,
+                                            product_id=int(pid),
+                                            description_category_id=int(selected_row["description_category_id"]),
+                                            type_id=int(selected_row["type_id"]),
+                                            required_only=False,
+                                            dictionary_min_score=float(dictionary_min_score),
+                                        )
+                                        total_applied += int(result.get("applied") or 0)
+                                        total_skipped_empty += int(result.get("skipped_empty") or 0)
+                                        total_skipped_dict += int(result.get("skipped_dictionary") or 0)
+                                        progress.progress(i / len(selected_product_ids))
+                                    st.success(
+                                        f"Массовое заполнение завершено. Записано: {total_applied}, "
+                                        f"пустых пропущено: {total_skipped_empty}, dictionary без матчинга: {total_skipped_dict}."
+                                    )
 
                         payload_preview = build_product_ozon_api_attributes(
                             conn,
