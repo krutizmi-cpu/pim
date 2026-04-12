@@ -26,7 +26,7 @@ from services.supplier_parser import fetch_supplier_page, extract_supplier_data,
 from services.template_matching import auto_match_template_columns, apply_saved_mapping_rules, fill_template_dataframe, apply_client_validated_values, fill_template_workbook_bytes, dataframe_to_excel_bytes, detect_template_data_start_row
 from services.template_profiles import save_template_profile, list_template_profiles, get_template_profile_columns
 from services.readiness_service import analyze_template_readiness
-from services.ozon_api_service import is_configured, sync_category_tree, list_cached_categories, sync_category_attributes, list_cached_attributes, sync_attribute_dictionary_values, sync_all_category_dictionary_values, list_cached_attribute_values, import_cached_attributes_to_pim, suggest_mappings_for_cached_attributes, save_suggested_mappings, analyze_product_ozon_coverage, ensure_ozon_master_attributes, build_product_ozon_payload, materialize_product_ozon_attributes
+from services.ozon_api_service import is_configured, sync_category_tree, list_cached_categories, sync_category_attributes, list_cached_attributes, sync_attribute_dictionary_values, sync_all_category_dictionary_values, list_cached_attribute_values, import_cached_attributes_to_pim, suggest_mappings_for_cached_attributes, save_suggested_mappings, analyze_product_ozon_coverage, ensure_ozon_master_attributes, build_product_ozon_payload, materialize_product_ozon_attributes, preview_product_ozon_dictionary_gaps
 
 st.set_page_config(page_title="PIM", page_icon="📦", layout="wide")
 
@@ -1301,6 +1301,47 @@ def show_ozon_tab():
                             use_container_width=True,
                             hide_index=True,
                         )
+
+                        dict_unmatched_count = int((preview_df["status"] == "dictionary_unmatched").sum())
+                        if dict_unmatched_count > 0:
+                            st.markdown("### Подсказки по dictionary mismatch")
+                            st.caption("Для несопоставленных значений система предлагает ближайшие варианты из кэша справочника Ozon.")
+                            top_n = st.number_input(
+                                "Сколько вариантов показывать на один атрибут",
+                                min_value=1,
+                                max_value=10,
+                                value=3,
+                                step=1,
+                                key=f"ozon_dict_gap_topn_{selected_product_id}",
+                            )
+                            gap_rows = preview_product_ozon_dictionary_gaps(
+                                conn,
+                                product_id=int(selected_product_id),
+                                description_category_id=int(selected_row["description_category_id"]),
+                                type_id=int(selected_row["type_id"]),
+                                top_n=int(top_n),
+                            )
+                            if gap_rows:
+                                gap_df = pd.DataFrame(gap_rows)
+                                st.dataframe(
+                                    gap_df[
+                                        [
+                                            c
+                                            for c in [
+                                                "attribute_id",
+                                                "name",
+                                                "source_name",
+                                                "raw_value",
+                                                "suggestion_values",
+                                            ]
+                                            if c in gap_df.columns
+                                        ]
+                                    ],
+                                    use_container_width=True,
+                                    hide_index=True,
+                                )
+                            else:
+                                st.info("Несматченные dictionary-значения не найдены.")
             else:
                 st.info("По этой категории атрибуты ещё не загружались.")
     else:

@@ -620,6 +620,68 @@ def _best_token_for_search(text: str) -> str:
     return tokens[0]
 
 
+def _find_dictionary_candidates(
+    conn: sqlite3.Connection,
+    description_category_id: int,
+    type_id: int,
+    attribute_id: int,
+    raw_value: Any,
+    top_n: int = 5,
+) -> list[dict[str, Any]]:
+    source_text = _to_scalar_string(raw_value)
+    normalized_source = normalize_text(source_text)
+    if not normalized_source:
+        return []
+
+    token = _best_token_for_search(source_text)
+    params: list[Any] = [int(description_category_id), int(type_id), int(attribute_id)]
+    sql = """
+        SELECT value_id, value
+        FROM ozon_attribute_value_cache
+        WHERE description_category_id = ?
+          AND type_id = ?
+          AND attribute_id = ?
+    """
+    if token:
+        sql += " AND lower(IFNULL(value, '')) LIKE ?"
+        params.append(f"%{token.lower()}%")
+    sql += " LIMIT 1200"
+
+    candidates = conn.execute(sql, params).fetchall()
+    if not candidates:
+        return []
+
+    scored: list[dict[str, Any]] = []
+    for row in candidates:
+        candidate_value = row["value"] or ""
+        normalized_candidate = normalize_text(candidate_value)
+        if not normalized_candidate:
+            continue
+
+        if normalized_candidate == normalized_source:
+            score = 0.99
+            mode = "normalized_exact"
+        elif normalized_candidate in normalized_source or normalized_source in normalized_candidate:
+            ratio = SequenceMatcher(None, normalized_source, normalized_candidate).ratio()
+            score = max(0.90, ratio)
+            mode = "contains"
+        else:
+            score = SequenceMatcher(None, normalized_source, normalized_candidate).ratio()
+            mode = "fuzzy"
+
+        scored.append(
+            {
+                "value_id": int(row["value_id"]),
+                "value": row["value"],
+                "score": round(float(score), 4),
+                "matched_by": mode,
+            }
+        )
+
+    scored.sort(key=lambda item: item["score"], reverse=True)
+    return scored[: max(1, int(top_n))]
+
+
 def _find_best_dictionary_value(
     conn: sqlite3.Connection,
     description_category_id: int,
@@ -652,65 +714,22 @@ def _find_best_dictionary_value(
             "matched_by": "exact",
         }
 
-    normalized_source = normalize_text(source_text)
-    if not normalized_source:
-        return None
-
-    token = _best_token_for_search(source_text)
-    if not token:
-        return None
-
-    candidates = conn.execute(
-        """
-        SELECT value_id, value
-        FROM ozon_attribute_value_cache
-        WHERE description_category_id = ?
-          AND type_id = ?
-          AND attribute_id = ?
-          AND lower(IFNULL(value, '')) LIKE ?
-        LIMIT 800
-        """,
-        (int(description_category_id), int(type_id), int(attribute_id), f"%{token.lower()}%"),
-    ).fetchall()
+    candidates = _find_dictionary_candidates(
+        conn=conn,
+        description_category_id=int(description_category_id),
+        type_id=int(type_id),
+        attribute_id=int(attribute_id),
+        raw_value=source_text,
+        top_n=1,
+    )
     if not candidates:
         return None
 
-    best_score = 0.0
-    best_value_id = None
-    best_value = None
-    best_mode = None
-    for row in candidates:
-        candidate_value = row["value"] or ""
-        normalized_candidate = normalize_text(candidate_value)
-        if not normalized_candidate:
-            continue
-
-        if normalized_candidate == normalized_source:
-            score = 0.99
-            mode = "normalized_exact"
-        elif normalized_candidate in normalized_source or normalized_source in normalized_candidate:
-            ratio = SequenceMatcher(None, normalized_source, normalized_candidate).ratio()
-            score = max(0.90, ratio)
-            mode = "contains"
-        else:
-            score = SequenceMatcher(None, normalized_source, normalized_candidate).ratio()
-            mode = "fuzzy"
-
-        if score > best_score:
-            best_score = score
-            best_value_id = int(row["value_id"])
-            best_value = row["value"]
-            best_mode = mode
-
-    if best_value_id is None or best_score < float(min_score):
+    best = candidates[0]
+    if float(best.get("score") or 0) < float(min_score):
         return None
 
-    return {
-        "value_id": best_value_id,
-        "value": best_value,
-        "score": round(float(best_score), 4),
-        "matched_by": best_mode,
-    }
+    return best
 
 
 
@@ -992,3 +1011,44 @@ def materialize_product_ozon_attributes(
         "category_code": category_code,
         "rows": payload_rows,
     }
+
+
+def preview_product_ozon_dictionary_gaps(
+    conn: sqlite3.Connection,
+    product_id: int,
+    description_category_id: int,
+    type_id: int,
+    top_n: int = 3,
+) -> list[dict[str, Any]]:
+    payload_rows = build_product_ozon_payload(
+        conn=conn,
+        product_id=int(product_id),
+        description_category_id=int(description_category_id),
+        type_id=int(type_id),
+        required_only=False,
+    )
+    gaps: list[dict[str, Any]] = []
+    for row in payload_rows:
+        if row.get("status") != "dictionary_unmatched":
+            continue
+        suggestions = _find_dictionary_candidates(
+            conn=conn,
+            description_category_id=int(description_category_id),
+            type_id=int(type_id),
+            attribute_id=int(row.get("attribute_id")),
+            raw_value=row.get("value"),
+            top_n=int(top_n),
+        )
+        gaps.append(
+            {
+                "attribute_id": row.get("attribute_id"),
+                "name": row.get("name"),
+                "source_name": row.get("source_name"),
+                "raw_value": row.get("value"),
+                "suggestions": suggestions,
+                "suggestion_values": " | ".join(
+                    [f"{item.get('value')} (id={item.get('value_id')}, s={item.get('score')})" for item in suggestions]
+                ),
+            }
+        )
+    return gaps
