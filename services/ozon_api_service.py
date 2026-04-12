@@ -1419,22 +1419,124 @@ def submit_ozon_attributes_update(
     )
     request_payload = build_ozon_attributes_update_request(bulk_payload)
     if not request_payload.get("items"):
+        conn.execute(
+            """
+            INSERT INTO ozon_update_jobs (
+                description_category_id,
+                type_id,
+                offer_id_field,
+                items_count,
+                request_json,
+                response_json,
+                status,
+                error_message,
+                created_at,
+                updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            """,
+            (
+                int(description_category_id),
+                int(type_id),
+                str(offer_id_field or "article"),
+                0,
+                json.dumps(request_payload, ensure_ascii=False),
+                None,
+                "skipped",
+                "Нет готовых items для отправки в Ozon",
+            ),
+        )
+        conn.commit()
         return {
             "ok": False,
             "message": "Нет готовых items для отправки в Ozon",
             "request": request_payload,
             "bulk_summary": bulk_payload.get("summary", {}),
         }
+    try:
+        response = _post(
+            "/v1/product/attributes/update",
+            request_payload,
+            client_id=client_id,
+            api_key=api_key,
+        )
+        conn.execute(
+            """
+            INSERT INTO ozon_update_jobs (
+                description_category_id,
+                type_id,
+                offer_id_field,
+                items_count,
+                request_json,
+                response_json,
+                status,
+                error_message,
+                created_at,
+                updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            """,
+            (
+                int(description_category_id),
+                int(type_id),
+                str(offer_id_field or "article"),
+                int(request_payload.get("summary", {}).get("items_total") or 0),
+                json.dumps(request_payload, ensure_ascii=False),
+                json.dumps(response, ensure_ascii=False),
+                "success",
+                None,
+            ),
+        )
+        conn.commit()
+        return {
+            "ok": True,
+            "request": request_payload,
+            "response": response,
+            "bulk_summary": bulk_payload.get("summary", {}),
+        }
+    except Exception as e:
+        conn.execute(
+            """
+            INSERT INTO ozon_update_jobs (
+                description_category_id,
+                type_id,
+                offer_id_field,
+                items_count,
+                request_json,
+                response_json,
+                status,
+                error_message,
+                created_at,
+                updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            """,
+            (
+                int(description_category_id),
+                int(type_id),
+                str(offer_id_field or "article"),
+                int(request_payload.get("summary", {}).get("items_total") or 0),
+                json.dumps(request_payload, ensure_ascii=False),
+                None,
+                "error",
+                str(e)[:1000],
+            ),
+        )
+        conn.commit()
+        raise
 
-    response = _post(
-        "/v1/product/attributes/update",
-        request_payload,
-        client_id=client_id,
-        api_key=api_key,
-    )
-    return {
-        "ok": True,
-        "request": request_payload,
-        "response": response,
-        "bulk_summary": bulk_payload.get("summary", {}),
-    }
+
+def list_ozon_update_jobs(
+    conn: sqlite3.Connection,
+    limit: int = 100,
+) -> list[dict[str, Any]]:
+    rows = conn.execute(
+        """
+        SELECT *
+        FROM ozon_update_jobs
+        ORDER BY id DESC
+        LIMIT ?
+        """,
+        (int(limit),),
+    ).fetchall()
+    return [dict(r) for r in rows]

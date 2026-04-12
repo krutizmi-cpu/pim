@@ -27,7 +27,7 @@ from services.supplier_parser import fetch_supplier_page, extract_supplier_data,
 from services.template_matching import auto_match_template_columns, apply_saved_mapping_rules, fill_template_dataframe, apply_client_validated_values, fill_template_workbook_bytes, dataframe_to_excel_bytes, detect_template_data_start_row
 from services.template_profiles import save_template_profile, list_template_profiles, get_template_profile_columns
 from services.readiness_service import analyze_template_readiness
-from services.ozon_api_service import is_configured, sync_category_tree, list_cached_categories, sync_category_attributes, list_cached_attributes, sync_attribute_dictionary_values, sync_all_category_dictionary_values, list_cached_attribute_values, import_cached_attributes_to_pim, suggest_mappings_for_cached_attributes, save_suggested_mappings, analyze_product_ozon_coverage, ensure_ozon_master_attributes, build_product_ozon_payload, materialize_product_ozon_attributes, preview_product_ozon_dictionary_gaps, build_product_ozon_api_attributes, build_bulk_ozon_api_payloads, build_ozon_attributes_update_request, submit_ozon_attributes_update, save_dictionary_override, list_dictionary_overrides, delete_dictionary_override
+from services.ozon_api_service import is_configured, sync_category_tree, list_cached_categories, sync_category_attributes, list_cached_attributes, sync_attribute_dictionary_values, sync_all_category_dictionary_values, list_cached_attribute_values, import_cached_attributes_to_pim, suggest_mappings_for_cached_attributes, save_suggested_mappings, analyze_product_ozon_coverage, ensure_ozon_master_attributes, build_product_ozon_payload, materialize_product_ozon_attributes, preview_product_ozon_dictionary_gaps, build_product_ozon_api_attributes, build_bulk_ozon_api_payloads, build_ozon_attributes_update_request, submit_ozon_attributes_update, list_ozon_update_jobs, save_dictionary_override, list_dictionary_overrides, delete_dictionary_override
 
 st.set_page_config(page_title="PIM", page_icon="📦", layout="wide")
 OZON_OFFER_ID_OPTIONS = ["article", "internal_article", "supplier_article"]
@@ -1626,6 +1626,41 @@ def show_ozon_tab():
                                 )
                                 st.success(f"Удалено overrides: {int(result.get('deleted') or 0)}")
                                 st.rerun()
+
+                        st.markdown("### Журнал отправок в Ozon")
+                        jobs_limit = st.number_input(
+                            "Сколько последних отправок показывать",
+                            min_value=10,
+                            max_value=500,
+                            value=50,
+                            step=10,
+                            key=f"ozon_jobs_limit_{selected_product_id}",
+                        )
+                        jobs = list_ozon_update_jobs(conn, limit=int(jobs_limit))
+                        if jobs:
+                            jobs_df = pd.DataFrame(jobs)
+                            st.dataframe(
+                                jobs_df[
+                                    [
+                                        c
+                                        for c in [
+                                            "id",
+                                            "status",
+                                            "items_count",
+                                            "description_category_id",
+                                            "type_id",
+                                            "offer_id_field",
+                                            "error_message",
+                                            "created_at",
+                                        ]
+                                        if c in jobs_df.columns
+                                    ]
+                                ],
+                                use_container_width=True,
+                                hide_index=True,
+                            )
+                        else:
+                            st.info("Отправок в Ozon пока не было.")
             else:
                 st.info("По этой категории атрибуты ещё не загружались.")
     else:
