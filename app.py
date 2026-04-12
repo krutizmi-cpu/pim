@@ -204,6 +204,16 @@ def export_current_df(df: pd.DataFrame):
     return output.getvalue()
 
 
+def dataframes_to_excel_bytes(sheets: dict[str, pd.DataFrame]) -> bytes:
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        for sheet_name, df in sheets.items():
+            safe_name = str(sheet_name)[:31] if sheet_name else "sheet"
+            frame = df if df is not None else pd.DataFrame()
+            frame.to_excel(writer, index=False, sheet_name=safe_name)
+    return output.getvalue()
+
+
 def build_ozon_product_list_template_excel() -> bytes:
     df = pd.DataFrame(
         {
@@ -1735,6 +1745,7 @@ def show_ozon_tab():
                                 dictionary_min_score=float(dictionary_min_score),
                                 offer_id_field=str(offer_id_field),
                             )
+                            bulk_result_df = pd.DataFrame()
                             st.download_button(
                                 "Скачать bulk Ozon JSON по выбранным товарам",
                                 data=json.dumps(bulk_payload, ensure_ascii=False, indent=2).encode("utf-8"),
@@ -1772,6 +1783,44 @@ def show_ozon_tab():
                                 file_name=f"ozon_attributes_update_request_{int(selected_row['description_category_id'])}_{int(selected_row['type_id'])}.json",
                                 mime="application/json",
                                 key=f"ozon_update_request_export_{selected_product_id}",
+                            )
+                            update_items = update_request.get("items") or []
+                            update_items_df = pd.DataFrame(
+                                [
+                                    {
+                                        "offer_id": item.get("offer_id"),
+                                        "description_category_id": item.get("description_category_id"),
+                                        "type_id": item.get("type_id"),
+                                        "attributes_count": len(item.get("attributes") or []),
+                                    }
+                                    for item in update_items
+                                ]
+                            )
+                            update_summary_df = pd.DataFrame(
+                                [
+                                    {
+                                        "products_total": int((bulk_payload.get("summary") or {}).get("products_total") or 0),
+                                        "attributes_included": int((bulk_payload.get("summary") or {}).get("attributes_included") or 0),
+                                        "attributes_skipped": int((bulk_payload.get("summary") or {}).get("attributes_skipped") or 0),
+                                        "missing_offer_id": int((bulk_payload.get("summary") or {}).get("missing_offer_id") or 0),
+                                        "request_items": int((update_request.get("summary") or {}).get("items_total") or 0),
+                                        "request_skipped_missing_offer": int((update_request.get("summary") or {}).get("skipped_missing_offer") or 0),
+                                        "request_skipped_empty_attrs": int((update_request.get("summary") or {}).get("skipped_empty_attrs") or 0),
+                                    }
+                                ]
+                            )
+                            st.download_button(
+                                "Скачать Ozon bulk пакет (Excel)",
+                                data=dataframes_to_excel_bytes(
+                                    {
+                                        "bulk_result": bulk_result_df,
+                                        "update_items": update_items_df,
+                                        "update_summary": update_summary_df,
+                                    }
+                                ),
+                                file_name=f"ozon_bulk_package_{int(selected_row['description_category_id'])}_{int(selected_row['type_id'])}.xlsx",
+                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                key=f"ozon_bulk_package_export_{selected_product_id}",
                             )
                             if st.button(
                                 "Отправить batch в Ozon (/v1/product/attributes/update)",
