@@ -420,10 +420,15 @@ def enrich_product_from_supplier(conn, product_id: int, force: bool = False) -> 
             updates[field] = new_value
 
         attributes_saved = 0
+        skipped_attribute_fields = []
         for attr_name, attr_value in (parsed.get("attributes") or {}).items():
             clean_code = str(attr_name).strip().lower()
             clean_code = "_".join("".join(ch if ch.isalnum() else " " for ch in clean_code).split())
             if not clean_code:
+                continue
+            attr_field_name = f"attr:{clean_code}"
+            if not can_overwrite_field(conn, product_id, attr_field_name, "supplier_page", force=force):
+                skipped_attribute_fields.append(clean_code)
                 continue
             existing_def = conn.execute(
                 "SELECT code FROM attribute_definitions WHERE code = ?",
@@ -442,7 +447,7 @@ def enrich_product_from_supplier(conn, product_id: int, force: bool = False) -> 
             save_field_source(
                 conn=conn,
                 product_id=product_id,
-                field_name=f"attr:{clean_code}",
+                field_name=attr_field_name,
                 source_type="supplier_page",
                 source_value_raw=attr_value,
                 source_url=supplier_url,
@@ -490,13 +495,15 @@ def enrich_product_from_supplier(conn, product_id: int, force: bool = False) -> 
 
         conn.commit()
         skipped_msg = f", пропущено ручных полей: {len(skipped_manual_fields)}" if skipped_manual_fields else ""
+        skipped_attr_msg = f", пропущено атрибутов по приоритету: {len(skipped_attribute_fields)}" if skipped_attribute_fields else ""
         return {
             "ok": True,
-            "message": f"Обогащение завершено, обновлено полей: {len(updates)}, атрибутов сохранено: {attributes_saved}{skipped_msg}",
+            "message": f"Обогащение завершено, обновлено полей: {len(updates)}, атрибутов сохранено: {attributes_saved}{skipped_msg}{skipped_attr_msg}",
             "updates": updates,
             "attributes": parsed.get("attributes", {}),
             "image_urls": parsed.get("image_urls", []),
             "skipped_manual_fields": skipped_manual_fields,
+            "skipped_attribute_fields": skipped_attribute_fields,
         }
     except Exception as e:
         conn.execute(

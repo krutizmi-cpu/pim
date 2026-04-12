@@ -207,11 +207,15 @@ def apply_client_validated_values(conn, product_ids: list[int], matches: list[di
                 )
                 applied += 1
             elif source_type == "attribute":
+                attr_field_name = f"attr:{field_name}"
+                if not can_overwrite_field(conn, product_id, attr_field_name, "client_validated", force=False):
+                    skipped += 1
+                    continue
                 set_product_attribute_value(conn, int(product_id), field_name, value, channel_code=channel_code)
                 save_field_source(
                     conn=conn,
                     product_id=product_id,
-                    field_name=f"attr:{field_name}",
+                    field_name=attr_field_name,
                     source_type="client_validated",
                     source_value_raw=value,
                     source_url=channel_code,
