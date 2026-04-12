@@ -214,6 +214,75 @@ def dataframes_to_excel_bytes(sheets: dict[str, pd.DataFrame]) -> bytes:
     return output.getvalue()
 
 
+def build_supplier_catalog_template_excel() -> bytes:
+    df = pd.DataFrame(
+        {
+            "Артикул": ["SUP-001", "SUP-002"],
+            "Артикул поставщика": ["RB_0001", "RB_0002"],
+            "Номенклатура": ["Велофара Rockbros", "Насос SKS"],
+            "Штрихкод": ["4600000000011", "4600000000012"],
+            "Категория": ["Вело", "Вело"],
+            "Поставщик": ["Rockbros", "SKS"],
+            "Ссылка на товар": ["https://example.com/item1", "https://example.com/item2"],
+            "Вес": [0.35, 0.42],
+            "Длина": [15, 21],
+            "Ширина": [9, 6],
+            "Высота": [5, 4],
+            "Длина упаковки": [17, 23],
+            "Ширина упаковки": [10, 7],
+            "Высота упаковки": [6, 5],
+            "Вес брутто": [0.41, 0.48],
+            "Фото": ["https://example.com/img1.jpg", "https://example.com/img2.jpg"],
+            "Описание": ["Яркая велофара", "Легкий насос"],
+        }
+    )
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="Каталог")
+    return output.getvalue()
+
+
+def inspect_excel_sheets(file_bytes: bytes) -> dict:
+    try:
+        xls = pd.ExcelFile(BytesIO(file_bytes))
+    except Exception as e:
+        return {"ok": False, "message": str(e)}
+
+    sheets = xls.sheet_names
+    header_keywords = {
+        "артикул",
+        "номенклатура",
+        "наименование",
+        "название",
+        "категория",
+        "бренд",
+        "штрихкод",
+        "код",
+        "поставщик",
+        "ссылка",
+    }
+    preview_rows = []
+    for sheet in sheets[:10]:
+        try:
+            probe = pd.read_excel(BytesIO(file_bytes), sheet_name=sheet, header=None, nrows=12)
+            row_scores = []
+            for i in range(len(probe)):
+                values = [str(v).strip() for v in probe.iloc[i].tolist() if str(v).strip() and str(v).strip().lower() != "nan"]
+                lower_values = [v.lower() for v in values]
+                keyword_hits = sum(1 for v in lower_values if v in header_keywords)
+                text_like = sum(1 for v in values if any(ch.isalpha() for ch in v))
+                score = len(values) + keyword_hits * 3 + text_like
+                row_scores.append({"row": i + 1, "non_empty": len(values), "keywords": keyword_hits, "sample": ", ".join(values[:6]), "score": score})
+            recommended = 1
+            if row_scores:
+                best = max(row_scores, key=lambda r: r["score"])
+                recommended = int(best["row"])
+            preview_rows.append({"sheet": sheet, "rows": row_scores, "recommended_header_row": recommended})
+        except Exception:
+            preview_rows.append({"sheet": sheet, "rows": [], "recommended_header_row": 1})
+    return {"ok": True, "sheets": sheets, "preview": preview_rows}
+
+
 def build_ozon_product_list_template_excel() -> bytes:
     df = pd.DataFrame(
         {
@@ -521,16 +590,84 @@ def render_template_readiness(filled_df: pd.DataFrame, manual_rows: list[dict]) 
 def show_import_tab():
     st.subheader("Импорт каталога")
     st.caption("Загрузи Excel поставщика или общий каталог, система создаст или обновит мастер-товары и покажет последнюю партию отдельно.")
+    st.download_button(
+        "Скачать шаблон импорта поставщика (Excel)",
+        data=build_supplier_catalog_template_excel(),
+        file_name="supplier_catalog_import_template.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        key="supplier_import_template",
+    )
     uploaded = st.file_uploader("Excel файл", type=["xlsx", "xls"])
 
     if uploaded is not None:
+        uploaded_bytes = uploaded.getvalue() if hasattr(uploaded, "getvalue") else uploaded.read()
+        if not uploaded_bytes:
+            st.error("Файл прочитан пустым. Перезагрузи файл и повтори импорт.")
+            return
         temp_path = Path("data/_import_temp.xlsx")
         temp_path.parent.mkdir(parents=True, exist_ok=True)
-        temp_path.write_bytes(uploaded.read())
+        temp_path.write_bytes(uploaded_bytes)
+
+        excel_info = inspect_excel_sheets(uploaded_bytes)
+        import_mode = st.radio(
+            "Режим определения структуры Excel",
+            options=["Автоопределение", "Ручной выбор листа и строки заголовка"],
+            horizontal=True,
+            key="import_mode",
+        )
+
+        selected_sheet = None
+        selected_header_row_zero = None
+        if excel_info.get("ok"):
+            sheets = excel_info.get("sheets") or []
+            preview = excel_info.get("preview") or []
+            recommended_by_sheet = {item.get("sheet"): int(item.get("recommended_header_row") or 1) for item in preview}
+            if sheets:
+                preview_df_rows = []
+                for item in preview:
+                    rows = item.get("rows") or []
+                    recommended = int(item.get("recommended_header_row") or 1)
+                    row_obj = next((r for r in rows if int(r.get("row", 0)) == recommended), {})
+                    preview_df_rows.append(
+                        {
+                            "Лист": item.get("sheet"),
+                            "Строки-превью": len(rows),
+                            "Рекоменд. строка заголовка": recommended,
+                            "Sample рекоменд. строки": row_obj.get("sample", ""),
+                        }
+                    )
+                if preview_df_rows:
+                    st.dataframe(pd.DataFrame(preview_df_rows), use_container_width=True, hide_index=True)
+
+            if import_mode == "Ручной выбор листа и строки заголовка" and sheets:
+                c1, c2 = st.columns(2)
+                with c1:
+                    selected_sheet = st.selectbox("Лист для импорта", options=sheets, index=0, key="manual_import_sheet")
+                with c2:
+                    default_header_row = int(recommended_by_sheet.get(selected_sheet, 2))
+                    header_row_human = st.number_input(
+                        "Строка заголовка (1 = первая строка)",
+                        min_value=1,
+                        max_value=50,
+                        value=default_header_row,
+                        step=1,
+                        key=f"manual_import_header_row_{selected_sheet}",
+                    )
+                    selected_header_row_zero = int(header_row_human) - 1
+        else:
+            st.warning(f"Не удалось прочитать структуру Excel: {excel_info.get('message')}")
 
         if st.button("Импортировать", type="primary"):
             conn = get_db()
-            result = import_catalog_from_excel(conn, temp_path)
+            if import_mode == "Ручной выбор листа и строки заголовка":
+                result = import_catalog_from_excel(
+                    conn,
+                    temp_path,
+                    sheet_name=selected_sheet,
+                    header_row=selected_header_row_zero,
+                )
+            else:
+                result = import_catalog_from_excel(conn, temp_path)
             batch_df = load_products(conn, limit=1000, import_batch_id=result.batch_id)
             conn.close()
             st.session_state["last_import_batch_id"] = result.batch_id
@@ -547,7 +684,7 @@ def show_import_tab():
             if not batch_df.empty:
                 st.dataframe(batch_df, use_container_width=True, hide_index=True)
             else:
-                st.info("В текущей партии нет отображаемых записей")
+                st.info("В текущей партии нет отображаемых записей. Попробуй ручной выбор листа и строки заголовка.")
 
             if result.duplicates:
                 st.dataframe(pd.DataFrame(result.duplicates), use_container_width=True)

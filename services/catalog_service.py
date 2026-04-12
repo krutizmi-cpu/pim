@@ -199,9 +199,19 @@ def _detect_best_sheet_and_header(excel_path: Path, max_scan_rows: int = 12) -> 
     return best_sheet, int(best_header)
 
 
-def _read_excel_smart(excel_path: Path) -> pd.DataFrame:
-    sheet_name, header_row = _detect_best_sheet_and_header(excel_path)
-    df = pd.read_excel(excel_path, sheet_name=sheet_name, header=header_row)
+def _read_excel_smart(
+    excel_path: Path,
+    sheet_name: str | None = None,
+    header_row: int | None = None,
+) -> pd.DataFrame:
+    if sheet_name is not None or header_row is not None:
+        xls = pd.ExcelFile(excel_path)
+        selected_sheet = sheet_name if sheet_name in xls.sheet_names else xls.sheet_names[0]
+        selected_header = max(0, int(header_row)) if header_row is not None else 0
+        df = pd.read_excel(excel_path, sheet_name=selected_sheet, header=selected_header)
+    else:
+        selected_sheet, selected_header = _detect_best_sheet_and_header(excel_path)
+        df = pd.read_excel(excel_path, sheet_name=selected_sheet, header=selected_header)
     # Drop fully empty columns and rows early.
     df = df.dropna(axis=1, how="all").dropna(axis=0, how="all")
     return df
@@ -340,9 +350,14 @@ def _apply_enrichment(
     return product_data
 
 
-def import_catalog_from_excel(conn: sqlite3.Connection, excel_path: Path) -> ImportResult:
+def import_catalog_from_excel(
+    conn: sqlite3.Connection,
+    excel_path: Path,
+    sheet_name: str | None = None,
+    header_row: int | None = None,
+) -> ImportResult:
     init_db(conn)
-    df = _read_excel_smart(excel_path)
+    df = _read_excel_smart(excel_path, sheet_name=sheet_name, header_row=header_row)
     normalized = normalize_columns(df)
 
     created = 0
