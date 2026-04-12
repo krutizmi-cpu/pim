@@ -4,6 +4,7 @@ from io import BytesIO
 from pathlib import Path
 
 import pandas as pd
+from openpyxl import load_workbook
 
 from services.attribute_service import list_attribute_definitions, list_channel_mapping_rules, set_product_attribute_value
 from services.source_priority import can_overwrite_field
@@ -232,4 +233,103 @@ def dataframe_to_excel_bytes(df: pd.DataFrame, sheet_name: str = "template") -> 
     output = BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         df.to_excel(writer, index=False, sheet_name=sheet_name)
+    return output.getvalue()
+
+
+def detect_template_data_start_row(template_bytes: bytes, sheet_name: str | None = None) -> int:
+    workbook = load_workbook(BytesIO(template_bytes), read_only=True, data_only=False)
+    try:
+        ws = workbook[sheet_name] if sheet_name and sheet_name in workbook.sheetnames else workbook.active
+        max_scan_rows = min(int(ws.max_row or 1), 120)
+        header_tokens = {
+            "артикул", "article", "sku", "name", "название", "наименование",
+            "barcode", "штрихкод", "бренд", "brand", "описание", "description",
+        }
+
+        candidate_header_row = None
+        best_score = -1
+        for row_idx in range(1, max_scan_rows + 1):
+            values = []
+            for cell in ws[row_idx]:
+                val = cell.value
+                if val is None:
+                    continue
+                text = str(val).strip().lower()
+                if text:
+                    values.append(text)
+            if not values:
+                continue
+
+            score = 0
+            for v in values:
+                if any(token in v for token in header_tokens):
+                    score += 2
+                if len(v) < 50:
+                    score += 1
+
+            if score > best_score and len(values) >= 2:
+                best_score = score
+                candidate_header_row = row_idx
+
+        if candidate_header_row is None:
+            return 2
+
+        return int(candidate_header_row + 1)
+    finally:
+        workbook.close()
+
+
+def fill_template_workbook_bytes(
+    conn,
+    template_bytes: bytes,
+    product_ids: list[int],
+    matches: list[dict],
+    sheet_name: str | None = None,
+    data_start_row: int | None = None,
+) -> bytes:
+    workbook = load_workbook(BytesIO(template_bytes))
+    ws = workbook[sheet_name] if sheet_name and sheet_name in workbook.sheetnames else workbook.active
+
+    start_row = int(data_start_row or detect_template_data_start_row(template_bytes, sheet_name=ws.title))
+    if start_row < 2:
+        start_row = 2
+    header_row = start_row - 1
+
+    column_map: dict[str, int] = {}
+    for col_idx in range(1, int(ws.max_column or 1) + 1):
+        cell_value = ws.cell(row=header_row, column=col_idx).value
+        if cell_value is None:
+            continue
+        key = str(cell_value).strip()
+        if key and key not in column_map:
+            column_map[key] = col_idx
+
+    if not column_map:
+        output = BytesIO()
+        workbook.save(output)
+        return output.getvalue()
+
+    # Clear previous values in the data area for mapped columns.
+    for row_idx in range(start_row, int(ws.max_row or start_row) + 1):
+        for match in matches:
+            template_column = match.get("template_column")
+            if not template_column or template_column not in column_map:
+                continue
+            ws.cell(row=row_idx, column=column_map[template_column]).value = None
+
+    for row_offset, product_id in enumerate(product_ids):
+        target_row = start_row + row_offset
+        value_map = build_product_value_map(conn, int(product_id))
+        for match in matches:
+            if match.get("status") != "matched":
+                continue
+            template_column = match.get("template_column")
+            source_name = match.get("source_name")
+            if not template_column or template_column not in column_map or not source_name:
+                continue
+            value = apply_transform(value_map.get(source_name), match.get("transform_rule"))
+            ws.cell(row=target_row, column=column_map[template_column]).value = value
+
+    output = BytesIO()
+    workbook.save(output)
     return output.getvalue()
