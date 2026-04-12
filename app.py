@@ -1553,6 +1553,29 @@ def show_ozon_tab():
                                 mime="application/json",
                                 key=f"ozon_bulk_payload_export_{selected_product_id}",
                             )
+                            bulk_products = bulk_payload.get("products") or []
+                            if bulk_products:
+                                bulk_result_df = pd.DataFrame(
+                                    [
+                                        {
+                                            "product_id": int(item.get("product_id") or 0),
+                                            "offer_id": item.get("offer_id"),
+                                            "offer_id_field": item.get("offer_id_field"),
+                                            "included_attributes": int(item.get("included") or 0),
+                                            "skipped_attributes": int(item.get("skipped") or 0),
+                                            "description_category_id": int(item.get("description_category_id") or 0),
+                                            "type_id": int(item.get("type_id") or 0),
+                                        }
+                                        for item in bulk_products
+                                    ]
+                                )
+                                st.download_button(
+                                    "Скачать результат bulk обработки (Excel)",
+                                    data=dataframe_to_excel_bytes(bulk_result_df, sheet_name="ozon_bulk_result"),
+                                    file_name=f"ozon_bulk_result_{int(selected_row['description_category_id'])}_{int(selected_row['type_id'])}.xlsx",
+                                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                    key=f"ozon_bulk_result_export_{selected_product_id}",
+                                )
                             update_request = build_ozon_attributes_update_request(bulk_payload)
                             st.download_button(
                                 "Скачать request JSON для /v1/product/attributes/update",
