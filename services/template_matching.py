@@ -13,10 +13,11 @@ from services.transforms import apply_transform
 
 
 BASE_PRODUCT_FIELD_ALIASES = {
-    "supplier_article": ["идентификатор номенклатуры поставщика", "внутренний код поставщика", "артикул поставщика", "supplier article"],
-    "article": ["артикул", "sku", "vendor code", "код товара"],
-    "name": ["название", "наименование", "товар", "name", "title"],
-    "barcode": ["штрихкод", "ean", "barcode"],
+    "supplier_article": ["идентификатор номенклатуры поставщика", "внутренний код поставщика", "артикул поставщика", "supplier article", "vendor code", "vendor_code"],
+    "article": ["артикул", "sku", "код товара", "article"],
+    "internal_article": ["id sap", "id_sap", "внутренний код", "internal article"],
+    "name": ["название", "наименование", "товар", "name", "title", "name on site", "name_on_site"],
+    "barcode": ["штрихкод", "ean", "barcode", "bar code", "bar_code"],
     "brand": ["бренд", "brand", "марка"],
     "description": ["описание", "description"],
     "uom": ["единица измерения", "ед. изм", "uom"],
@@ -25,10 +26,11 @@ BASE_PRODUCT_FIELD_ALIASES = {
     "width": ["ширина", "width"],
     "height": ["высота", "height"],
     "package_length": ["длина упаковки", "упаковка длина", "глубина упаковки"],
-    "package_width": ["ширина упаковки", "упаковка ширина"],
-    "package_height": ["высота упаковки", "упаковка высота"],
-    "gross_weight": ["вес брутто", "вес в упаковке", "gross weight"],
-    "image_url": ["фото", "изображение", "image", "main image"],
+    "package_width": ["ширина упаковки", "упаковка ширина", "packing width", "packing_width"],
+    "package_height": ["высота упаковки", "упаковка высота", "packing height", "packing_height"],
+    "gross_weight": ["вес брутто", "вес в упаковке", "gross weight", "package weight", "package_weight"],
+    "image_url": ["фото", "изображение", "image", "main image", "image links", "image_links"],
+    "tnved_code": ["tnved", "тнвэд", "тн вэд", "код тнвэд"],
 }
 
 SPECIAL_TEMPLATE_MATCHERS = [
@@ -49,6 +51,23 @@ SPECIAL_TEMPLATE_MATCHERS = [
     (("фото №3", "фото no3", "фото n3"), "column", "media_gallery", "online_trade_standard", "image_3"),
     (("фото №4", "фото no4", "фото n4"), "column", "media_gallery", "online_trade_standard", "image_4"),
     (("фото №5", "фото no5", "фото n5"), "column", "media_gallery", "online_trade_standard", "image_5"),
+    # Detmir category template (bike sample)
+    (("exact:id_sap", "exact:id sap"), "column", "internal_article", "detmir_standard", None),
+    (("exact:title",), "column", "name", "detmir_standard", None),
+    (("exact:bar_code", "exact:bar code"), "column", "barcode", "detmir_standard", None),
+    (("exact:name_on_site", "exact:name on site"), "column", "name", "detmir_standard", None),
+    (("exact:vendor_code", "exact:vendor code"), "column", "supplier_article", "detmir_standard", None),
+    (("exact:packing_height",), "column", "package_height", "detmir_standard", None),
+    (("exact:packing_width",), "column", "package_width", "detmir_standard", None),
+    (("exact:package_length",), "column", "package_length", "detmir_standard", None),
+    (("exact:package_weight",), "column", "gross_weight", "detmir_standard", None),
+    (("exact:ves",), "column", "weight", "detmir_standard", None),
+    (("exact:dlina",), "column", "length", "detmir_standard", None),
+    (("exact:shirina",), "column", "width", "detmir_standard", None),
+    (("exact:vysota",), "column", "height", "detmir_standard", None),
+    (("exact:description",), "column", "description", "detmir_standard", None),
+    (("exact:tnved",), "column", "tnved_code", "detmir_standard", None),
+    (("exact:image_links", "exact:image links"), "column", "media_gallery", "detmir_standard", "join_images"),
 ]
 
 
@@ -81,7 +100,12 @@ def auto_match_template_columns(conn, columns: list[str]) -> list[dict]:
         norm = normalize_key(col)
         special = None
         for needles, source_type, source_name, matched_by, transform_rule in SPECIAL_TEMPLATE_MATCHERS:
-            if any(normalize_key(n) in norm for n in needles):
+            def _needle_match(needle_raw: str) -> bool:
+                needle_raw = str(needle_raw or "")
+                if needle_raw.startswith("exact:"):
+                    return normalize_key(needle_raw.split(":", 1)[1]) == norm
+                return normalize_key(needle_raw) in norm
+            if any(_needle_match(n) for n in needles):
                 special = (source_type, source_name, matched_by, transform_rule)
                 break
 
@@ -328,8 +352,37 @@ def detect_template_data_start_row(template_bytes: bytes, sheet_name: str | None
 
         if candidate_header_row is None:
             return 2
-
-        return int(candidate_header_row + 1)
+        data_start = int(candidate_header_row + 1)
+        # Skip instruction rows often used in client templates (Detmir/others).
+        instruction_markers = (
+            "введите",
+            "выберите",
+            "формат",
+            "минимальное кол-во",
+            "максимальное кол-во",
+            "можно выбрать",
+            "присваивается автоматически",
+            "выпадающий список",
+        )
+        for row_idx in range(data_start, min(data_start + 8, int(ws.max_row or data_start)) + 1):
+            values = []
+            for cell in ws[row_idx]:
+                if cell.value is None:
+                    continue
+                text = str(cell.value).strip().lower()
+                if text:
+                    values.append(text)
+            if not values:
+                continue
+            if any(any(marker in val for marker in instruction_markers) for val in values):
+                data_start = row_idx + 1
+                continue
+            # If row mostly zero placeholders, it's likely first data row.
+            non_zero = [v for v in values if v not in {"0", "0.0"}]
+            if len(non_zero) <= 2:
+                break
+            break
+        return int(max(2, data_start))
     finally:
         workbook.close()
 
