@@ -30,6 +30,7 @@ from services.readiness_service import analyze_template_readiness
 from services.ozon_api_service import is_configured, sync_category_tree, list_cached_categories, sync_category_attributes, list_cached_attributes, sync_attribute_dictionary_values, sync_all_category_dictionary_values, list_cached_attribute_values, import_cached_attributes_to_pim, suggest_mappings_for_cached_attributes, save_suggested_mappings, analyze_product_ozon_coverage, ensure_ozon_master_attributes, build_product_ozon_payload, materialize_product_ozon_attributes, preview_product_ozon_dictionary_gaps, build_product_ozon_api_attributes, build_bulk_ozon_api_payloads, save_dictionary_override, list_dictionary_overrides, delete_dictionary_override
 
 st.set_page_config(page_title="PIM", page_icon="📦", layout="wide")
+OZON_OFFER_ID_OPTIONS = ["article", "internal_article", "supplier_article"]
 
 
 def get_db():
@@ -1224,7 +1225,9 @@ def show_ozon_tab():
                     else:
                         st.caption("Значения этого справочника ещё не загружены в кэш.")
 
-                product_rows = conn.execute("SELECT id, name, article FROM products ORDER BY id DESC LIMIT 500").fetchall()
+                product_rows = conn.execute(
+                    "SELECT id, name, article, internal_article, supplier_article FROM products ORDER BY id DESC LIMIT 500"
+                ).fetchall()
                 if product_rows:
                     product_options = [int(r["id"]) for r in product_rows]
                     selected_product_id = st.selectbox(
@@ -1252,6 +1255,12 @@ def show_ozon_tab():
                         "Работать только с обязательными Ozon-атрибутами (required)",
                         value=False,
                         key=f"ozon_required_only_{selected_product_id}",
+                    )
+                    offer_id_field = st.selectbox(
+                        "Поле товара для Ozon offer_id",
+                        options=OZON_OFFER_ID_OPTIONS,
+                        index=0,
+                        key=f"ozon_offer_id_field_{selected_product_id}",
                     )
                     preview_rows = build_product_ozon_payload(
                         conn,
@@ -1329,6 +1338,7 @@ def show_ozon_tab():
                                         report_rows.append(
                                             {
                                                 "product_id": int(pid),
+                                                "offer_id": (product_row[offer_id_field] if product_row else None),
                                                 "article": product_row["article"] if product_row else None,
                                                 "name": product_row["name"] if product_row else None,
                                                 "readiness_pct": int(summary.get("readiness_pct") or 0),
@@ -1385,6 +1395,7 @@ def show_ozon_tab():
                             type_id=int(selected_row["type_id"]),
                             required_only=required_only_mode,
                             dictionary_min_score=float(dictionary_min_score),
+                            offer_id_field=str(offer_id_field),
                         )
                         st.download_button(
                             "Скачать preview Ozon JSON",
@@ -1400,6 +1411,7 @@ def show_ozon_tab():
                                 type_id=int(selected_row["type_id"]),
                                 required_only=required_only_mode,
                                 dictionary_min_score=float(dictionary_min_score),
+                                offer_id_field=str(offer_id_field),
                             )
                             st.download_button(
                                 "Скачать bulk Ozon JSON по выбранным товарам",
@@ -1407,6 +1419,12 @@ def show_ozon_tab():
                                 file_name=f"ozon_bulk_payload_{int(selected_row['description_category_id'])}_{int(selected_row['type_id'])}.json",
                                 mime="application/json",
                                 key=f"ozon_bulk_payload_export_{selected_product_id}",
+                            )
+                            st.caption(
+                                f"Bulk summary: products={bulk_payload.get('summary', {}).get('products_total', 0)}, "
+                                f"included={bulk_payload.get('summary', {}).get('attributes_included', 0)}, "
+                                f"skipped={bulk_payload.get('summary', {}).get('attributes_skipped', 0)}, "
+                                f"missing_offer_id={bulk_payload.get('summary', {}).get('missing_offer_id', 0)}"
                             )
 
                         st.markdown("### Preview полуавтозаполнения Ozon")

@@ -17,6 +17,7 @@ from utils.text_normalizer import normalize_text
 
 BASE_URL = "https://api-seller.ozon.ru"
 DEFAULT_TIMEOUT = 30.0
+OZON_OFFER_ID_FIELDS = ("article", "internal_article", "supplier_article")
 
 
 def get_env_credentials() -> tuple[str | None, str | None]:
@@ -943,6 +944,30 @@ def _source_exists(conn: sqlite3.Connection, source_type: str | None, source_nam
     return False
 
 
+def _resolve_offer_id(
+    conn: sqlite3.Connection,
+    product_id: int,
+    offer_id_field: str = "article",
+) -> str | None:
+    field = str(offer_id_field or "article").strip()
+    if field not in OZON_OFFER_ID_FIELDS:
+        field = "article"
+
+    row = conn.execute(
+        "SELECT article, internal_article, supplier_article FROM products WHERE id = ? LIMIT 1",
+        (int(product_id),),
+    ).fetchone()
+    if not row:
+        return None
+
+    value = row[field]
+    if value in (None, ""):
+        value = row["article"]
+    if value in (None, ""):
+        return None
+    return str(value).strip()
+
+
 
 def suggest_mappings_for_cached_attributes(
     conn: sqlite3.Connection,
@@ -1246,6 +1271,7 @@ def build_product_ozon_api_attributes(
     type_id: int,
     required_only: bool = False,
     dictionary_min_score: float = 0.78,
+    offer_id_field: str = "article",
 ) -> dict[str, Any]:
     rows = build_product_ozon_payload(
         conn=conn,
@@ -1277,8 +1303,12 @@ def build_product_ozon_api_attributes(
             }
         )
 
+    offer_id = _resolve_offer_id(conn, int(product_id), offer_id_field=offer_id_field)
+
     return {
         "product_id": int(product_id),
+        "offer_id": offer_id,
+        "offer_id_field": str(offer_id_field or "article"),
         "description_category_id": int(description_category_id),
         "type_id": int(type_id),
         "attributes": attributes,
@@ -1294,10 +1324,12 @@ def build_bulk_ozon_api_payloads(
     type_id: int,
     required_only: bool = False,
     dictionary_min_score: float = 0.78,
+    offer_id_field: str = "article",
 ) -> dict[str, Any]:
     products_payload: list[dict[str, Any]] = []
     total_included = 0
     total_skipped = 0
+    missing_offer_id = 0
 
     for pid in product_ids:
         item = build_product_ozon_api_attributes(
@@ -1307,18 +1339,23 @@ def build_bulk_ozon_api_payloads(
             type_id=int(type_id),
             required_only=required_only,
             dictionary_min_score=float(dictionary_min_score),
+            offer_id_field=str(offer_id_field or "article"),
         )
         products_payload.append(item)
         total_included += int(item.get("included") or 0)
         total_skipped += int(item.get("skipped") or 0)
+        if not item.get("offer_id"):
+            missing_offer_id += 1
 
     return {
         "description_category_id": int(description_category_id),
         "type_id": int(type_id),
+        "offer_id_field": str(offer_id_field or "article"),
         "products": products_payload,
         "summary": {
             "products_total": int(len(products_payload)),
             "attributes_included": int(total_included),
             "attributes_skipped": int(total_skipped),
+            "missing_offer_id": int(missing_offer_id),
         },
     }
