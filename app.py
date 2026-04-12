@@ -27,7 +27,7 @@ from services.supplier_parser import fetch_supplier_page, extract_supplier_data,
 from services.template_matching import auto_match_template_columns, apply_saved_mapping_rules, fill_template_dataframe, apply_client_validated_values, fill_template_workbook_bytes, dataframe_to_excel_bytes, detect_template_data_start_row
 from services.template_profiles import save_template_profile, list_template_profiles, get_template_profile_columns
 from services.readiness_service import analyze_template_readiness
-from services.ozon_api_service import is_configured, sync_category_tree, list_cached_categories, sync_category_attributes, list_cached_attributes, sync_attribute_dictionary_values, sync_all_category_dictionary_values, list_cached_attribute_values, import_cached_attributes_to_pim, suggest_mappings_for_cached_attributes, save_suggested_mappings, analyze_product_ozon_coverage, ensure_ozon_master_attributes, build_product_ozon_payload, materialize_product_ozon_attributes, preview_product_ozon_dictionary_gaps, build_product_ozon_api_attributes, build_bulk_ozon_api_payloads, build_ozon_attributes_update_request, save_dictionary_override, list_dictionary_overrides, delete_dictionary_override
+from services.ozon_api_service import is_configured, sync_category_tree, list_cached_categories, sync_category_attributes, list_cached_attributes, sync_attribute_dictionary_values, sync_all_category_dictionary_values, list_cached_attribute_values, import_cached_attributes_to_pim, suggest_mappings_for_cached_attributes, save_suggested_mappings, analyze_product_ozon_coverage, ensure_ozon_master_attributes, build_product_ozon_payload, materialize_product_ozon_attributes, preview_product_ozon_dictionary_gaps, build_product_ozon_api_attributes, build_bulk_ozon_api_payloads, build_ozon_attributes_update_request, submit_ozon_attributes_update, save_dictionary_override, list_dictionary_overrides, delete_dictionary_override
 
 st.set_page_config(page_title="PIM", page_icon="📦", layout="wide")
 OZON_OFFER_ID_OPTIONS = ["article", "internal_article", "supplier_article"]
@@ -1428,6 +1428,32 @@ def show_ozon_tab():
                                 mime="application/json",
                                 key=f"ozon_update_request_export_{selected_product_id}",
                             )
+                            if st.button(
+                                "Отправить batch в Ozon (/v1/product/attributes/update)",
+                                disabled=(not configured),
+                                key=f"ozon_send_update_{selected_product_id}",
+                            ):
+                                send_result = submit_ozon_attributes_update(
+                                    conn=conn,
+                                    product_ids=[int(x) for x in selected_product_ids],
+                                    description_category_id=int(selected_row["description_category_id"]),
+                                    type_id=int(selected_row["type_id"]),
+                                    required_only=required_only_mode,
+                                    dictionary_min_score=float(dictionary_min_score),
+                                    offer_id_field=str(offer_id_field),
+                                    client_id=client_id or None,
+                                    api_key=api_key or None,
+                                )
+                                if send_result.get("ok"):
+                                    response = send_result.get("response") or {}
+                                    result_part = response.get("result") if isinstance(response, dict) else None
+                                    task_id = result_part.get("task_id") if isinstance(result_part, dict) else None
+                                    st.success(
+                                        f"Batch отправлен в Ozon. items={send_result.get('request', {}).get('summary', {}).get('items_total', 0)}"
+                                        + (f", task_id={task_id}" if task_id else "")
+                                    )
+                                else:
+                                    st.error(send_result.get("message") or "Не удалось отправить batch в Ozon")
                             st.caption(
                                 f"Bulk summary: products={bulk_payload.get('summary', {}).get('products_total', 0)}, "
                                 f"included={bulk_payload.get('summary', {}).get('attributes_included', 0)}, "

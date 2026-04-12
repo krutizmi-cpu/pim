@@ -1395,3 +1395,46 @@ def build_ozon_attributes_update_request(
             "skipped_empty_attrs": int(skipped_empty_attrs),
         },
     }
+
+
+def submit_ozon_attributes_update(
+    conn: sqlite3.Connection,
+    product_ids: list[int],
+    description_category_id: int,
+    type_id: int,
+    required_only: bool = False,
+    dictionary_min_score: float = 0.78,
+    offer_id_field: str = "article",
+    client_id: str | None = None,
+    api_key: str | None = None,
+) -> dict[str, Any]:
+    bulk_payload = build_bulk_ozon_api_payloads(
+        conn=conn,
+        product_ids=[int(x) for x in product_ids],
+        description_category_id=int(description_category_id),
+        type_id=int(type_id),
+        required_only=required_only,
+        dictionary_min_score=float(dictionary_min_score),
+        offer_id_field=str(offer_id_field or "article"),
+    )
+    request_payload = build_ozon_attributes_update_request(bulk_payload)
+    if not request_payload.get("items"):
+        return {
+            "ok": False,
+            "message": "Нет готовых items для отправки в Ozon",
+            "request": request_payload,
+            "bulk_summary": bulk_payload.get("summary", {}),
+        }
+
+    response = _post(
+        "/v1/product/attributes/update",
+        request_payload,
+        client_id=client_id,
+        api_key=api_key,
+    )
+    return {
+        "ok": True,
+        "request": request_payload,
+        "response": response,
+        "bulk_summary": bulk_payload.get("summary", {}),
+    }
