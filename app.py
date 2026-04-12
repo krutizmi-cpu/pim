@@ -1248,12 +1248,17 @@ def show_ozon_tab():
                         format_func=lambda x: next((f"ID {r['id']} | {r['article'] or '-'} | {r['name'] or '-'}" for r in product_rows if int(r['id']) == int(x)), str(x)),
                         key=f"ozon_bulk_product_ids_{selected_product_id}",
                     )
+                    required_only_mode = st.checkbox(
+                        "Работать только с обязательными Ozon-атрибутами (required)",
+                        value=False,
+                        key=f"ozon_required_only_{selected_product_id}",
+                    )
                     preview_rows = build_product_ozon_payload(
                         conn,
                         product_id=int(selected_product_id),
                         description_category_id=int(selected_row["description_category_id"]),
                         type_id=int(selected_row["type_id"]),
-                        required_only=False,
+                        required_only=required_only_mode,
                         dictionary_min_score=float(dictionary_min_score),
                     )
                     if preview_rows:
@@ -1295,7 +1300,7 @@ def show_ozon_tab():
                                     product_id=int(selected_product_id),
                                     description_category_id=int(selected_row["description_category_id"]),
                                     type_id=int(selected_row["type_id"]),
-                                    required_only=False,
+                                    required_only=required_only_mode,
                                     dictionary_min_score=float(dictionary_min_score),
                                 )
                                 st.success(
@@ -1361,7 +1366,7 @@ def show_ozon_tab():
                                             product_id=int(pid),
                                             description_category_id=int(selected_row["description_category_id"]),
                                             type_id=int(selected_row["type_id"]),
-                                            required_only=False,
+                                            required_only=required_only_mode,
                                             dictionary_min_score=float(dictionary_min_score),
                                         )
                                         total_applied += int(result.get("applied") or 0)
@@ -1378,7 +1383,7 @@ def show_ozon_tab():
                             product_id=int(selected_product_id),
                             description_category_id=int(selected_row["description_category_id"]),
                             type_id=int(selected_row["type_id"]),
-                            required_only=False,
+                            required_only=required_only_mode,
                             dictionary_min_score=float(dictionary_min_score),
                         )
                         st.download_button(
@@ -1393,7 +1398,7 @@ def show_ozon_tab():
                                 product_ids=[int(x) for x in selected_product_ids],
                                 description_category_id=int(selected_row["description_category_id"]),
                                 type_id=int(selected_row["type_id"]),
-                                required_only=False,
+                                required_only=required_only_mode,
                                 dictionary_min_score=float(dictionary_min_score),
                             )
                             st.download_button(
