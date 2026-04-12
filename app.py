@@ -27,7 +27,7 @@ from services.supplier_parser import fetch_supplier_page, extract_supplier_data,
 from services.template_matching import auto_match_template_columns, apply_saved_mapping_rules, fill_template_dataframe, apply_client_validated_values, fill_template_workbook_bytes, dataframe_to_excel_bytes, detect_template_data_start_row
 from services.template_profiles import save_template_profile, list_template_profiles, get_template_profile_columns
 from services.readiness_service import analyze_template_readiness
-from services.ozon_api_service import is_configured, sync_category_tree, list_cached_categories, sync_category_attributes, list_cached_attributes, sync_attribute_dictionary_values, sync_all_category_dictionary_values, list_cached_attribute_values, import_cached_attributes_to_pim, suggest_mappings_for_cached_attributes, save_suggested_mappings, analyze_product_ozon_coverage, ensure_ozon_master_attributes, build_product_ozon_payload, materialize_product_ozon_attributes, preview_product_ozon_dictionary_gaps, build_product_ozon_api_attributes, build_bulk_ozon_api_payloads, save_dictionary_override, list_dictionary_overrides
+from services.ozon_api_service import is_configured, sync_category_tree, list_cached_categories, sync_category_attributes, list_cached_attributes, sync_attribute_dictionary_values, sync_all_category_dictionary_values, list_cached_attribute_values, import_cached_attributes_to_pim, suggest_mappings_for_cached_attributes, save_suggested_mappings, analyze_product_ozon_coverage, ensure_ozon_master_attributes, build_product_ozon_payload, materialize_product_ozon_attributes, preview_product_ozon_dictionary_gaps, build_product_ozon_api_attributes, build_bulk_ozon_api_payloads, save_dictionary_override, list_dictionary_overrides, delete_dictionary_override
 
 st.set_page_config(page_title="PIM", page_icon="📦", layout="wide")
 
@@ -1533,8 +1533,9 @@ def show_ozon_tab():
                         )
                         if overrides:
                             st.markdown("### Сохранённые dictionary overrides")
+                            overrides_df = pd.DataFrame(overrides)
                             st.dataframe(
-                                pd.DataFrame(overrides)[
+                                overrides_df[
                                     [
                                         c
                                         for c in [
@@ -1545,12 +1546,33 @@ def show_ozon_tab():
                                             "comment",
                                             "updated_at",
                                         ]
-                                        if c in pd.DataFrame(overrides).columns
+                                        if c in overrides_df.columns
                                     ]
                                 ],
                                 use_container_width=True,
                                 hide_index=True,
                             )
+                            selected_override_idx = st.selectbox(
+                                "Выбери override для удаления",
+                                options=list(range(len(overrides))),
+                                format_func=lambda idx: (
+                                    f"attr={overrides[idx].get('attribute_id')} | "
+                                    f"raw={overrides[idx].get('raw_value')} -> "
+                                    f"id={overrides[idx].get('value_id')} ({overrides[idx].get('value')})"
+                                ),
+                                key=f"ozon_override_delete_idx_{selected_product_id}",
+                            )
+                            if st.button("Удалить выбранный override", key=f"ozon_delete_override_{selected_product_id}"):
+                                item = overrides[int(selected_override_idx)]
+                                result = delete_dictionary_override(
+                                    conn=conn,
+                                    description_category_id=int(selected_row["description_category_id"]),
+                                    type_id=int(selected_row["type_id"]),
+                                    attribute_id=int(item.get("attribute_id")),
+                                    raw_value=item.get("raw_value"),
+                                )
+                                st.success(f"Удалено overrides: {int(result.get('deleted') or 0)}")
+                                st.rerun()
             else:
                 st.info("По этой категории атрибуты ещё не загружались.")
     else:

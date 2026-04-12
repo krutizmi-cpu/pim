@@ -723,6 +723,30 @@ def save_dictionary_override(
     }
 
 
+def delete_dictionary_override(
+    conn: sqlite3.Connection,
+    description_category_id: int,
+    type_id: int,
+    attribute_id: int,
+    raw_value: Any,
+) -> dict[str, Any]:
+    normalized_raw = _normalize_override_key(raw_value)
+    if not normalized_raw:
+        return {"deleted": 0}
+    cur = conn.execute(
+        """
+        DELETE FROM ozon_dictionary_overrides
+        WHERE description_category_id = ?
+          AND type_id = ?
+          AND attribute_id = ?
+          AND normalized_raw_value = ?
+        """,
+        (int(description_category_id), int(type_id), int(attribute_id), normalized_raw),
+    )
+    conn.commit()
+    return {"deleted": int(cur.rowcount or 0)}
+
+
 def _get_dictionary_override(
     conn: sqlite3.Connection,
     description_category_id: int,
