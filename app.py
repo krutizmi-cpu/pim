@@ -391,6 +391,54 @@ def import_dictionary_overrides_from_excel(
     }
 
 
+def resolve_job_ids_from_excel(file_bytes: bytes, column_name: str | None = None) -> dict:
+    try:
+        df = pd.read_excel(BytesIO(file_bytes))
+    except Exception as e:
+        return {"ok": False, "message": f"Не удалось прочитать Excel: {e}"}
+
+    if df.empty:
+        return {"ok": False, "message": "Excel пустой"}
+
+    columns = {str(c).strip().lower(): str(c) for c in df.columns}
+    selected_column = None
+    if column_name:
+        selected_column = columns.get(str(column_name).strip().lower())
+        if not selected_column:
+            return {"ok": False, "message": f"Колонка '{column_name}' не найдена"}
+    if not selected_column:
+        for alias in ["job_id", "id", "job"]:
+            if alias in columns:
+                selected_column = columns[alias]
+                break
+    if not selected_column:
+        selected_column = str(df.columns[0])
+
+    job_ids = []
+    errors = []
+    seen = set()
+    for idx, value in enumerate(df[selected_column].tolist(), start=2):
+        text = _cell_to_lookup_text(value)
+        if not text:
+            continue
+        try:
+            job_id = int(float(text))
+            if job_id in seen:
+                continue
+            seen.add(job_id)
+            job_ids.append(job_id)
+        except Exception:
+            errors.append({"row": idx, "value": text, "error": "Не удалось распознать job_id"})
+
+    return {
+        "ok": True,
+        "used_column": selected_column,
+        "job_ids": job_ids,
+        "count": len(job_ids),
+        "errors": errors[:100],
+    }
+
+
 def render_template_readiness(filled_df: pd.DataFrame, manual_rows: list[dict]) -> None:
     readiness = analyze_template_readiness(filled_df, manual_rows)
     summary = readiness["summary"]
@@ -1962,6 +2010,70 @@ def show_ozon_tab():
                                 st.rerun()
 
                         st.markdown("### Журнал отправок в Ozon")
+                        retry_col1, retry_col2 = st.columns([2, 1])
+                        with retry_col1:
+                            retry_excel_file = st.file_uploader(
+                                "Excel со списком job_id для повторной отправки",
+                                type=["xlsx", "xls"],
+                                key=f"ozon_retry_jobs_file_{selected_product_id}",
+                            )
+                            retry_excel_column = st.text_input(
+                                "Колонка job_id (опционально)",
+                                value="",
+                                key=f"ozon_retry_jobs_column_{selected_product_id}",
+                                placeholder="job_id",
+                            )
+                        with retry_col2:
+                            if st.button(
+                                "Массово повторить jobs из Excel",
+                                disabled=(not configured),
+                                key=f"ozon_retry_jobs_apply_{selected_product_id}",
+                            ):
+                                if retry_excel_file is None:
+                                    st.warning("Сначала загрузи Excel со списком job_id.")
+                                else:
+                                    parsed_jobs = resolve_job_ids_from_excel(
+                                        retry_excel_file.read(),
+                                        column_name=retry_excel_column or None,
+                                    )
+                                    if not parsed_jobs.get("ok"):
+                                        st.error(parsed_jobs.get("message") or "Не удалось прочитать job_id из Excel.")
+                                    else:
+                                        job_ids = parsed_jobs.get("job_ids") or []
+                                        if not job_ids:
+                                            st.warning("В Excel не найдено корректных job_id.")
+                                        else:
+                                            progress = st.progress(0)
+                                            ok_count = 0
+                                            err_count = 0
+                                            errors = []
+                                            for i, job_id in enumerate(job_ids, start=1):
+                                                result = retry_ozon_update_job(
+                                                    conn=conn,
+                                                    job_id=int(job_id),
+                                                    client_id=client_id or None,
+                                                    api_key=api_key or None,
+                                                )
+                                                if result.get("ok"):
+                                                    ok_count += 1
+                                                else:
+                                                    err_count += 1
+                                                    errors.append({"job_id": job_id, "error": result.get("message") or "Ошибка"})
+                                                progress.progress(i / len(job_ids))
+                                            st.success(f"Массовый retry завершён. Успешно: {ok_count}, с ошибкой: {err_count}.")
+                                            if parsed_jobs.get("errors"):
+                                                st.dataframe(pd.DataFrame(parsed_jobs.get("errors")), use_container_width=True, hide_index=True)
+                                            if errors:
+                                                err_df = pd.DataFrame(errors)
+                                                st.dataframe(err_df, use_container_width=True, hide_index=True)
+                                                st.download_button(
+                                                    "Скачать ошибки retry (Excel)",
+                                                    data=dataframe_to_excel_bytes(err_df, sheet_name="retry_errors"),
+                                                    file_name="ozon_retry_errors.xlsx",
+                                                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                                    key=f"ozon_retry_errors_export_{selected_product_id}",
+                                                )
+                                            st.rerun()
                         jobs_limit = st.number_input(
                             "Сколько последних отправок показывать",
                             min_value=10,
