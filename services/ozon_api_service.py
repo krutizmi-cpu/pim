@@ -1066,3 +1066,51 @@ def preview_product_ozon_dictionary_gaps(
             }
         )
     return gaps
+
+
+def build_product_ozon_api_attributes(
+    conn: sqlite3.Connection,
+    product_id: int,
+    description_category_id: int,
+    type_id: int,
+    required_only: bool = False,
+    dictionary_min_score: float = 0.78,
+) -> dict[str, Any]:
+    rows = build_product_ozon_payload(
+        conn=conn,
+        product_id=int(product_id),
+        description_category_id=int(description_category_id),
+        type_id=int(type_id),
+        required_only=required_only,
+        dictionary_min_score=float(dictionary_min_score),
+    )
+    attributes: list[dict[str, Any]] = []
+    skipped = 0
+    for row in rows:
+        if row.get("status") != "ready":
+            skipped += 1
+            continue
+
+        value = row.get("value")
+        value_item: dict[str, Any]
+        if row.get("dictionary_value_id") is not None:
+            value_item = {"dictionary_value_id": int(row.get("dictionary_value_id"))}
+        else:
+            value_item = {"value": value}
+
+        attributes.append(
+            {
+                "id": int(row.get("attribute_id")),
+                "complex_id": 0,
+                "values": [value_item],
+            }
+        )
+
+    return {
+        "product_id": int(product_id),
+        "description_category_id": int(description_category_id),
+        "type_id": int(type_id),
+        "attributes": attributes,
+        "included": int(len(attributes)),
+        "skipped": int(skipped),
+    }

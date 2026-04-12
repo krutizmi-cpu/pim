@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from io import BytesIO
 from pathlib import Path
 
@@ -26,7 +27,7 @@ from services.supplier_parser import fetch_supplier_page, extract_supplier_data,
 from services.template_matching import auto_match_template_columns, apply_saved_mapping_rules, fill_template_dataframe, apply_client_validated_values, fill_template_workbook_bytes, dataframe_to_excel_bytes, detect_template_data_start_row
 from services.template_profiles import save_template_profile, list_template_profiles, get_template_profile_columns
 from services.readiness_service import analyze_template_readiness
-from services.ozon_api_service import is_configured, sync_category_tree, list_cached_categories, sync_category_attributes, list_cached_attributes, sync_attribute_dictionary_values, sync_all_category_dictionary_values, list_cached_attribute_values, import_cached_attributes_to_pim, suggest_mappings_for_cached_attributes, save_suggested_mappings, analyze_product_ozon_coverage, ensure_ozon_master_attributes, build_product_ozon_payload, materialize_product_ozon_attributes, preview_product_ozon_dictionary_gaps
+from services.ozon_api_service import is_configured, sync_category_tree, list_cached_categories, sync_category_attributes, list_cached_attributes, sync_attribute_dictionary_values, sync_all_category_dictionary_values, list_cached_attribute_values, import_cached_attributes_to_pim, suggest_mappings_for_cached_attributes, save_suggested_mappings, analyze_product_ozon_coverage, ensure_ozon_master_attributes, build_product_ozon_payload, materialize_product_ozon_attributes, preview_product_ozon_dictionary_gaps, build_product_ozon_api_attributes
 
 st.set_page_config(page_title="PIM", page_icon="📦", layout="wide")
 
@@ -1286,6 +1287,21 @@ def show_ozon_tab():
                                     f"Записано Ozon-значений: {result['applied']}, пустых пропущено: {result['skipped_empty']}, "
                                     f"dictionary без матчинга: {result.get('skipped_dictionary', 0)}. category_code={result['category_code']}"
                                 )
+
+                        payload_preview = build_product_ozon_api_attributes(
+                            conn,
+                            product_id=int(selected_product_id),
+                            description_category_id=int(selected_row["description_category_id"]),
+                            type_id=int(selected_row["type_id"]),
+                            required_only=False,
+                            dictionary_min_score=float(dictionary_min_score),
+                        )
+                        st.download_button(
+                            "Скачать preview Ozon JSON",
+                            data=json.dumps(payload_preview, ensure_ascii=False, indent=2).encode("utf-8"),
+                            file_name=f"ozon_payload_preview_product_{int(selected_product_id)}.json",
+                            mime="application/json",
+                        )
 
                         st.markdown("### Preview полуавтозаполнения Ozon")
                         st.dataframe(
