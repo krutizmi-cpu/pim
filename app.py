@@ -27,7 +27,7 @@ from services.supplier_parser import fetch_supplier_page, extract_supplier_data,
 from services.template_matching import auto_match_template_columns, apply_saved_mapping_rules, fill_template_dataframe, apply_client_validated_values, fill_template_workbook_bytes, dataframe_to_excel_bytes, detect_template_data_start_row
 from services.template_profiles import save_template_profile, list_template_profiles, get_template_profile_columns
 from services.readiness_service import analyze_template_readiness
-from services.ozon_api_service import is_configured, sync_category_tree, list_cached_categories, sync_category_attributes, list_cached_attributes, sync_attribute_dictionary_values, sync_all_category_dictionary_values, list_cached_attribute_values, import_cached_attributes_to_pim, suggest_mappings_for_cached_attributes, save_suggested_mappings, analyze_product_ozon_coverage, ensure_ozon_master_attributes, build_product_ozon_payload, materialize_product_ozon_attributes, preview_product_ozon_dictionary_gaps, build_product_ozon_api_attributes, build_bulk_ozon_api_payloads, build_ozon_attributes_update_request, submit_ozon_attributes_update, list_ozon_update_jobs, save_dictionary_override, list_dictionary_overrides, delete_dictionary_override
+from services.ozon_api_service import is_configured, sync_category_tree, list_cached_categories, sync_category_attributes, list_cached_attributes, sync_attribute_dictionary_values, sync_all_category_dictionary_values, list_cached_attribute_values, import_cached_attributes_to_pim, suggest_mappings_for_cached_attributes, save_suggested_mappings, analyze_product_ozon_coverage, ensure_ozon_master_attributes, build_product_ozon_payload, materialize_product_ozon_attributes, preview_product_ozon_dictionary_gaps, build_product_ozon_api_attributes, build_bulk_ozon_api_payloads, build_ozon_attributes_update_request, submit_ozon_attributes_update, list_ozon_update_jobs, get_ozon_update_job, retry_ozon_update_job, save_dictionary_override, list_dictionary_overrides, delete_dictionary_override
 
 st.set_page_config(page_title="PIM", page_icon="📦", layout="wide")
 OZON_OFFER_ID_OPTIONS = ["article", "internal_article", "supplier_article"]
@@ -1650,6 +1650,8 @@ def show_ozon_tab():
                                             "description_category_id",
                                             "type_id",
                                             "offer_id_field",
+                                            "task_id",
+                                            "retry_of_job_id",
                                             "error_message",
                                             "created_at",
                                         ]
@@ -1659,6 +1661,60 @@ def show_ozon_tab():
                                 use_container_width=True,
                                 hide_index=True,
                             )
+                            selected_job_id = st.selectbox(
+                                "Job для действий",
+                                options=[int(j["id"]) for j in jobs],
+                                format_func=lambda jid: next(
+                                    (
+                                        f"#{j['id']} | {j.get('status')} | items={j.get('items_count')} | created={j.get('created_at')}"
+                                        for j in jobs
+                                        if int(j["id"]) == int(jid)
+                                    ),
+                                    str(jid),
+                                ),
+                                key=f"ozon_job_action_{selected_product_id}",
+                            )
+                            job_item = get_ozon_update_job(conn, int(selected_job_id))
+                            if job_item:
+                                a1, a2, a3 = st.columns(3)
+                                with a1:
+                                    request_bytes = (job_item.get("request_json") or "{}").encode("utf-8")
+                                    st.download_button(
+                                        "Скачать request job",
+                                        data=request_bytes,
+                                        file_name=f"ozon_job_{int(selected_job_id)}_request.json",
+                                        mime="application/json",
+                                        key=f"ozon_job_req_dl_{selected_product_id}",
+                                    )
+                                with a2:
+                                    response_bytes = (job_item.get("response_json") or "{}").encode("utf-8")
+                                    st.download_button(
+                                        "Скачать response job",
+                                        data=response_bytes,
+                                        file_name=f"ozon_job_{int(selected_job_id)}_response.json",
+                                        mime="application/json",
+                                        key=f"ozon_job_resp_dl_{selected_product_id}",
+                                    )
+                                with a3:
+                                    if st.button(
+                                        "Повторить отправку job",
+                                        disabled=(not configured),
+                                        key=f"ozon_job_retry_{selected_product_id}",
+                                    ):
+                                        retry_result = retry_ozon_update_job(
+                                            conn=conn,
+                                            job_id=int(selected_job_id),
+                                            client_id=client_id or None,
+                                            api_key=api_key or None,
+                                        )
+                                        if retry_result.get("ok"):
+                                            st.success(
+                                                "Повторная отправка выполнена"
+                                                + (f", task_id={retry_result.get('task_id')}" if retry_result.get("task_id") else "")
+                                            )
+                                        else:
+                                            st.error(retry_result.get("message") or "Не удалось повторить отправку job")
+                                        st.rerun()
                         else:
                             st.info("Отправок в Ozon пока не было.")
             else:

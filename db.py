@@ -448,14 +448,22 @@ def _ensure_ozon_tables(conn: sqlite3.Connection) -> None:
             request_json TEXT,
             response_json TEXT,
             status TEXT,
+            task_id TEXT,
+            retry_of_job_id INTEGER,
             error_message TEXT,
             created_at TEXT DEFAULT CURRENT_TIMESTAMP,
             updated_at TEXT
         )
         """
     )
+    existing_job_cols = _table_columns(conn, "ozon_update_jobs")
+    if "task_id" not in existing_job_cols:
+        conn.execute("ALTER TABLE ozon_update_jobs ADD COLUMN task_id TEXT")
+    if "retry_of_job_id" not in existing_job_cols:
+        conn.execute("ALTER TABLE ozon_update_jobs ADD COLUMN retry_of_job_id INTEGER")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_ozon_jobs_created ON ozon_update_jobs(created_at)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_ozon_jobs_status ON ozon_update_jobs(status)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_ozon_jobs_retry_of ON ozon_update_jobs(retry_of_job_id)")
 
 
 

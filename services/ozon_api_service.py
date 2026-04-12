@@ -1397,6 +1397,17 @@ def build_ozon_attributes_update_request(
     }
 
 
+def _extract_task_id_from_response(response: dict[str, Any] | None) -> str | None:
+    if not isinstance(response, dict):
+        return None
+    result = response.get("result")
+    if isinstance(result, dict) and result.get("task_id") is not None:
+        return str(result.get("task_id"))
+    if response.get("task_id") is not None:
+        return str(response.get("task_id"))
+    return None
+
+
 def submit_ozon_attributes_update(
     conn: sqlite3.Connection,
     product_ids: list[int],
@@ -1429,11 +1440,13 @@ def submit_ozon_attributes_update(
                 request_json,
                 response_json,
                 status,
+                task_id,
+                retry_of_job_id,
                 error_message,
                 created_at,
                 updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
             """,
             (
                 int(description_category_id),
@@ -1443,6 +1456,8 @@ def submit_ozon_attributes_update(
                 json.dumps(request_payload, ensure_ascii=False),
                 None,
                 "skipped",
+                None,
+                None,
                 "Нет готовых items для отправки в Ozon",
             ),
         )
@@ -1460,6 +1475,7 @@ def submit_ozon_attributes_update(
             client_id=client_id,
             api_key=api_key,
         )
+        task_id = _extract_task_id_from_response(response)
         conn.execute(
             """
             INSERT INTO ozon_update_jobs (
@@ -1470,11 +1486,13 @@ def submit_ozon_attributes_update(
                 request_json,
                 response_json,
                 status,
+                task_id,
+                retry_of_job_id,
                 error_message,
                 created_at,
                 updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
             """,
             (
                 int(description_category_id),
@@ -1484,6 +1502,8 @@ def submit_ozon_attributes_update(
                 json.dumps(request_payload, ensure_ascii=False),
                 json.dumps(response, ensure_ascii=False),
                 "success",
+                task_id,
+                None,
                 None,
             ),
         )
@@ -1505,11 +1525,13 @@ def submit_ozon_attributes_update(
                 request_json,
                 response_json,
                 status,
+                task_id,
+                retry_of_job_id,
                 error_message,
                 created_at,
                 updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
             """,
             (
                 int(description_category_id),
@@ -1519,6 +1541,8 @@ def submit_ozon_attributes_update(
                 json.dumps(request_payload, ensure_ascii=False),
                 None,
                 "error",
+                None,
+                None,
                 str(e)[:1000],
             ),
         )
@@ -1540,3 +1564,114 @@ def list_ozon_update_jobs(
         (int(limit),),
     ).fetchall()
     return [dict(r) for r in rows]
+
+
+def get_ozon_update_job(
+    conn: sqlite3.Connection,
+    job_id: int,
+) -> dict[str, Any] | None:
+    row = conn.execute(
+        "SELECT * FROM ozon_update_jobs WHERE id = ? LIMIT 1",
+        (int(job_id),),
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def retry_ozon_update_job(
+    conn: sqlite3.Connection,
+    job_id: int,
+    client_id: str | None = None,
+    api_key: str | None = None,
+) -> dict[str, Any]:
+    job = get_ozon_update_job(conn, int(job_id))
+    if not job:
+        return {"ok": False, "message": "Job не найден"}
+
+    request_json = job.get("request_json")
+    if not request_json:
+        return {"ok": False, "message": "У job нет request_json"}
+
+    try:
+        request_payload = json.loads(request_json)
+    except Exception:
+        return {"ok": False, "message": "request_json повреждён и не читается как JSON"}
+
+    items_count = int(((request_payload or {}).get("summary") or {}).get("items_total") or 0)
+    if not request_payload.get("items"):
+        return {"ok": False, "message": "В request нет items для повторной отправки"}
+
+    try:
+        response = _post(
+            "/v1/product/attributes/update",
+            request_payload,
+            client_id=client_id,
+            api_key=api_key,
+        )
+        task_id = _extract_task_id_from_response(response)
+        conn.execute(
+            """
+            INSERT INTO ozon_update_jobs (
+                description_category_id,
+                type_id,
+                offer_id_field,
+                items_count,
+                request_json,
+                response_json,
+                status,
+                task_id,
+                retry_of_job_id,
+                error_message,
+                created_at,
+                updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            """,
+            (
+                int(job.get("description_category_id") or 0),
+                int(job.get("type_id") or 0),
+                job.get("offer_id_field") or "article",
+                items_count,
+                json.dumps(request_payload, ensure_ascii=False),
+                json.dumps(response, ensure_ascii=False),
+                "success",
+                task_id,
+                int(job_id),
+                None,
+            ),
+        )
+        conn.commit()
+        return {"ok": True, "response": response, "task_id": task_id}
+    except Exception as e:
+        conn.execute(
+            """
+            INSERT INTO ozon_update_jobs (
+                description_category_id,
+                type_id,
+                offer_id_field,
+                items_count,
+                request_json,
+                response_json,
+                status,
+                task_id,
+                retry_of_job_id,
+                error_message,
+                created_at,
+                updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            """,
+            (
+                int(job.get("description_category_id") or 0),
+                int(job.get("type_id") or 0),
+                job.get("offer_id_field") or "article",
+                items_count,
+                json.dumps(request_payload, ensure_ascii=False),
+                None,
+                "error",
+                None,
+                int(job_id),
+                str(e)[:1000],
+            ),
+        )
+        conn.commit()
+        return {"ok": False, "message": str(e)}
