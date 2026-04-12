@@ -13,11 +13,13 @@ from services.transforms import apply_transform
 
 
 BASE_PRODUCT_FIELD_ALIASES = {
+    "supplier_article": ["идентификатор номенклатуры поставщика", "внутренний код поставщика", "артикул поставщика", "supplier article"],
     "article": ["артикул", "sku", "vendor code", "код товара"],
     "name": ["название", "наименование", "товар", "name", "title"],
     "barcode": ["штрихкод", "ean", "barcode"],
     "brand": ["бренд", "brand", "марка"],
     "description": ["описание", "description"],
+    "uom": ["единица измерения", "ед. изм", "uom"],
     "weight": ["вес", "weight"],
     "length": ["длина", "length"],
     "width": ["ширина", "width"],
@@ -29,32 +31,82 @@ BASE_PRODUCT_FIELD_ALIASES = {
     "image_url": ["фото", "изображение", "image", "main image"],
 }
 
+SPECIAL_TEMPLATE_MATCHERS = [
+    # Online Trade standard template (long headers)
+    (("индентификатор номенклатуры поставщика", "идентификатор номенклатуры поставщика"), "column", "supplier_article", "online_trade_standard", None),
+    (("штрих-код товара", "штрихкод товара"), "column", "barcode", "online_trade_standard", None),
+    (("артикул не менее",), "column", "article", "online_trade_standard", None),
+    (("наименование (править", "наименование"), "column", "name", "online_trade_standard", None),
+    (("производитель (название бренда)", "производитель"), "column", "brand", "online_trade_standard", None),
+    (("вес брутто в кг",), "column", "gross_weight", "online_trade_standard", None),
+    (("единица измерения",), "column", "uom", "online_trade_standard", None),
+    (("длина/глубина упаковки",), "column", "package_length", "online_trade_standard", None),
+    (("ширина упаковки",), "column", "package_width", "online_trade_standard", None),
+    (("высота упаковки",), "column", "package_height", "online_trade_standard", None),
+    (("описание полное текстовое",), "column", "description", "online_trade_standard", None),
+    (("фото №1", "фото no1", "фото n1"), "column", "media_gallery", "online_trade_standard", "image_1"),
+    (("фото №2", "фото no2", "фото n2"), "column", "media_gallery", "online_trade_standard", "image_2"),
+    (("фото №3", "фото no3", "фото n3"), "column", "media_gallery", "online_trade_standard", "image_3"),
+    (("фото №4", "фото no4", "фото n4"), "column", "media_gallery", "online_trade_standard", "image_4"),
+    (("фото №5", "фото no5", "фото n5"), "column", "media_gallery", "online_trade_standard", "image_5"),
+]
+
 
 def normalize_key(value: str) -> str:
     return " ".join(str(value).strip().lower().replace("_", " ").split())
 
 
-def build_candidate_map(conn) -> dict[str, tuple[str, str, str]]:
+def build_candidate_map(conn) -> tuple[dict[str, tuple[str, str, str]], list[tuple[str, str, str, str]]]:
     result: dict[str, tuple[str, str, str]] = {}
+    alias_rows: list[tuple[str, str, str, str]] = []
 
     for field_name, aliases in BASE_PRODUCT_FIELD_ALIASES.items():
         for alias in aliases:
-            result[normalize_key(alias)] = ("column", field_name, alias)
+            norm = normalize_key(alias)
+            result[norm] = ("column", field_name, alias)
+            alias_rows.append((norm, "column", field_name, alias))
 
     for attr in list_attribute_definitions(conn):
         result[normalize_key(attr["name"])] = ("attribute", attr["code"], attr["name"])
         result[normalize_key(attr["code"])] = ("attribute", attr["code"], attr["name"])
 
-    return result
+    return result, alias_rows
 
 
 def auto_match_template_columns(conn, columns: list[str]) -> list[dict]:
-    candidate_map = build_candidate_map(conn)
+    candidate_map, alias_rows = build_candidate_map(conn)
     matches: list[dict] = []
 
     for col in columns:
         norm = normalize_key(col)
+        special = None
+        for needles, source_type, source_name, matched_by, transform_rule in SPECIAL_TEMPLATE_MATCHERS:
+            if any(normalize_key(n) in norm for n in needles):
+                special = (source_type, source_name, matched_by, transform_rule)
+                break
+
+        if special:
+            source_type, source_name, matched_by, transform_rule = special
+            matches.append(
+                {
+                    "template_column": col,
+                    "status": "matched",
+                    "source_type": source_type,
+                    "source_name": source_name,
+                    "matched_by": matched_by,
+                    "transform_rule": transform_rule,
+                }
+            )
+            continue
+
         matched = candidate_map.get(norm)
+        if not matched:
+            # Partial alias match for verbose client headers.
+            for alias_norm, source_type, source_name, matched_by in alias_rows:
+                if len(alias_norm) >= 4 and alias_norm in norm:
+                    matched = (source_type, source_name, f"alias_contains:{matched_by}")
+                    break
+
         if matched:
             source_type, source_name, matched_by = matched
             matches.append(
@@ -64,18 +116,21 @@ def auto_match_template_columns(conn, columns: list[str]) -> list[dict]:
                     "source_type": source_type,
                     "source_name": source_name,
                     "matched_by": matched_by,
+                    "transform_rule": None,
                 }
             )
-        else:
-            matches.append(
-                {
-                    "template_column": col,
-                    "status": "unmatched",
-                    "source_type": None,
-                    "source_name": None,
-                    "matched_by": None,
-                }
-            )
+            continue
+
+        matches.append(
+            {
+                "template_column": col,
+                "status": "unmatched",
+                "source_type": None,
+                "source_name": None,
+                "matched_by": None,
+                "transform_rule": None,
+            }
+        )
 
     return matches
 

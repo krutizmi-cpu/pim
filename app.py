@@ -1417,8 +1417,10 @@ def show_template_tab():
     uploaded = st.file_uploader("Загрузить Excel-шаблон клиента", type=["xlsx", "xls"], key="client_template")
     defs = list_attribute_definitions(conn)
     source_options = [("column", c) for c in [
-        "article", "name", "barcode", "brand", "description", "weight", "length", "width", "height",
-        "package_length", "package_width", "package_height", "gross_weight", "image_url", "category", "supplier_name", "supplier_article", "media_gallery"
+        "article", "internal_article", "supplier_article", "name", "barcode", "brand", "description",
+        "weight", "length", "width", "height", "package_length", "package_width", "package_height",
+        "gross_weight", "image_url", "category", "base_category", "supplier_name", "supplier_url",
+        "uom", "tnved_code", "media_gallery"
     ]] + [("attribute", d["code"]) for d in defs]
 
     if uploaded is not None:
