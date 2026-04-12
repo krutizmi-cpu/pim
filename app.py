@@ -1914,6 +1914,13 @@ def show_ozon_tab():
                         if overrides:
                             st.markdown("### Сохранённые dictionary overrides")
                             overrides_df = pd.DataFrame(overrides)
+                            st.download_button(
+                                "Скачать overrides (Excel)",
+                                data=dataframe_to_excel_bytes(overrides_df, sheet_name="overrides"),
+                                file_name=f"ozon_dictionary_overrides_{int(selected_row['description_category_id'])}_{int(selected_row['type_id'])}.xlsx",
+                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                key=f"ozon_overrides_export_{selected_product_id}",
+                            )
                             st.dataframe(
                                 overrides_df[
                                     [
@@ -1966,6 +1973,13 @@ def show_ozon_tab():
                         jobs = list_ozon_update_jobs(conn, limit=int(jobs_limit))
                         if jobs:
                             jobs_df = pd.DataFrame(jobs)
+                            st.download_button(
+                                "Скачать журнал jobs (Excel)",
+                                data=dataframe_to_excel_bytes(jobs_df, sheet_name="ozon_jobs"),
+                                file_name="ozon_update_jobs.xlsx",
+                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                key=f"ozon_jobs_export_{selected_product_id}",
+                            )
                             jm1, jm2, jm3, jm4 = st.columns(4)
                             jm1.metric("Всего jobs", int(len(jobs_df)))
                             jm2.metric("Успех", int((jobs_df["status"] == "success").sum()) if "status" in jobs_df.columns else 0)
@@ -2060,6 +2074,44 @@ def show_ozon_tab():
                                             else:
                                                 st.error(retry_result.get("message") or "Не удалось повторить отправку job")
                                             st.rerun()
+                                    try:
+                                        job_request = json.loads(job_item.get("request_json") or "{}")
+                                    except Exception:
+                                        job_request = {}
+                                    try:
+                                        job_response = json.loads(job_item.get("response_json") or "{}")
+                                    except Exception:
+                                        job_response = {}
+                                    job_items = job_request.get("items") if isinstance(job_request, dict) else []
+                                    if isinstance(job_items, list) and job_items:
+                                        job_items_df = pd.DataFrame(
+                                            [
+                                                {
+                                                    "offer_id": item.get("offer_id"),
+                                                    "description_category_id": item.get("description_category_id"),
+                                                    "type_id": item.get("type_id"),
+                                                    "attributes_count": len(item.get("attributes") or []),
+                                                }
+                                                for item in job_items
+                                            ]
+                                        )
+                                        st.download_button(
+                                            "Скачать selected job items (Excel)",
+                                            data=dataframe_to_excel_bytes(job_items_df, sheet_name="job_items"),
+                                            file_name=f"ozon_job_{int(selected_job_id)}_items.xlsx",
+                                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                            key=f"ozon_job_items_excel_{selected_product_id}",
+                                        )
+                                        st.dataframe(job_items_df, use_container_width=True, hide_index=True)
+                                    if job_response:
+                                        response_df = pd.DataFrame([job_response])
+                                        st.download_button(
+                                            "Скачать selected job response (Excel)",
+                                            data=dataframe_to_excel_bytes(response_df, sheet_name="job_response"),
+                                            file_name=f"ozon_job_{int(selected_job_id)}_response.xlsx",
+                                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                            key=f"ozon_job_response_excel_{selected_product_id}",
+                                        )
                         else:
                             st.info("Отправок в Ozon пока не было.")
             else:
