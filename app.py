@@ -1639,6 +1639,21 @@ def show_ozon_tab():
                         jobs = list_ozon_update_jobs(conn, limit=int(jobs_limit))
                         if jobs:
                             jobs_df = pd.DataFrame(jobs)
+                            jm1, jm2, jm3, jm4 = st.columns(4)
+                            jm1.metric("Всего jobs", int(len(jobs_df)))
+                            jm2.metric("Успех", int((jobs_df["status"] == "success").sum()) if "status" in jobs_df.columns else 0)
+                            jm3.metric("Ошибка", int((jobs_df["status"] == "error").sum()) if "status" in jobs_df.columns else 0)
+                            jm4.metric("Skipped", int((jobs_df["status"] == "skipped").sum()) if "status" in jobs_df.columns else 0)
+
+                            status_filter = st.selectbox(
+                                "Фильтр jobs по статусу",
+                                options=["Все", "success", "error", "skipped"],
+                                index=0,
+                                key=f"ozon_jobs_status_filter_{selected_product_id}",
+                            )
+                            if status_filter != "Все":
+                                jobs_df = jobs_df[jobs_df["status"] == status_filter]
+
                             st.dataframe(
                                 jobs_df[
                                     [
@@ -1661,60 +1676,63 @@ def show_ozon_tab():
                                 use_container_width=True,
                                 hide_index=True,
                             )
-                            selected_job_id = st.selectbox(
-                                "Job для действий",
-                                options=[int(j["id"]) for j in jobs],
-                                format_func=lambda jid: next(
-                                    (
-                                        f"#{j['id']} | {j.get('status')} | items={j.get('items_count')} | created={j.get('created_at')}"
-                                        for j in jobs
-                                        if int(j["id"]) == int(jid)
+                            if jobs_df.empty:
+                                st.info("По текущему фильтру jobs не найдено.")
+                            else:
+                                selected_job_id = st.selectbox(
+                                    "Job для действий",
+                                    options=[int(jid) for jid in jobs_df["id"].tolist()],
+                                    format_func=lambda jid: next(
+                                        (
+                                            f"#{j['id']} | {j.get('status')} | items={j.get('items_count')} | created={j.get('created_at')}"
+                                            for j in jobs
+                                            if int(j["id"]) == int(jid)
+                                        ),
+                                        str(jid),
                                     ),
-                                    str(jid),
-                                ),
-                                key=f"ozon_job_action_{selected_product_id}",
-                            )
-                            job_item = get_ozon_update_job(conn, int(selected_job_id))
-                            if job_item:
-                                a1, a2, a3 = st.columns(3)
-                                with a1:
-                                    request_bytes = (job_item.get("request_json") or "{}").encode("utf-8")
-                                    st.download_button(
-                                        "Скачать request job",
-                                        data=request_bytes,
-                                        file_name=f"ozon_job_{int(selected_job_id)}_request.json",
-                                        mime="application/json",
-                                        key=f"ozon_job_req_dl_{selected_product_id}",
-                                    )
-                                with a2:
-                                    response_bytes = (job_item.get("response_json") or "{}").encode("utf-8")
-                                    st.download_button(
-                                        "Скачать response job",
-                                        data=response_bytes,
-                                        file_name=f"ozon_job_{int(selected_job_id)}_response.json",
-                                        mime="application/json",
-                                        key=f"ozon_job_resp_dl_{selected_product_id}",
-                                    )
-                                with a3:
-                                    if st.button(
-                                        "Повторить отправку job",
-                                        disabled=(not configured),
-                                        key=f"ozon_job_retry_{selected_product_id}",
-                                    ):
-                                        retry_result = retry_ozon_update_job(
-                                            conn=conn,
-                                            job_id=int(selected_job_id),
-                                            client_id=client_id or None,
-                                            api_key=api_key or None,
+                                    key=f"ozon_job_action_{selected_product_id}",
+                                )
+                                job_item = get_ozon_update_job(conn, int(selected_job_id))
+                                if job_item:
+                                    a1, a2, a3 = st.columns(3)
+                                    with a1:
+                                        request_bytes = (job_item.get("request_json") or "{}").encode("utf-8")
+                                        st.download_button(
+                                            "Скачать request job",
+                                            data=request_bytes,
+                                            file_name=f"ozon_job_{int(selected_job_id)}_request.json",
+                                            mime="application/json",
+                                            key=f"ozon_job_req_dl_{selected_product_id}",
                                         )
-                                        if retry_result.get("ok"):
-                                            st.success(
-                                                "Повторная отправка выполнена"
-                                                + (f", task_id={retry_result.get('task_id')}" if retry_result.get("task_id") else "")
+                                    with a2:
+                                        response_bytes = (job_item.get("response_json") or "{}").encode("utf-8")
+                                        st.download_button(
+                                            "Скачать response job",
+                                            data=response_bytes,
+                                            file_name=f"ozon_job_{int(selected_job_id)}_response.json",
+                                            mime="application/json",
+                                            key=f"ozon_job_resp_dl_{selected_product_id}",
+                                        )
+                                    with a3:
+                                        if st.button(
+                                            "Повторить отправку job",
+                                            disabled=(not configured),
+                                            key=f"ozon_job_retry_{selected_product_id}",
+                                        ):
+                                            retry_result = retry_ozon_update_job(
+                                                conn=conn,
+                                                job_id=int(selected_job_id),
+                                                client_id=client_id or None,
+                                                api_key=api_key or None,
                                             )
-                                        else:
-                                            st.error(retry_result.get("message") or "Не удалось повторить отправку job")
-                                        st.rerun()
+                                            if retry_result.get("ok"):
+                                                st.success(
+                                                    "Повторная отправка выполнена"
+                                                    + (f", task_id={retry_result.get('task_id')}" if retry_result.get("task_id") else "")
+                                                )
+                                            else:
+                                                st.error(retry_result.get("message") or "Не удалось повторить отправку job")
+                                            st.rerun()
                         else:
                             st.info("Отправок в Ozon пока не было.")
             else:
