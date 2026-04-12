@@ -160,6 +160,53 @@ class ImportResult:
     batch_id: str
 
 
+def _alias_universe() -> set[str]:
+    values = set()
+    for aliases in COLUMN_MAP.values():
+        for alias in aliases:
+            values.add(str(alias).strip().lower())
+    return values
+
+
+def _detect_best_sheet_and_header(excel_path: Path, max_scan_rows: int = 12) -> tuple[str, int]:
+    xls = pd.ExcelFile(excel_path)
+    aliases = _alias_universe()
+    best_sheet = xls.sheet_names[0]
+    best_header = 0
+    best_score = -1
+
+    for sheet in xls.sheet_names:
+        try:
+            probe = pd.read_excel(excel_path, sheet_name=sheet, header=None, nrows=max_scan_rows)
+        except Exception:
+            continue
+        if probe.empty:
+            continue
+
+        for row_idx in range(min(max_scan_rows, len(probe))):
+            row_values = [str(v).strip().lower() for v in probe.iloc[row_idx].tolist() if str(v).strip() and str(v).lower() != "nan"]
+            if not row_values:
+                continue
+            score = sum(1 for v in row_values if v in aliases)
+            # slight bonus for rows that look like headers (contain multiple short tokens)
+            short_tokens = sum(1 for v in row_values if len(v) <= 30)
+            score = score * 10 + short_tokens
+            if score > best_score:
+                best_score = score
+                best_sheet = sheet
+                best_header = row_idx
+
+    return best_sheet, int(best_header)
+
+
+def _read_excel_smart(excel_path: Path) -> pd.DataFrame:
+    sheet_name, header_row = _detect_best_sheet_and_header(excel_path)
+    df = pd.read_excel(excel_path, sheet_name=sheet_name, header=header_row)
+    # Drop fully empty columns and rows early.
+    df = df.dropna(axis=1, how="all").dropna(axis=0, how="all")
+    return df
+
+
 def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     source_columns = {str(col).strip().lower(): col for col in df.columns}
     rename_map: dict[str, str] = {}
@@ -295,7 +342,7 @@ def _apply_enrichment(
 
 def import_catalog_from_excel(conn: sqlite3.Connection, excel_path: Path) -> ImportResult:
     init_db(conn)
-    df = pd.read_excel(excel_path)
+    df = _read_excel_smart(excel_path)
     normalized = normalize_columns(df)
 
     created = 0
