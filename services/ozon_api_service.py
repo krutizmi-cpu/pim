@@ -620,6 +620,141 @@ def _best_token_for_search(text: str) -> str:
     return tokens[0]
 
 
+def _normalize_override_key(value: Any) -> str:
+    return normalize_text(_to_scalar_string(value))
+
+
+def list_dictionary_overrides(
+    conn: sqlite3.Connection,
+    description_category_id: int,
+    type_id: int,
+    attribute_id: int | None = None,
+    limit: int = 500,
+) -> list[dict[str, Any]]:
+    params: list[Any] = [int(description_category_id), int(type_id)]
+    sql = """
+        SELECT *
+        FROM ozon_dictionary_overrides
+        WHERE description_category_id = ?
+          AND type_id = ?
+    """
+    if attribute_id is not None:
+        sql += " AND attribute_id = ?"
+        params.append(int(attribute_id))
+    sql += " ORDER BY updated_at DESC, created_at DESC, id DESC LIMIT ?"
+    params.append(int(limit))
+    rows = conn.execute(sql, params).fetchall()
+    return [dict(r) for r in rows]
+
+
+def save_dictionary_override(
+    conn: sqlite3.Connection,
+    description_category_id: int,
+    type_id: int,
+    attribute_id: int,
+    raw_value: Any,
+    value_id: int,
+    value: str | None = None,
+    comment: str | None = None,
+) -> dict[str, Any]:
+    raw_text = _to_scalar_string(raw_value)
+    normalized_raw = _normalize_override_key(raw_text)
+    if not raw_text or not normalized_raw:
+        raise ValueError("Пустое raw_value для dictionary override")
+
+    resolved_value = value
+    if resolved_value in (None, ""):
+        ref = conn.execute(
+            """
+            SELECT value
+            FROM ozon_attribute_value_cache
+            WHERE description_category_id = ?
+              AND type_id = ?
+              AND attribute_id = ?
+              AND value_id = ?
+            LIMIT 1
+            """,
+            (int(description_category_id), int(type_id), int(attribute_id), int(value_id)),
+        ).fetchone()
+        resolved_value = ref["value"] if ref else None
+
+    conn.execute(
+        """
+        INSERT INTO ozon_dictionary_overrides (
+            description_category_id,
+            type_id,
+            attribute_id,
+            raw_value,
+            normalized_raw_value,
+            value_id,
+            value,
+            comment,
+            created_at,
+            updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+        ON CONFLICT(description_category_id, type_id, attribute_id, normalized_raw_value) DO UPDATE SET
+            value_id = excluded.value_id,
+            value = excluded.value,
+            comment = excluded.comment,
+            updated_at = CURRENT_TIMESTAMP
+        """,
+        (
+            int(description_category_id),
+            int(type_id),
+            int(attribute_id),
+            raw_text,
+            normalized_raw,
+            int(value_id),
+            resolved_value,
+            comment,
+        ),
+    )
+    conn.commit()
+    return {
+        "description_category_id": int(description_category_id),
+        "type_id": int(type_id),
+        "attribute_id": int(attribute_id),
+        "raw_value": raw_text,
+        "normalized_raw_value": normalized_raw,
+        "value_id": int(value_id),
+        "value": resolved_value,
+        "comment": comment,
+    }
+
+
+def _get_dictionary_override(
+    conn: sqlite3.Connection,
+    description_category_id: int,
+    type_id: int,
+    attribute_id: int,
+    raw_value: Any,
+) -> dict[str, Any] | None:
+    normalized_raw = _normalize_override_key(raw_value)
+    if not normalized_raw:
+        return None
+    row = conn.execute(
+        """
+        SELECT value_id, value
+        FROM ozon_dictionary_overrides
+        WHERE description_category_id = ?
+          AND type_id = ?
+          AND attribute_id = ?
+          AND normalized_raw_value = ?
+        LIMIT 1
+        """,
+        (int(description_category_id), int(type_id), int(attribute_id), normalized_raw),
+    ).fetchone()
+    if not row:
+        return None
+    return {
+        "value_id": int(row["value_id"]),
+        "value": row["value"],
+        "score": 1.0,
+        "matched_by": "override",
+    }
+
+
 def _find_dictionary_candidates(
     conn: sqlite3.Connection,
     description_category_id: int,
@@ -693,6 +828,16 @@ def _find_best_dictionary_value(
     source_text = _to_scalar_string(raw_value)
     if not source_text:
         return None
+
+    override = _get_dictionary_override(
+        conn=conn,
+        description_category_id=int(description_category_id),
+        type_id=int(type_id),
+        attribute_id=int(attribute_id),
+        raw_value=source_text,
+    )
+    if override:
+        return override
 
     exact = conn.execute(
         """

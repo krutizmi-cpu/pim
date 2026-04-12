@@ -405,6 +405,38 @@ def _ensure_ozon_tables(conn: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_ozon_attr_val_value_id ON ozon_attribute_value_cache(value_id)"
     )
 
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS ozon_dictionary_overrides (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            description_category_id INTEGER NOT NULL,
+            type_id INTEGER NOT NULL,
+            attribute_id INTEGER NOT NULL,
+            raw_value TEXT NOT NULL,
+            normalized_raw_value TEXT NOT NULL,
+            value_id INTEGER NOT NULL,
+            value TEXT,
+            comment TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_ozon_dict_override_unique
+        ON ozon_dictionary_overrides(
+            description_category_id,
+            type_id,
+            attribute_id,
+            normalized_raw_value
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_ozon_dict_override_attr ON ozon_dictionary_overrides(attribute_id)"
+    )
+
 
 
 def _ensure_channel_tables(conn: sqlite3.Connection) -> None:
