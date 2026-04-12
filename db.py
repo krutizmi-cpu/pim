@@ -465,6 +465,23 @@ def _ensure_ozon_tables(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_ozon_jobs_status ON ozon_update_jobs(status)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_ozon_jobs_retry_of ON ozon_update_jobs(retry_of_job_id)")
 
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS ozon_update_job_items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            job_id INTEGER NOT NULL,
+            offer_id TEXT,
+            product_id INTEGER,
+            description_category_id INTEGER,
+            type_id INTEGER,
+            attributes_count INTEGER DEFAULT 0,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_ozon_job_items_job ON ozon_update_job_items(job_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_ozon_job_items_offer ON ozon_update_job_items(offer_id)")
+
 
 
 def _ensure_channel_tables(conn: sqlite3.Connection) -> None:

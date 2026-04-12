@@ -27,7 +27,7 @@ from services.supplier_parser import fetch_supplier_page, extract_supplier_data,
 from services.template_matching import auto_match_template_columns, apply_saved_mapping_rules, fill_template_dataframe, apply_client_validated_values, fill_template_workbook_bytes, dataframe_to_excel_bytes, detect_template_data_start_row
 from services.template_profiles import save_template_profile, list_template_profiles, get_template_profile_columns
 from services.readiness_service import analyze_template_readiness
-from services.ozon_api_service import is_configured, sync_category_tree, list_cached_categories, sync_category_attributes, list_cached_attributes, sync_attribute_dictionary_values, sync_all_category_dictionary_values, list_cached_attribute_values, import_cached_attributes_to_pim, suggest_mappings_for_cached_attributes, save_suggested_mappings, analyze_product_ozon_coverage, ensure_ozon_master_attributes, build_product_ozon_payload, materialize_product_ozon_attributes, preview_product_ozon_dictionary_gaps, build_product_ozon_api_attributes, build_bulk_ozon_api_payloads, build_ozon_attributes_update_request, submit_ozon_attributes_update, list_ozon_update_jobs, get_ozon_update_job, retry_ozon_update_job, save_dictionary_override, list_dictionary_overrides, delete_dictionary_override
+from services.ozon_api_service import is_configured, sync_category_tree, list_cached_categories, sync_category_attributes, list_cached_attributes, sync_attribute_dictionary_values, sync_all_category_dictionary_values, list_cached_attribute_values, import_cached_attributes_to_pim, suggest_mappings_for_cached_attributes, save_suggested_mappings, analyze_product_ozon_coverage, ensure_ozon_master_attributes, build_product_ozon_payload, materialize_product_ozon_attributes, preview_product_ozon_dictionary_gaps, build_product_ozon_api_attributes, build_bulk_ozon_api_payloads, build_ozon_attributes_update_request, submit_ozon_attributes_update, list_ozon_update_jobs, get_ozon_update_job, retry_ozon_update_job, list_ozon_update_job_items, save_dictionary_override, list_dictionary_overrides, delete_dictionary_override
 
 st.set_page_config(page_title="PIM", page_icon="📦", layout="wide")
 OZON_OFFER_ID_OPTIONS = ["article", "internal_article", "supplier_article"]
@@ -2186,27 +2186,13 @@ def show_ozon_tab():
                                             else:
                                                 st.error(retry_result.get("message") or "Не удалось повторить отправку job")
                                             st.rerun()
-                                    try:
-                                        job_request = json.loads(job_item.get("request_json") or "{}")
-                                    except Exception:
-                                        job_request = {}
+                                    job_items = list_ozon_update_job_items(conn, int(selected_job_id), limit=10000)
                                     try:
                                         job_response = json.loads(job_item.get("response_json") or "{}")
                                     except Exception:
                                         job_response = {}
-                                    job_items = job_request.get("items") if isinstance(job_request, dict) else []
-                                    if isinstance(job_items, list) and job_items:
-                                        job_items_df = pd.DataFrame(
-                                            [
-                                                {
-                                                    "offer_id": item.get("offer_id"),
-                                                    "description_category_id": item.get("description_category_id"),
-                                                    "type_id": item.get("type_id"),
-                                                    "attributes_count": len(item.get("attributes") or []),
-                                                }
-                                                for item in job_items
-                                            ]
-                                        )
+                                    if job_items:
+                                        job_items_df = pd.DataFrame(job_items)
                                         st.download_button(
                                             "Скачать selected job items (Excel)",
                                             data=dataframe_to_excel_bytes(job_items_df, sheet_name="job_items"),
