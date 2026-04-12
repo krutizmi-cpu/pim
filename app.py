@@ -2224,6 +2224,46 @@ def show_ozon_tab():
                             if jobs_df.empty:
                                 st.info("По текущему фильтру jobs не найдено.")
                             else:
+                                retry_all_col1, retry_all_col2 = st.columns([1, 2])
+                                with retry_all_col1:
+                                    if st.button(
+                                        "Повторить все jobs из фильтра",
+                                        disabled=(not configured),
+                                        key=f"ozon_retry_filtered_jobs_{selected_product_id}",
+                                    ):
+                                        filtered_ids = [int(jid) for jid in jobs_df["id"].tolist()]
+                                        progress = st.progress(0)
+                                        ok_count = 0
+                                        err_rows = []
+                                        for i, jid in enumerate(filtered_ids, start=1):
+                                            res = retry_ozon_update_job(
+                                                conn=conn,
+                                                job_id=int(jid),
+                                                client_id=client_id or None,
+                                                api_key=api_key or None,
+                                            )
+                                            if res.get("ok"):
+                                                ok_count += 1
+                                            else:
+                                                err_rows.append({"job_id": int(jid), "error": res.get("message") or "Ошибка"})
+                                            progress.progress(i / len(filtered_ids))
+                                        st.success(
+                                            f"Retry по фильтру завершён. Успешно: {ok_count}, ошибок: {len(err_rows)}."
+                                        )
+                                        if err_rows:
+                                            err_df = pd.DataFrame(err_rows)
+                                            st.dataframe(err_df, use_container_width=True, hide_index=True)
+                                            st.download_button(
+                                                "Скачать ошибки retry по фильтру (Excel)",
+                                                data=dataframe_to_excel_bytes(err_df, sheet_name="retry_errors"),
+                                                file_name="ozon_retry_filtered_errors.xlsx",
+                                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                                key=f"ozon_retry_filtered_errors_{selected_product_id}",
+                                            )
+                                        st.rerun()
+                                with retry_all_col2:
+                                    st.caption("Кнопка повторяет все jobs, которые видны после текущего фильтра статуса.")
+
                                 selected_job_id = st.selectbox(
                                     "Job для действий",
                                     options=[int(jid) for jid in jobs_df["id"].tolist()],
