@@ -5,6 +5,7 @@ from io import BytesIO
 from pathlib import Path
 
 import pandas as pd
+import sqlite3
 import streamlit as st
 from openpyxl import load_workbook
 
@@ -659,16 +660,26 @@ def show_import_tab():
 
         if st.button("Импортировать", type="primary"):
             conn = get_db()
-            if import_mode == "Ручной выбор листа и строки заголовка":
-                result = import_catalog_from_excel(
-                    conn,
-                    temp_path,
-                    sheet_name=selected_sheet,
-                    header_row=selected_header_row_zero,
-                )
-            else:
-                result = import_catalog_from_excel(conn, temp_path)
-            batch_df = load_products(conn, limit=1000, import_batch_id=result.batch_id)
+            try:
+                if import_mode == "Ручной выбор листа и строки заголовка":
+                    result = import_catalog_from_excel(
+                        conn,
+                        temp_path,
+                        sheet_name=selected_sheet,
+                        header_row=selected_header_row_zero,
+                    )
+                else:
+                    result = import_catalog_from_excel(conn, temp_path)
+                batch_df = load_products(conn, limit=1000, import_batch_id=result.batch_id)
+            except sqlite3.OperationalError as e:
+                conn.close()
+                st.error(f"Ошибка базы при импорте: {e}")
+                st.info("Попробуй автоопределение или выбери другой лист/строку заголовка. Если ошибка повторяется, база требует миграции.")
+                return
+            except Exception as e:
+                conn.close()
+                st.error(f"Ошибка импорта: {e}")
+                return
             conn.close()
             st.session_state["last_import_batch_id"] = result.batch_id
             st.success(

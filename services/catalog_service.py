@@ -350,6 +350,126 @@ def _apply_enrichment(
     return product_data
 
 
+def _product_columns(conn: sqlite3.Connection) -> set[str]:
+    rows = conn.execute("PRAGMA table_info(products)").fetchall()
+    cols: set[str] = set()
+    for row in rows:
+        if isinstance(row, sqlite3.Row):
+            cols.add(str(row["name"]))
+        else:
+            cols.add(str(row[1]))
+    return cols
+
+
+def _update_product_dynamic(
+    conn: sqlite3.Connection,
+    article_key: str,
+    product_data: dict[str, Any],
+    now: str,
+    batch_id: str,
+    cols: set[str],
+) -> None:
+    update_order = [
+        "name",
+        "barcode",
+        "category",
+        "supplier_url",
+        "weight",
+        "length",
+        "width",
+        "height",
+        "package_length",
+        "package_width",
+        "package_height",
+        "gross_weight",
+        "image_url",
+        "description",
+        "normalized_name",
+        "supplier_name",
+        "supplier_article",
+        "internal_article",
+        "subcategory",
+        "wheel_diameter_inch",
+        "enrichment_status",
+        "enrichment_comment",
+    ]
+    assignments: list[str] = []
+    params: list[Any] = []
+    for field in update_order:
+        if field in cols:
+            assignments.append(f"{field} = ?")
+            params.append(product_data.get(field))
+    if "updated_at" in cols:
+        assignments.append("updated_at = ?")
+        params.append(now)
+    if "import_batch_id" in cols:
+        assignments.append("import_batch_id = ?")
+        params.append(batch_id)
+    if not assignments:
+        return
+    params.append(article_key)
+    conn.execute(
+        f"UPDATE products SET {', '.join(assignments)} WHERE article = ?",
+        tuple(params),
+    )
+
+
+def _insert_product_dynamic(
+    conn: sqlite3.Connection,
+    product_data: dict[str, Any],
+    now: str,
+    batch_id: str,
+    cols: set[str],
+) -> sqlite3.Cursor:
+    insert_order = [
+        "article",
+        "name",
+        "barcode",
+        "category",
+        "supplier_url",
+        "weight",
+        "length",
+        "width",
+        "height",
+        "package_length",
+        "package_width",
+        "package_height",
+        "gross_weight",
+        "image_url",
+        "description",
+        "normalized_name",
+        "enrichment_status",
+        "enrichment_comment",
+        "duplicate_status",
+        "supplier_name",
+        "supplier_article",
+        "internal_article",
+        "subcategory",
+        "wheel_diameter_inch",
+        "created_at",
+        "updated_at",
+        "import_batch_id",
+    ]
+    fields: list[str] = []
+    values: list[Any] = []
+    for field in insert_order:
+        if field not in cols:
+            continue
+        fields.append(field)
+        if field == "duplicate_status":
+            values.append(None)
+        elif field in {"created_at", "updated_at"}:
+            values.append(now)
+        elif field == "import_batch_id":
+            values.append(batch_id)
+        else:
+            values.append(product_data.get(field))
+
+    placeholders = ", ".join(["?"] * len(fields))
+    sql = f"INSERT INTO products ({', '.join(fields)}) VALUES ({placeholders})"
+    return conn.execute(sql, tuple(values))
+
+
 def import_catalog_from_excel(
     conn: sqlite3.Connection,
     excel_path: Path,
@@ -359,6 +479,7 @@ def import_catalog_from_excel(
     init_db(conn)
     df = _read_excel_smart(excel_path, sheet_name=sheet_name, header_row=header_row)
     normalized = normalize_columns(df)
+    cols = _product_columns(conn)
 
     created = 0
     updated = 0
@@ -391,129 +512,23 @@ def import_catalog_from_excel(
         ).fetchone()
 
         if exists:
-            conn.execute(
-                """
-                UPDATE products
-                SET
-                    name = ?,
-                    barcode = ?,
-                    category = ?,
-                    supplier_url = ?,
-                    weight = ?,
-                    length = ?,
-                    width = ?,
-                    height = ?,
-                    package_length = ?,
-                    package_width = ?,
-                    package_height = ?,
-                    gross_weight = ?,
-                    image_url = ?,
-                    description = ?,
-                    normalized_name = ?,
-                    supplier_name = ?,
-                    supplier_article = ?,
-                    internal_article = ?,
-                    subcategory = ?,
-                    wheel_diameter_inch = ?,
-                    enrichment_status = ?,
-                    enrichment_comment = ?,
-                    updated_at = ?,
-                    import_batch_id = ?
-                WHERE article = ?
-                """,
-                (
-                    product_data["name"],
-                    product_data["barcode"],
-                    product_data["category"],
-                    product_data["supplier_url"],
-                    product_data["weight"],
-                    product_data["length"],
-                    product_data["width"],
-                    product_data["height"],
-                    product_data["package_length"],
-                    product_data["package_width"],
-                    product_data["package_height"],
-                    product_data["gross_weight"],
-                    product_data["image_url"],
-                    product_data["description"],
-                    product_data["normalized_name"],
-                    product_data["supplier_name"],
-                    product_data["supplier_article"],
-                    product_data["internal_article"],
-                    product_data["subcategory"],
-                    product_data["wheel_diameter_inch"],
-                    product_data["enrichment_status"],
-                    product_data["enrichment_comment"],
-                    now,
-                    batch_id,
-                    article_key,
-                ),
+            _update_product_dynamic(
+                conn=conn,
+                article_key=article_key,
+                product_data=product_data,
+                now=now,
+                batch_id=batch_id,
+                cols=cols,
             )
             product_id = int(exists["id"])
             updated += 1
         else:
-            cur = conn.execute(
-                """
-                INSERT INTO products (
-                    article,
-                    name,
-                    barcode,
-                    category,
-                    supplier_url,
-                    weight,
-                    length,
-                    width,
-                    height,
-                    package_length,
-                    package_width,
-                    package_height,
-                    gross_weight,
-                    image_url,
-                    description,
-                    normalized_name,
-                    enrichment_status,
-                    enrichment_comment,
-                    duplicate_status,
-                    supplier_name,
-                    supplier_article,
-                    internal_article,
-                    subcategory,
-                    wheel_diameter_inch,
-                    created_at,
-                    updated_at,
-                    import_batch_id
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    product_data["article"],
-                    product_data["name"],
-                    product_data["barcode"],
-                    product_data["category"],
-                    product_data["supplier_url"],
-                    product_data["weight"],
-                    product_data["length"],
-                    product_data["width"],
-                    product_data["height"],
-                    product_data["package_length"],
-                    product_data["package_width"],
-                    product_data["package_height"],
-                    product_data["gross_weight"],
-                    product_data["image_url"],
-                    product_data["description"],
-                    product_data["normalized_name"],
-                    product_data["enrichment_status"],
-                    product_data["enrichment_comment"],
-                    None,
-                    product_data["supplier_name"],
-                    product_data["supplier_article"],
-                    product_data["internal_article"],
-                    product_data["subcategory"],
-                    product_data["wheel_diameter_inch"],
-                    now,
-                    now,
-                    batch_id,
-                ),
+            cur = _insert_product_dynamic(
+                conn=conn,
+                product_data=product_data,
+                now=now,
+                batch_id=batch_id,
+                cols=cols,
             )
             product_id = int(cur.lastrowid)
             created += 1

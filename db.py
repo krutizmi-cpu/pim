@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+import tempfile
 from pathlib import Path
 
 DB_PATH = Path("data/catalog.db")
@@ -48,10 +49,32 @@ REQUIRED_PRODUCT_COLUMNS: dict[str, str] = {
 
 
 def get_connection(db_path: Path = DB_PATH) -> sqlite3.Connection:
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(db_path, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    return conn
+    primary_path = Path(db_path)
+    primary_path.parent.mkdir(parents=True, exist_ok=True)
+
+    def _connect(path: Path) -> sqlite3.Connection:
+        conn_local = sqlite3.connect(path, check_same_thread=False, timeout=30.0)
+        conn_local.row_factory = sqlite3.Row
+        return conn_local
+
+    conn = _connect(primary_path)
+    try:
+        # Fast writeability probe for Streamlit Cloud / read-only mount cases.
+        conn.execute("CREATE TABLE IF NOT EXISTS _pim_rw_probe (id INTEGER PRIMARY KEY)")
+        conn.commit()
+        return conn
+    except sqlite3.OperationalError as e:
+        msg = str(e).lower()
+        if "readonly" not in msg and "read-only" not in msg:
+            conn.close()
+            raise
+        conn.close()
+        fallback_path = Path(tempfile.gettempdir()) / "pim" / "catalog.db"
+        fallback_path.parent.mkdir(parents=True, exist_ok=True)
+        fallback = _connect(fallback_path)
+        fallback.execute("CREATE TABLE IF NOT EXISTS _pim_rw_probe (id INTEGER PRIMARY KEY)")
+        fallback.commit()
+        return fallback
 
 
 def _table_columns(conn: sqlite3.Connection, table_name: str) -> set[str]:
