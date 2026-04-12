@@ -1719,6 +1719,48 @@ def show_ozon_tab():
                                         f"Массовое заполнение завершено. Записано: {total_applied}, "
                                         f"пустых пропущено: {total_skipped_empty}, dictionary без матчинга: {total_skipped_dict}."
                                     )
+                        if st.button("Сформировать dictionary gaps по выбранным (Excel)", key=f"ozon_bulk_gap_export_btn_{selected_product_id}"):
+                            if not selected_product_ids:
+                                st.warning("Выбери хотя бы один товар.")
+                            else:
+                                gap_export_rows = []
+                                progress = st.progress(0)
+                                for i, pid in enumerate(selected_product_ids, start=1):
+                                    product_row = next((r for r in product_rows if int(r["id"]) == int(pid)), None)
+                                    gap_rows = preview_product_ozon_dictionary_gaps(
+                                        conn=conn,
+                                        product_id=int(pid),
+                                        description_category_id=int(selected_row["description_category_id"]),
+                                        type_id=int(selected_row["type_id"]),
+                                        top_n=3,
+                                        dictionary_min_score=float(dictionary_min_score),
+                                    )
+                                    for gap in gap_rows:
+                                        gap_export_rows.append(
+                                            {
+                                                "product_id": int(pid),
+                                                "article": product_row["article"] if product_row else None,
+                                                "name": product_row["name"] if product_row else None,
+                                                "attribute_id": gap.get("attribute_id"),
+                                                "attribute_name": gap.get("name"),
+                                                "source_name": gap.get("source_name"),
+                                                "raw_value": gap.get("raw_value"),
+                                                "suggestion_values": gap.get("suggestion_values"),
+                                            }
+                                        )
+                                    progress.progress(i / len(selected_product_ids))
+                                if gap_export_rows:
+                                    gap_export_df = pd.DataFrame(gap_export_rows)
+                                    st.dataframe(gap_export_df, use_container_width=True, hide_index=True)
+                                    st.download_button(
+                                        "Скачать dictionary gaps (Excel)",
+                                        data=dataframe_to_excel_bytes(gap_export_df, sheet_name="dictionary_gaps"),
+                                        file_name=f"ozon_dictionary_gaps_{int(selected_row['description_category_id'])}_{int(selected_row['type_id'])}.xlsx",
+                                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                        key=f"ozon_bulk_gap_export_{selected_product_id}",
+                                    )
+                                else:
+                                    st.success("Dictionary gaps по выбранным товарам не найдено.")
 
                         payload_preview = build_product_ozon_api_attributes(
                             conn,
