@@ -4,6 +4,7 @@ import json
 from io import BytesIO
 import math
 from pathlib import Path
+from urllib.parse import quote
 
 import pandas as pd
 import sqlite3
@@ -105,6 +106,136 @@ def list_catalog_categories(conn) -> list[str]:
         """
     ).fetchall()
     return [str(r["value"]) for r in rows if r["value"]]
+
+
+def _is_blank_value(value: object) -> bool:
+    if value is None:
+        return True
+    text = str(value).strip()
+    return text == "" or text.lower() == "none"
+
+
+def render_supplier_url(url_template: str, row: dict) -> str | None:
+    if not url_template:
+        return None
+    article = str(row.get("article") or "").strip()
+    supplier_article = str(row.get("supplier_article") or "").strip()
+    name = str(row.get("name") or "").strip()
+    category = str(row.get("category") or "").strip()
+    code = str(row.get("article") or row.get("supplier_article") or "").strip()
+    rendered = str(url_template)
+    rendered = rendered.replace("{article}", article)
+    rendered = rendered.replace("{article_q}", quote(article, safe=""))
+    rendered = rendered.replace("{supplier_article}", supplier_article)
+    rendered = rendered.replace("{supplier_article_q}", quote(supplier_article, safe=""))
+    rendered = rendered.replace("{name}", name)
+    rendered = rendered.replace("{name_q}", quote(name, safe=""))
+    rendered = rendered.replace("{category}", category)
+    rendered = rendered.replace("{category_q}", quote(category, safe=""))
+    rendered = rendered.replace("{code}", code)
+    rendered = rendered.replace("{code_q}", quote(code, safe=""))
+    rendered = rendered.strip()
+    if not rendered:
+        return None
+    if rendered.startswith("http://") or rendered.startswith("https://"):
+        return rendered
+    if "." in rendered and " " not in rendered:
+        return f"https://{rendered}"
+    return None
+
+
+def load_product_ids(
+    conn,
+    search: str = "",
+    category: str = "",
+    supplier: str = "",
+    import_batch_id: str = "",
+    parse_filter: str = "Все",
+    limit: int | None = None,
+    offset: int = 0,
+) -> list[int]:
+    where, params = _build_product_filters(
+        search=search,
+        category=category,
+        supplier=supplier,
+        import_batch_id=import_batch_id,
+        parse_filter=parse_filter,
+    )
+    sql = "SELECT id FROM products"
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY id DESC"
+    if limit is not None:
+        sql += " LIMIT ? OFFSET ?"
+        params.extend([int(limit), int(offset)])
+    rows = conn.execute(sql, params).fetchall()
+    return [int(r["id"]) for r in rows]
+
+
+def apply_mass_product_updates(
+    conn,
+    product_ids: list[int],
+    updates: dict[str, str],
+    supplier_url_template: str | None = None,
+    only_empty: bool = False,
+) -> dict:
+    if not product_ids:
+        return {"updated_products": 0, "updated_fields": 0}
+    tracked_fields = ["supplier_name", "supplier_url", "category", "base_category", "subcategory", "brand"]
+    updated_products = 0
+    updated_fields = 0
+    for pid in product_ids:
+        row = conn.execute(
+            """
+            SELECT id, article, supplier_article, name, category, supplier_name, supplier_url, base_category, subcategory, brand
+            FROM products
+            WHERE id = ?
+            LIMIT 1
+            """,
+            (int(pid),),
+        ).fetchone()
+        if not row:
+            continue
+        current = dict(row)
+        row_updates: dict[str, str] = {}
+        for field, value in updates.items():
+            if value is None:
+                continue
+            if only_empty and not _is_blank_value(current.get(field)):
+                continue
+            row_updates[field] = str(value).strip()
+
+        if supplier_url_template:
+            generated = render_supplier_url(supplier_url_template, current)
+            if generated:
+                if (not only_empty) or _is_blank_value(current.get("supplier_url")):
+                    row_updates["supplier_url"] = generated
+
+        if not row_updates:
+            continue
+
+        set_clause = ", ".join([f"{k} = ?" for k in row_updates.keys()])
+        params = list(row_updates.values()) + [int(pid)]
+        conn.execute(
+            f"UPDATE products SET {set_clause}, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            params,
+        )
+        for field_name, value in row_updates.items():
+            if field_name in tracked_fields:
+                save_field_source(
+                    conn=conn,
+                    product_id=int(pid),
+                    field_name=field_name,
+                    source_type="manual",
+                    source_value_raw=value,
+                    source_url=None,
+                    confidence=1.0,
+                    is_manual=True,
+                )
+                updated_fields += 1
+        updated_products += 1
+    conn.commit()
+    return {"updated_products": updated_products, "updated_fields": updated_fields}
 
 
 def render_section_help() -> None:
@@ -937,6 +1068,15 @@ def show_import_tab():
                                 f"привязано {ozon_match_result['assigned']}, пропущено {ozon_match_result['skipped']}"
                             )
                 batch_df = load_products(conn, limit=1000, import_batch_id=result.batch_id)
+                missing_supplier_count = conn.execute(
+                    """
+                    SELECT COUNT(*) AS c
+                    FROM products
+                    WHERE import_batch_id = ?
+                      AND (supplier_name IS NULL OR TRIM(supplier_name) = '')
+                    """,
+                    (result.batch_id,),
+                ).fetchone()["c"]
             except sqlite3.OperationalError as e:
                 conn.close()
                 st.error(f"Ошибка базы при импорте: {e}")
@@ -951,6 +1091,11 @@ def show_import_tab():
             st.success(
                 f"Импорт завершён. Всего: {result.imported}, создано: {result.created}, обновлено: {result.updated}, дублей: {len(result.duplicates)}"
             )
+            if int(missing_supplier_count or 0) > 0:
+                st.warning(
+                    f"У {int(missing_supplier_count)} товаров в этой партии не назначен поставщик. "
+                    "Назначь его массово во вкладке Каталог."
+                )
             c1, c2, c3, c4 = st.columns(4)
             c1.metric("Импортировано", int(result.imported))
             c2.metric("Создано", int(result.created))
@@ -986,6 +1131,8 @@ def show_catalog_tab():
 
     category_values = list_catalog_categories(conn)
     supplier_values = list_distinct_values(conn, "supplier_name")
+    supplier_profile_values = [str(p["supplier_name"]) for p in list_supplier_profiles(conn, only_active=True)]
+    supplier_values = sorted(set(supplier_values + supplier_profile_values))
     c1, c2, c3, c4, c5, c6 = st.columns([2, 1, 1, 1, 1, 1])
     with c1:
         search = st.text_input("Поиск", placeholder="Название / артикул / штрихкод")
@@ -1112,6 +1259,108 @@ def show_catalog_tab():
 
     if selected_id:
         st.session_state["selected_product_id"] = int(selected_id)
+
+    with st.expander("Массовое изменение данных", expanded=False):
+        st.caption("Здесь можно массово назначить поставщика, URL, категории и бренд.")
+        mm1, mm2, mm3 = st.columns(3)
+        with mm1:
+            scope = st.selectbox(
+                "Область применения",
+                options=["Текущая страница", "Вся выборка по фильтру"],
+                key="mass_edit_scope",
+                help="Текущая страница: только видимые товары. Вся выборка: все товары по текущим фильтрам.",
+            )
+            only_empty = st.checkbox(
+                "Заполнять только пустые поля",
+                value=True,
+                key="mass_edit_only_empty",
+                help="Если включено, заполнит только пустые значения.",
+            )
+        with mm2:
+            mass_supplier = st.selectbox(
+                "Поставщик",
+                options=[""] + supplier_values,
+                index=0,
+                key="mass_edit_supplier",
+                help="Назначить поставщика выбранным товарам.",
+            )
+            mass_category = st.selectbox(
+                "Категория",
+                options=[""] + category_values,
+                index=0,
+                key="mass_edit_category",
+            )
+            mass_base_category = st.selectbox(
+                "Базовая категория",
+                options=[""] + category_values,
+                index=0,
+                key="mass_edit_base_category",
+            )
+            mass_subcategory = st.selectbox(
+                "Подкатегория",
+                options=[""] + category_values,
+                index=0,
+                key="mass_edit_subcategory",
+            )
+        with mm3:
+            mass_brand = st.text_input("Бренд", value="", key="mass_edit_brand")
+            profile_for_url = st.selectbox(
+                "Профиль URL поставщика",
+                options=[""] + supplier_profile_values,
+                index=0,
+                key="mass_edit_profile_for_url",
+                help="Можно выбрать профиль, чтобы автоматически подставить URL template.",
+            )
+            profile_map = {p["supplier_name"]: p for p in list_supplier_profiles(conn, only_active=True)}
+            mass_supplier_url_template = st.text_input(
+                "URL template",
+                value=st.session_state.get("mass_edit_supplier_url_template", ""),
+                key="mass_edit_supplier_url_template",
+                help="Поддержка плейсхолдеров: {article}, {supplier_article}, {code}, {name} и *_q.",
+            )
+            if st.button("Подставить URL template из профиля", key="mass_edit_apply_profile_template"):
+                if profile_for_url and profile_for_url in profile_map:
+                    st.session_state["mass_edit_supplier_url_template"] = profile_map[profile_for_url].get("url_template") or ""
+                    st.rerun()
+
+        apply_mass = st.button(
+            "Применить массовые изменения",
+            type="primary",
+            help="Применить изменения к выбранной области товаров.",
+            key="mass_edit_apply_btn",
+        )
+        if apply_mass:
+            if scope == "Текущая страница":
+                target_ids = [int(x) for x in ids]
+            else:
+                target_ids = load_product_ids(
+                    conn,
+                    search=search,
+                    category=category,
+                    supplier=supplier,
+                    import_batch_id=batch_id or "",
+                    parse_filter=parse_filter,
+                    limit=None,
+                    offset=0,
+                )
+            updates = {
+                "supplier_name": mass_supplier.strip() if mass_supplier else None,
+                "category": mass_category.strip() if mass_category else None,
+                "base_category": mass_base_category.strip() if mass_base_category else None,
+                "subcategory": mass_subcategory.strip() if mass_subcategory else None,
+                "brand": mass_brand.strip() if mass_brand else None,
+            }
+            result = apply_mass_product_updates(
+                conn=conn,
+                product_ids=target_ids,
+                updates=updates,
+                supplier_url_template=mass_supplier_url_template.strip() or None,
+                only_empty=bool(only_empty),
+            )
+            st.success(
+                f"Обновлено товаров: {result['updated_products']}, обновлено полей: {result['updated_fields']}"
+            )
+            st.rerun()
 
     conn.close()
 
