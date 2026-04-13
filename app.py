@@ -1831,7 +1831,7 @@ def show_template_tab():
     with t1:
         channel_code = st.text_input("Код клиента / канала", value="onlinetrade", key="template_channel_code")
     with t2:
-        known_categories = [""] + sorted([str(x) for x in product_df["category"].dropna().unique().tolist()]) if "product_df" in locals() else [""]
+        known_categories = [""] + list_catalog_categories(conn)
         category_code = st.selectbox(
             "Категория шаблона/профиля (из базы)",
             options=known_categories,
