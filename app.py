@@ -75,6 +75,73 @@ def to_attribute_code(name: str) -> str:
     return clean[:120]
 
 
+def list_distinct_values(conn, column_name: str) -> list[str]:
+    rows = conn.execute(
+        f"""
+        SELECT DISTINCT TRIM({column_name}) AS value
+        FROM products
+        WHERE {column_name} IS NOT NULL
+          AND TRIM({column_name}) <> ''
+        ORDER BY value
+        """
+    ).fetchall()
+    return [str(r["value"]) for r in rows if r["value"]]
+
+
+def list_catalog_categories(conn) -> list[str]:
+    rows = conn.execute(
+        """
+        SELECT DISTINCT TRIM(value) AS value
+        FROM (
+            SELECT category AS value FROM products
+            UNION ALL
+            SELECT base_category AS value FROM products
+            UNION ALL
+            SELECT subcategory AS value FROM products
+        )
+        WHERE value IS NOT NULL
+          AND TRIM(value) <> ''
+        ORDER BY value
+        """
+    ).fetchall()
+    return [str(r["value"]) for r in rows if r["value"]]
+
+
+def render_section_help() -> None:
+    with st.expander("Инструкция по разделам и кнопкам", expanded=False):
+        st.markdown(
+            """
+**Импорт**
+- `Скачать шаблон импорта поставщика`: скачать эталонный Excel для загрузки каталога.
+- `Профиль поставщика`: выбрать поставщика из базы.
+- `Сохранить профиль`: сохранить/обновить поставщика, сайт и URL-шаблон.
+- `Импортировать`: загрузить файл в мастер-каталог.
+
+**Каталог**
+- `Поиск`: быстрый поиск по названию/артикулу/штрихкоду.
+- `Категория` / `Поставщик`: фильтры из базы (выпадающие меню).
+- `Размер страницы` / `Страница` / `◀ Назад` / `Вперед ▶`: постраничная навигация.
+- `Обновить дубли`: пересчитать дубли по текущей странице.
+- `Обогатить поставщика`: массовый парсинг supplier_url по текущей странице.
+- `Автопривязать Ozon категории`: назначить эталонную Ozon-категорию.
+
+**Карточка**
+- `Спарсить поставщика`: мягкое обогащение (не перетирает сильные значения).
+- `Перезаполнить из поставщика`: жесткое обогащение с перезаписью.
+- `Подобрать Ozon категорию`: автоподбор эталонной Ozon-категории.
+- `Перепривязать Ozon категорию (force)`: повторный подбор с перезаписью.
+- `Сохранить карточку`: сохранить ручные изменения в мастер-карточке.
+
+**Клиентский шаблон**
+- `Сохранить mapping rules`: сохранить правила соответствия колонок.
+- `Сохранить профиль шаблона`: сохранить тип шаблона клиента для повторной выгрузки.
+- `Добавить несматченные в master-атрибуты`: расширить мастер-карточку новыми полями.
+- `Подтвердить значения как client_validated`: зафиксировать проверенные значения.
+- `Скачать заполненный шаблон`: выгрузка результата в формате клиента.
+            """
+        )
+
+
 def _build_product_filters(
     search: str = "",
     category: str = "",
@@ -91,11 +158,11 @@ def _build_product_filters(
         params.extend([s, s, s, s])
 
     if category:
-        where.append("(category = ? OR base_category = ?)")
-        params.extend([category, category])
+        where.append("(LOWER(TRIM(category)) = LOWER(TRIM(?)) OR LOWER(TRIM(base_category)) = LOWER(TRIM(?)) OR LOWER(TRIM(subcategory)) = LOWER(TRIM(?)))")
+        params.extend([category, category, category])
 
     if supplier:
-        where.append("supplier_name = ?")
+        where.append("LOWER(TRIM(supplier_name)) = LOWER(TRIM(?))")
         params.append(supplier)
 
     if import_batch_id:
@@ -691,6 +758,15 @@ def render_template_readiness(filled_df: pd.DataFrame, manual_rows: list[dict]) 
 def show_import_tab():
     st.subheader("Импорт каталога")
     st.caption("Загрузи Excel поставщика или общий каталог, система создаст или обновит мастер-товары и покажет последнюю партию отдельно.")
+    with st.expander("Инструкция по кнопкам раздела Импорт", expanded=False):
+        st.markdown(
+            """
+- `Скачать шаблон импорта поставщика (Excel)`: эталонный формат для поставщиков.
+- `Сохранить профиль`: записывает профиль поставщика (имя, сайт, URL template) в БД.
+- `Импортировать`: запускает импорт файла в мастер-каталог.
+- `После импорта автоматически привязывать товары к Ozon категориям`: применяет Ozon-эталон сразу после загрузки.
+            """
+        )
     st.download_button(
         "Скачать шаблон импорта поставщика (Excel)",
         data=build_supplier_catalog_template_excel(),
@@ -700,6 +776,7 @@ def show_import_tab():
     )
     profiles_conn = get_db()
     profiles = list_supplier_profiles(profiles_conn, only_active=True)
+    existing_suppliers = list_distinct_values(profiles_conn, "supplier_name")
     profiles_conn.close()
     profile_map = {p["supplier_name"]: p for p in profiles}
     selected_profile_name = st.selectbox(
@@ -717,11 +794,14 @@ def show_import_tab():
     uploaded = st.file_uploader("Excel файл", type=["xlsx", "xls"])
     s1, s2 = st.columns(2)
     with s1:
-        default_supplier_name = st.text_input(
-            "Поставщик по умолчанию",
-            value=st.session_state.get("import_default_supplier_name", ""),
-            placeholder="Например: Rockbros / SKS",
-            help="Если в файле нет колонки Поставщик, это значение будет проставлено автоматически.",
+        supplier_options = [""] + sorted(set(existing_suppliers + list(profile_map.keys())))
+        session_supplier = st.session_state.get("import_default_supplier_name", "")
+        supplier_index = supplier_options.index(session_supplier) if session_supplier in supplier_options else 0
+        default_supplier_name = st.selectbox(
+            "Поставщик по умолчанию (из базы)",
+            options=supplier_options,
+            index=supplier_index,
+            help="Если в файле нет колонки Поставщик, будет выбран этот поставщик из базы.",
         )
         st.session_state["import_default_supplier_name"] = default_supplier_name
     with s2:
@@ -739,7 +819,7 @@ def show_import_tab():
         with sp2:
             profile_base_url = st.text_input("Базовый URL", value="", key="supplier_profile_base_url")
         with sp3:
-            save_profile_btn = st.button("Сохранить профиль")
+            save_profile_btn = st.button("Сохранить профиль", help="Сохранить/обновить профиль поставщика в базе")
         profile_url_template = st.text_input(
             "URL template профиля",
             value=default_supplier_url_template or "",
@@ -822,7 +902,7 @@ def show_import_tab():
         else:
             st.warning(f"Не удалось прочитать структуру Excel: {excel_info.get('message')}")
 
-        if st.button("Импортировать", type="primary"):
+        if st.button("Импортировать", type="primary", help="Импортировать текущий Excel в мастер-каталог"):
             conn = get_db()
             try:
                 if import_mode == "Ручной выбор листа и строки заголовка":
@@ -891,20 +971,36 @@ def show_catalog_tab():
     conn = get_db()
     st.subheader("Каталог")
     st.caption("Здесь быстрый контроль по каталогу: поиск, последняя загрузка, статус supplier enrichment и переход в карточку товара.")
+    st.info("Фильтры `Категория` и `Поставщик` берутся из базы и выбираются только из выпадающих списков.")
+    with st.expander("Инструкция по кнопкам раздела Каталог", expanded=False):
+        st.markdown(
+            """
+- `◀ Назад` / `Вперед ▶`: постраничный переход по каталогу.
+- `Скачать текущую страницу Excel`: выгружает только отображаемую страницу.
+- `Обновить дубли по текущей выборке`: пересчет дублей по текущей странице.
+- `Обогатить поставщика по текущей странице`: парсинг supplier_url по текущей странице.
+- `Автопривязать Ozon категории`: автоподбор Ozon категории.
+- `Перепривязать Ozon категории (force)`: автоподбор с перезаписью.
+            """
+        )
 
+    category_values = list_catalog_categories(conn)
+    supplier_values = list_distinct_values(conn, "supplier_name")
     c1, c2, c3, c4, c5, c6 = st.columns([2, 1, 1, 1, 1, 1])
     with c1:
         search = st.text_input("Поиск", placeholder="Название / артикул / штрихкод")
     with c2:
-        category = st.text_input("Категория")
+        category_option = st.selectbox("Категория", options=["Все"] + category_values, index=0)
     with c3:
-        supplier = st.text_input("Поставщик")
+        supplier_option = st.selectbox("Поставщик", options=["Все"] + supplier_values, index=0)
     with c4:
         page_size = st.selectbox("Размер страницы", options=[50, 100, 200, 500], index=1)
     with c5:
         only_last_batch = st.checkbox("Только последняя загрузка", value=False)
     with c6:
         parse_filter = st.selectbox("Парсинг", ["Все", "Есть supplier_url", "Не парсено", "Ошибка", "Успех"], index=0)
+    category = "" if category_option == "Все" else category_option
+    supplier = "" if supplier_option == "Все" else supplier_option
 
     batch_id = st.session_state.get("last_import_batch_id") if only_last_batch else ""
     total_rows = count_products(
@@ -920,13 +1016,21 @@ def show_catalog_tab():
     current_page = int(st.session_state.get("catalog_page", 1))
     if current_page > total_pages:
         current_page = 1
-    p1, p2, p3 = st.columns([1, 1, 2])
+    p1, p2, p3, p4, p5 = st.columns([1, 1, 2, 1, 1])
     with p1:
         page = st.selectbox("Страница", options=page_options, index=page_options.index(current_page), key="catalog_page")
     with p2:
         st.metric("Всего страниц", total_pages)
     with p3:
         st.caption(f"Всего товаров по фильтру: {total_rows}")
+    with p4:
+        if st.button("◀ Назад", disabled=int(page) <= 1, help="Перейти на предыдущую страницу каталога"):
+            st.session_state["catalog_page"] = int(page) - 1
+            st.rerun()
+    with p5:
+        if st.button("Вперед ▶", disabled=int(page) >= total_pages, help="Перейти на следующую страницу каталога"):
+            st.session_state["catalog_page"] = int(page) + 1
+            st.rerun()
     offset = (int(page) - 1) * int(page_size)
     df = load_products(
         conn,
@@ -967,7 +1071,7 @@ def show_catalog_tab():
 
     b1, b2 = st.columns(2)
     with b1:
-        if st.button("Обновить дубли по текущей выборке"):
+        if st.button("Обновить дубли по текущей выборке", help="Пересчитать кандидатов дублей только для товаров на текущей странице"):
             total = 0
             progress = st.progress(0)
             for i, pid in enumerate(ids, start=1):
@@ -976,7 +1080,7 @@ def show_catalog_tab():
                 progress.progress(i / len(ids))
             st.success(f"Проверка дублей завершена: {total} товаров")
     with b2:
-        if st.button("Обогатить поставщика по текущей странице"):
+        if st.button("Обогатить поставщика по текущей странице", help="Запустить supplier parsing для товаров текущей страницы, где заполнен supplier_url"):
             total = 0
             progress = st.progress(0)
             for i, pid in enumerate(ids, start=1):
@@ -988,7 +1092,7 @@ def show_catalog_tab():
             st.success(f"Обогащение поставщика завершено: обработано {total} товаров")
     cextra1, cextra2 = st.columns(2)
     with cextra1:
-        if st.button("Автопривязать Ozon категории (текущая страница)"):
+        if st.button("Автопривязать Ozon категории (текущая страница)", help="Автоподбор эталонной Ozon категории для товаров этой страницы"):
             res = bulk_assign_ozon_categories(conn, [int(x) for x in ids], min_score=0.28, force=False)
             if res.get("message"):
                 st.info(str(res["message"]))
@@ -996,7 +1100,7 @@ def show_catalog_tab():
                 st.success(f"Ozon автопривязка: обработано {res['processed']}, привязано {res['assigned']}, пропущено {res['skipped']}")
             st.rerun()
     with cextra2:
-        if st.button("Перепривязать Ozon категории (force, текущая страница)"):
+        if st.button("Перепривязать Ozon категории (force, текущая страница)", help="Повторный подбор Ozon категории с возможной перезаписью текущей привязки"):
             res = bulk_assign_ozon_categories(conn, [int(x) for x in ids], min_score=0.28, force=True)
             if res.get("message"):
                 st.info(str(res["message"]))
@@ -1181,6 +1285,18 @@ def show_product_tab():
 
     st.subheader(f"Карточка товара #{product['id']}")
     st.caption("Мастер-карточка должна быть единым источником правды. Здесь можно вручную поправить данные или обогатить их с сайта поставщика.")
+    with st.expander("Инструкция по кнопкам раздела Карточка", expanded=False):
+        st.markdown(
+            """
+- `Спарсить поставщика`: аккуратное обогащение карточки с сайта поставщика.
+- `Перезаполнить из поставщика`: force-перезапись полей из supplier page.
+- `Подобрать Ozon категорию`: автоподбор эталонной категории Ozon.
+- `Перепривязать Ozon категорию (force)`: повторный подбор Ozon категории с перезаписью.
+- `Сохранить карточку`: сохранение ручных изменений.
+            """
+        )
+    supplier_values = list_distinct_values(conn, "supplier_name")
+    category_values = list_catalog_categories(conn)
 
     top1, top2, top3, top4 = st.columns(4)
     top1.metric("Артикул", product["article"] or "-")
@@ -1190,7 +1306,7 @@ def show_product_tab():
 
     ctop1, ctop2 = st.columns([1, 1])
     with ctop1:
-        if st.button("Спарсить поставщика", type="primary"):
+        if st.button("Спарсить поставщика", type="primary", help="Обогатить карточку с сайта поставщика без жесткой перезаписи ручных значений"):
             result = enrich_product_from_supplier(conn, int(product_id), force=False)
             if result["ok"]:
                 st.success(result["message"])
@@ -1200,7 +1316,7 @@ def show_product_tab():
             else:
                 st.error(result["message"])
     with ctop2:
-        if st.button("Перезаполнить из поставщика"):
+        if st.button("Перезаполнить из поставщика", help="Жесткая перезапись значений из supplier page (force-режим)"):
             result = enrich_product_from_supplier(conn, int(product_id), force=True)
             if result["ok"]:
                 st.success(result["message"])
@@ -1211,7 +1327,7 @@ def show_product_tab():
                 st.error(result["message"])
     ctop3, ctop4 = st.columns([1, 1])
     with ctop3:
-        if st.button("Подобрать Ozon категорию"):
+        if st.button("Подобрать Ozon категорию", help="Подобрать эталонную Ozon категорию автоматически"):
             res = bulk_assign_ozon_categories(conn, [int(product_id)], min_score=0.28, force=False)
             if res.get("message"):
                 st.info(str(res["message"]))
@@ -1219,7 +1335,7 @@ def show_product_tab():
                 st.success(f"Ozon автопривязка: обработано {res['processed']}, привязано {res['assigned']}, пропущено {res['skipped']}")
             st.rerun()
     with ctop4:
-        if st.button("Перепривязать Ozon категорию (force)"):
+        if st.button("Перепривязать Ozon категорию (force)", help="Повторно назначить Ozon категорию с перезаписью текущей привязки"):
             res = bulk_assign_ozon_categories(conn, [int(product_id)], min_score=0.28, force=True)
             if res.get("message"):
                 st.info(str(res["message"]))
@@ -1248,14 +1364,28 @@ def show_product_tab():
             supplier_article = st.text_input("Артикул поставщика", value=product["supplier_article"] or "")
             name = st.text_input("Название", value=product["name"] or "")
             brand = st.text_input("Бренд", value=product["brand"] or "")
-            supplier_name = st.text_input("Поставщик", value=product["supplier_name"] or "")
+            supplier_options = [""] + sorted(set(supplier_values + ([str(product["supplier_name"])] if product["supplier_name"] else [])))
+            supplier_default = str(product["supplier_name"] or "")
+            supplier_idx = supplier_options.index(supplier_default) if supplier_default in supplier_options else 0
+            supplier_name = st.selectbox("Поставщик (из базы)", options=supplier_options, index=supplier_idx)
             barcode = st.text_input("Штрихкод", value=product["barcode"] or "")
             barcode_source = st.text_input("Источник штрихкода", value=product["barcode_source"] or "")
 
         with c2:
-            category = st.text_input("Категория", value=product["category"] or "")
-            base_category = st.text_input("Базовая категория", value=product["base_category"] or "")
-            subcategory = st.text_input("Подкатегория", value=product["subcategory"] or "")
+            category_options = [""] + sorted(set(category_values + ([str(product["category"])] if product["category"] else [])))
+            category_default = str(product["category"] or "")
+            category_idx = category_options.index(category_default) if category_default in category_options else 0
+            category = st.selectbox("Категория (из базы)", options=category_options, index=category_idx)
+
+            base_options = [""] + sorted(set(category_values + ([str(product["base_category"])] if product["base_category"] else [])))
+            base_default = str(product["base_category"] or "")
+            base_idx = base_options.index(base_default) if base_default in base_options else 0
+            base_category = st.selectbox("Базовая категория (из базы)", options=base_options, index=base_idx)
+
+            sub_options = [""] + sorted(set(category_values + ([str(product["subcategory"])] if product["subcategory"] else [])))
+            sub_default = str(product["subcategory"] or "")
+            sub_idx = sub_options.index(sub_default) if sub_default in sub_options else 0
+            subcategory = st.selectbox("Подкатегория (из базы)", options=sub_options, index=sub_idx)
             wheel_diameter_inch = st.number_input(
                 "Диаметр колеса, inch",
                 value=float(product["wheel_diameter_inch"] or 0.0),
@@ -1434,6 +1564,17 @@ def show_attributes_tab():
 def show_template_tab():
     st.subheader("Клиентский шаблон")
     st.caption("Здесь должен быть понятный сценарий: загрузили шаблон, увидели матчинг, поняли дыры, добили данные, скачали готовый файл.")
+    with st.expander("Инструкция по кнопкам раздела Клиентский шаблон", expanded=False):
+        st.markdown(
+            """
+- `Сохранить mapping rules`: сохранить карту соответствия колонок.
+- `Сохранить профиль шаблона`: запомнить тип шаблона клиента.
+- `Добавить несматченные в master-атрибуты`: автоматически создать недостающие атрибуты.
+- `Подтвердить значения как client_validated`: отметить значения как проверенные.
+- `Скачать заполненный шаблон`: выгрузка результата в формате клиента.
+- `Обогатить товар из supplier` (в Gap): быстрый переход к автодозаполнению.
+            """
+        )
     conn = get_db()
     product_df = load_products(conn, limit=5000)
 
@@ -1442,8 +1583,12 @@ def show_template_tab():
         channel_code = st.text_input("Код клиента / канала", value="onlinetrade", key="template_channel_code")
     with t2:
         known_categories = [""] + sorted([str(x) for x in product_df["category"].dropna().unique().tolist()]) if "product_df" in locals() else [""]
-        selected_known = st.selectbox("Категория товаров для шаблона (опционально)", options=known_categories, index=0, key="template_category_select")
-        category_code = st.text_input("Категория шаблона/профиля", value=selected_known or "", key="template_category_code")
+        category_code = st.selectbox(
+            "Категория шаблона/профиля (из базы)",
+            options=known_categories,
+            index=0,
+            key="template_category_select",
+        )
 
     p1, p2 = st.columns([1, 1])
     with p1:
@@ -2957,6 +3102,7 @@ def main():
 10. **Каналы**: поддерживай channel requirements и mapping rules для повторного безручного экспорта.
             """
         )
+    render_section_help()
 
     tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(
         ["📥 Импорт", "📚 Каталог", "🧾 Карточка", "🧩 Атрибуты", "🧠 Клиентский шаблон", "🛒 Ozon", "⚙️ Каналы"]
