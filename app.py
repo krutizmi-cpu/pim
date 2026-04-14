@@ -1123,7 +1123,7 @@ def show_catalog_tab():
 - `◀ Назад` / `Вперед ▶`: постраничный переход по каталогу.
 - `Скачать текущую страницу Excel`: выгружает только отображаемую страницу.
 - `Обновить дубли по текущей выборке`: пересчет дублей по текущей странице.
-- `Обогатить поставщика по текущей странице`: парсинг supplier_url по текущей странице.
+- `Обогатить поставщика по текущей странице`: парсинг supplier_url батчами с лимитом и таймаутом.
 - `Автопривязать Ozon категории`: автоподбор Ozon категории.
 - `Перепривязать Ozon категории (force)`: автоподбор с перезаписью.
             """
@@ -1215,6 +1215,36 @@ def show_catalog_tab():
 
     ids = df["id"].tolist()
     selected_id = st.selectbox("Открыть карточку товара", ids, format_func=lambda x: f"ID {x}")
+    supplier_candidate_ids = [
+        int(row["id"])
+        for _, row in df.iterrows()
+        if str(row.get("supplier_url") or "").strip()
+    ]
+    bc1, bc2 = st.columns(2)
+    with bc1:
+        max_bulk_enrich = st.number_input(
+            "Лимит обогащения за запуск",
+            min_value=1,
+            max_value=200,
+            value=min(20, max(1, len(supplier_candidate_ids))),
+            step=1,
+            help="Ограничивает количество товаров за один запуск, чтобы Streamlit Cloud не зависал.",
+            key="catalog_max_bulk_enrich",
+        )
+    with bc2:
+        supplier_timeout_seconds = st.number_input(
+            "Таймаут supplier_url, сек",
+            min_value=2,
+            max_value=30,
+            value=8,
+            step=1,
+            help="Максимальное время ожидания ответа от сайта поставщика для одного товара.",
+            key="catalog_supplier_timeout_seconds",
+        )
+    st.caption(
+        f"Кандидатов к обогащению на странице: {len(supplier_candidate_ids)}. "
+        f"За один запуск будет обработано до {int(max_bulk_enrich)}."
+    )
 
     b1, b2 = st.columns(2)
     with b1:
@@ -1228,15 +1258,36 @@ def show_catalog_tab():
             st.success(f"Проверка дублей завершена: {total} товаров")
     with b2:
         if st.button("Обогатить поставщика по текущей странице", help="Запустить supplier parsing для товаров текущей страницы, где заполнен supplier_url"):
-            total = 0
-            progress = st.progress(0)
-            for i, pid in enumerate(ids, start=1):
-                product_row = get_product(conn, int(pid))
-                if product_row and product_row["supplier_url"]:
-                    enrich_product_from_supplier(conn, int(pid), force=False)
-                    total += 1
-                progress.progress(i / len(ids))
-            st.success(f"Обогащение поставщика завершено: обработано {total} товаров")
+            if not supplier_candidate_ids:
+                st.info("На текущей странице нет товаров с заполненным supplier_url.")
+            else:
+                target_ids = supplier_candidate_ids[: int(max_bulk_enrich)]
+                progress = st.progress(0)
+                processed = 0
+                success = 0
+                failed = 0
+                for i, pid in enumerate(target_ids, start=1):
+                    try:
+                        result = enrich_product_from_supplier(
+                            conn,
+                            int(pid),
+                            force=False,
+                            timeout_seconds=float(supplier_timeout_seconds),
+                        )
+                        if result.get("ok"):
+                            success += 1
+                        else:
+                            failed += 1
+                    except Exception:
+                        failed += 1
+                    processed += 1
+                    progress.progress(i / len(target_ids))
+                skipped_by_limit = max(0, len(supplier_candidate_ids) - len(target_ids))
+                st.success(
+                    "Обогащение поставщика завершено: "
+                    f"обработано {processed}, успешно {success}, ошибок {failed}, "
+                    f"отложено по лимиту {skipped_by_limit}."
+                )
     cextra1, cextra2 = st.columns(2)
     with cextra1:
         if st.button("Автопривязать Ozon категории (текущая страница)", help="Автоподбор эталонной Ozon категории для товаров этой страницы"):
@@ -1365,7 +1416,12 @@ def show_catalog_tab():
     conn.close()
 
 
-def enrich_product_from_supplier(conn, product_id: int, force: bool = False) -> dict:
+def enrich_product_from_supplier(
+    conn,
+    product_id: int,
+    force: bool = False,
+    timeout_seconds: float = 8.0,
+) -> dict:
     product = get_product(conn, product_id)
     if not product:
         return {"ok": False, "message": "Товар не найден"}
@@ -1375,7 +1431,7 @@ def enrich_product_from_supplier(conn, product_id: int, force: bool = False) -> 
         return {"ok": False, "message": "У товара нет supplier_url"}
 
     try:
-        html = fetch_supplier_page(supplier_url)
+        html = fetch_supplier_page(supplier_url, timeout=float(timeout_seconds))
         raw_data = extract_supplier_data(html, supplier_url)
         parsed = normalize_supplier_data(raw_data)
 

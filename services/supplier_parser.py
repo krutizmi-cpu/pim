@@ -57,7 +57,7 @@ def _convert_weight(value: float | None, unit: str | None) -> float | None:
     return value
 
 
-def fetch_supplier_page(url: str, timeout: float = 20.0) -> str:
+def fetch_supplier_page(url: str, timeout: float = 10.0) -> str:
     with httpx.Client(headers=HEADERS, follow_redirects=True, timeout=timeout) as client:
         response = client.get(url)
         response.raise_for_status()
