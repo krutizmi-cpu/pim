@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+import json
 from pathlib import Path
 import re
 from typing import Any
@@ -13,6 +14,7 @@ import sqlite3
 
 from db import init_db
 from pim_enrich import enrich_product
+from services.attribute_service import set_product_attribute_value
 from services.duplicate_service import refresh_duplicates_for_product
 from services.text_utils import normalize_name
 
@@ -37,6 +39,7 @@ SUPPORTED_FIELDS = [
     "package_height",
     "gross_weight",
     "image_url",
+    "gallery_images_raw",
     "description",
 ]
 
@@ -116,6 +119,8 @@ COLUMN_MAP: dict[str, list[str]] = {
         "url поставщика",
         "ссылка поставщика",
         "supplier link",
+        "ссылка на товар на оф. сайте",
+        "ссылка на товар на официальном сайте",
         "ссылки на товар на оф. сайте",
         "ссылка на товар",
         "url",
@@ -168,7 +173,17 @@ COLUMN_MAP: dict[str, list[str]] = {
     "image_url": [
         "image_url",
         "фото",
+        "фото №1",
+        "фото n1",
+        "фото no1",
+        "ссылка на фото",
+        "ссылка на изображение",
+        "ссылки на изображения",
+        "ссылки на изображения товара",
         "картинка",
+        "изображение",
+        "image links",
+        "image_links",
         "image",
         "главное фото",
     ],
@@ -259,6 +274,32 @@ def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
 
     normalized = df.rename(columns=rename_map).copy()
 
+    image_hint_cols: list[str] = []
+    for col in normalized.columns:
+        label = str(col).strip().lower()
+        if label == "image_url" or any(hint in label for hint in ("фото", "image", "картин", "изображ")):
+            image_hint_cols.append(col)
+    if image_hint_cols:
+        detected_main: list[str | None] = []
+        detected_gallery: list[str | None] = []
+        for _, row in normalized[image_hint_cols].iterrows():
+            refs: list[str] = []
+            seen: set[str] = set()
+            for col in image_hint_cols:
+                for ref in _extract_image_refs(row.get(col)):
+                    if ref in seen:
+                        continue
+                    seen.add(ref)
+                    refs.append(ref)
+            detected_main.append(refs[0] if refs else None)
+            detected_gallery.append("\n".join(refs[1:]) if len(refs) > 1 else None)
+        if "image_url" in normalized.columns:
+            current_image = normalized["image_url"].apply(_normalize_image_ref)
+            normalized["image_url"] = current_image.where(current_image.notna(), pd.Series(detected_main, index=normalized.index))
+        else:
+            normalized["image_url"] = detected_main
+        normalized["gallery_images_raw"] = detected_gallery
+
     for col in SUPPORTED_FIELDS:
         if col not in normalized.columns:
             normalized[col] = None
@@ -285,6 +326,40 @@ def _looks_like_url(value: str) -> bool:
         return False
     # Accept domains like example.com/path
     return bool(re.match(r"^[a-z0-9][a-z0-9\.\-]+\.[a-z]{2,}.*$", text))
+
+
+def _normalize_image_ref(value: object) -> str | None:
+    text = _to_text(value)
+    if not text:
+        return None
+    cleaned = text.strip().strip(",;")
+    low = cleaned.lower()
+    if low.startswith("http://") or low.startswith("https://"):
+        return cleaned
+    if _looks_like_url(cleaned):
+        return f"https://{cleaned}"
+    if (cleaned.startswith("\\\\") or re.match(r"^[a-zA-Z]:\\", cleaned)) and re.search(r"\.(jpg|jpeg|png|webp|gif)$", low):
+        return cleaned
+    return None
+
+
+def _extract_image_refs(value: object) -> list[str]:
+    text = _to_text(value)
+    if not text:
+        return []
+    refs: list[str] = []
+    seen: set[str] = set()
+    direct = _normalize_image_ref(text)
+    if direct:
+        refs.append(direct)
+        seen.add(direct)
+    for chunk in re.split(r"[\n\r\t,;| ]+", text):
+        norm = _normalize_image_ref(chunk)
+        if not norm or norm in seen:
+            continue
+        seen.add(norm)
+        refs.append(norm)
+    return refs
 
 
 def _normalize_supplier_url(value: object) -> str | None:
@@ -355,10 +430,32 @@ def _build_product_dict(row: pd.Series, normalized_name: str) -> dict[str, Any]:
         "package_width": _to_float(row.get("package_width")),
         "package_height": _to_float(row.get("package_height")),
         "gross_weight": _to_float(row.get("gross_weight")),
-        "image_url": _to_text(row.get("image_url")),
+        "image_url": _normalize_image_ref(row.get("image_url")),
+        "gallery_images_raw": _to_text(row.get("gallery_images_raw")),
         "description": _to_text(row.get("description")),
         "normalized_name": normalized_name,
     }
+
+
+def _save_gallery_attributes(conn: sqlite3.Connection, product_id: int, product_data: dict[str, Any]) -> None:
+    refs: list[str] = []
+    seen: set[str] = set()
+    for candidate in [product_data.get("image_url"), product_data.get("gallery_images_raw")]:
+        for ref in _extract_image_refs(candidate):
+            if ref in seen:
+                continue
+            seen.add(ref)
+            refs.append(ref)
+    if not refs:
+        return
+    set_product_attribute_value(conn, int(product_id), "main_image", refs[0])
+    if len(refs) > 1:
+        set_product_attribute_value(
+            conn,
+            int(product_id),
+            "gallery_images",
+            json.dumps(refs, ensure_ascii=False),
+        )
 
 
 def _apply_enrichment(
@@ -618,6 +715,7 @@ def import_catalog_from_excel(
             product_id = int(cur.lastrowid)
             created += 1
 
+        _save_gallery_attributes(conn, product_id, product_data)
         duplicates.extend(refresh_duplicates_for_product(conn, product_id))
 
     conn.commit()

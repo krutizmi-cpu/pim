@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import os
 import sqlite3
 import tempfile
 from pathlib import Path
 
 DB_PATH = Path("data/catalog.db")
+_ACTIVE_DB_PATH: Path | None = None
 
 
 REQUIRED_PRODUCT_COLUMNS: dict[str, str] = {
@@ -52,33 +54,61 @@ REQUIRED_PRODUCT_COLUMNS: dict[str, str] = {
 }
 
 
+def _candidate_db_paths(db_path: Path) -> list[Path]:
+    env_path = (os.getenv("PIM_DB_PATH") or os.getenv("DATABASE_PATH") or "").strip()
+    candidates: list[Path] = []
+    if env_path:
+        candidates.append(Path(env_path).expanduser())
+    candidates.append(Path(db_path).expanduser())
+    candidates.append(Path.home() / ".pim" / "catalog.db")
+    candidates.append(Path.cwd() / "data" / "catalog.db")
+    candidates.append(Path(tempfile.gettempdir()) / "pim" / "catalog.db")
+    unique: list[Path] = []
+    seen: set[str] = set()
+    for item in candidates:
+        key = str(item.resolve()) if item.exists() else str(item)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(item)
+    return unique
+
+
 def get_connection(db_path: Path = DB_PATH) -> sqlite3.Connection:
-    primary_path = Path(db_path)
-    primary_path.parent.mkdir(parents=True, exist_ok=True)
+    global _ACTIVE_DB_PATH
 
     def _connect(path: Path) -> sqlite3.Connection:
+        path.parent.mkdir(parents=True, exist_ok=True)
         conn_local = sqlite3.connect(path, check_same_thread=False, timeout=30.0)
         conn_local.row_factory = sqlite3.Row
         return conn_local
 
-    conn = _connect(primary_path)
-    try:
-        # Fast writeability probe for Streamlit Cloud / read-only mount cases.
-        conn.execute("CREATE TABLE IF NOT EXISTS _pim_rw_probe (id INTEGER PRIMARY KEY)")
-        conn.commit()
-        return conn
-    except sqlite3.OperationalError as e:
-        msg = str(e).lower()
-        if "readonly" not in msg and "read-only" not in msg:
+    last_error: Exception | None = None
+    for candidate in _candidate_db_paths(Path(db_path)):
+        conn = _connect(candidate)
+        try:
+            # Fast writeability probe for read-only mount cases.
+            conn.execute("CREATE TABLE IF NOT EXISTS _pim_rw_probe (id INTEGER PRIMARY KEY)")
+            conn.commit()
+            _ACTIVE_DB_PATH = candidate
+            return conn
+        except sqlite3.OperationalError as e:
             conn.close()
-            raise
-        conn.close()
-        fallback_path = Path(tempfile.gettempdir()) / "pim" / "catalog.db"
-        fallback_path.parent.mkdir(parents=True, exist_ok=True)
-        fallback = _connect(fallback_path)
-        fallback.execute("CREATE TABLE IF NOT EXISTS _pim_rw_probe (id INTEGER PRIMARY KEY)")
-        fallback.commit()
-        return fallback
+            last_error = e
+            msg = str(e).lower()
+            if "readonly" not in msg and "read-only" not in msg:
+                raise
+            continue
+
+    if last_error:
+        raise last_error
+    raise RuntimeError("Не удалось открыть SQLite базу данных")
+
+
+def get_active_db_path() -> str | None:
+    if _ACTIVE_DB_PATH is None:
+        return None
+    return str(_ACTIVE_DB_PATH)
 
 
 def _table_columns(conn: sqlite3.Connection, table_name: str) -> set[str]:
@@ -311,6 +341,18 @@ def _ensure_product_data_sources_table(conn: sqlite3.Connection) -> None:
     )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_pds_product_id ON product_data_sources(product_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_pds_field_name ON product_data_sources(field_name)")
+
+
+def _ensure_system_settings_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS system_settings (
+            key TEXT PRIMARY KEY,
+            value TEXT,
+            updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
 
 
 def _ensure_template_profile_tables(conn: sqlite3.Connection) -> None:
@@ -735,6 +777,7 @@ def init_db(conn: sqlite3.Connection) -> None:
     _ensure_category_defaults_table(conn)
     _ensure_attribute_tables(conn)
     _ensure_product_data_sources_table(conn)
+    _ensure_system_settings_table(conn)
     _ensure_template_profile_tables(conn)
     _ensure_supplier_profiles_table(conn)
     _ensure_ozon_tables(conn)

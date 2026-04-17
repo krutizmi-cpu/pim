@@ -8,30 +8,37 @@ from typing import Any
 from services.source_tracking import save_field_source
 
 
+STOP_TOKENS = {
+    "и", "для", "с", "на", "в", "из", "по", "под", "или", "the", "for", "with", "to",
+    "товар", "товары", "прочее", "другое", "разное", "аксессуар", "аксессуары",
+}
+GENERIC_CATEGORY_TOKENS = {"прочее", "товары", "другое", "разное", "other", "misc"}
+
+
 def _normalize(text: str | None) -> str:
-    return " ".join(str(text or "").strip().lower().split())
+    return " ".join(str(text or "").strip().lower().replace("ё", "е").split())
 
 
 def _tokenize(text: str | None) -> set[str]:
     tokens = re.findall(r"[a-zA-Zа-яА-Я0-9]+", _normalize(text))
-    return {t for t in tokens if len(t) >= 2}
+    return {t for t in tokens if len(t) >= 2 and t not in STOP_TOKENS}
 
 
-def _query_terms(product_row: dict[str, Any]) -> list[str]:
-    candidates = [
-        product_row.get("base_category"),
-        product_row.get("subcategory"),
-        product_row.get("category"),
-        product_row.get("name"),
+def _query_terms(product_row: dict[str, Any]) -> list[tuple[str, float, str]]:
+    weighted_candidates = [
+        (product_row.get("base_category"), 1.25, "base_category"),
+        (product_row.get("subcategory"), 1.20, "subcategory"),
+        (product_row.get("category"), 1.10, "category"),
+        (product_row.get("name"), 0.85, "name"),
     ]
-    out: list[str] = []
+    out: list[tuple[str, float, str]] = []
     seen = set()
-    for value in candidates:
-        norm = _normalize(value)
+    for raw_value, weight, source in weighted_candidates:
+        norm = _normalize(raw_value)
         if not norm or norm in seen:
             continue
         seen.add(norm)
-        out.append(norm)
+        out.append((norm, float(weight), source))
     return out
 
 
@@ -53,6 +60,8 @@ def _category_candidates(conn: sqlite3.Connection) -> list[dict[str, Any]]:
             continue
         seen.add(key)
         text = _normalize(" ".join([str(row["full_path"] or ""), str(row["category_name"] or ""), str(row["type_name"] or "")]))
+        tokens = _tokenize(text)
+        generic_penalty = 0.12 if tokens and tokens.issubset(GENERIC_CATEGORY_TOKENS) else 0.0
         candidates.append(
             {
                 "description_category_id": int(row["description_category_id"]),
@@ -60,13 +69,14 @@ def _category_candidates(conn: sqlite3.Connection) -> list[dict[str, Any]]:
                 "full_path": row["full_path"] or row["category_name"] or "",
                 "category_name": row["category_name"] or "",
                 "text": text,
-                "tokens": _tokenize(text),
+                "tokens": tokens,
+                "generic_penalty": generic_penalty,
             }
         )
     return candidates
 
 
-def _score(query: str, query_tokens: set[str], candidate: dict[str, Any]) -> float:
+def _score(query: str, query_tokens: set[str], candidate: dict[str, Any], weight: float) -> float:
     text = candidate["text"]
     if not text:
         return 0.0
@@ -75,24 +85,44 @@ def _score(query: str, query_tokens: set[str], candidate: dict[str, Any]) -> flo
     if query_tokens:
         overlap = len(query_tokens & candidate["tokens"]) / max(len(query_tokens), 1)
     contains = 1.0 if query in text else 0.0
-    return 0.55 * ratio + 0.35 * overlap + 0.10 * contains
+    token_contains = 0.0
+    if query_tokens and any(tok in text for tok in query_tokens):
+        token_contains = 0.5
+    raw_score = (0.50 * ratio) + (0.35 * overlap) + (0.10 * contains) + (0.05 * token_contains)
+    raw_score -= float(candidate.get("generic_penalty") or 0.0)
+    return max(0.0, min(1.0, raw_score * weight))
 
 
 def _best_match_for_product(product_row: dict[str, Any], categories: list[dict[str, Any]]) -> dict[str, Any] | None:
     terms = _query_terms(product_row)
     if not terms or not categories:
         return None
+
+    anchor_tokens: set[str] = set()
+    for query, _, source in terms:
+        if source in {"base_category", "subcategory", "category"}:
+            anchor_tokens.update(_tokenize(query))
+
     best: dict[str, Any] | None = None
     best_score = 0.0
     best_term = None
-    for term in terms:
+    best_source = None
+
+    for term, weight, source in terms:
         term_tokens = _tokenize(term)
+        if not term_tokens:
+            continue
         for category in categories:
-            score = _score(term, term_tokens, category)
+            # Strong filter: if we have anchor tokens, require at least one overlap.
+            if anchor_tokens and not (anchor_tokens & category["tokens"]):
+                continue
+            score = _score(term, term_tokens, category, weight=weight)
             if score > best_score:
                 best_score = score
                 best = category
                 best_term = term
+                best_source = source
+
     if not best:
         return None
     return {
@@ -101,13 +131,14 @@ def _best_match_for_product(product_row: dict[str, Any], categories: list[dict[s
         "full_path": best["full_path"],
         "score": round(float(best_score), 4),
         "matched_by": best_term,
+        "matched_source": best_source,
     }
 
 
 def bulk_assign_ozon_categories(
     conn: sqlite3.Connection,
     product_ids: list[int],
-    min_score: float = 0.28,
+    min_score: float = 0.42,
     force: bool = False,
 ) -> dict[str, Any]:
     categories = _category_candidates(conn)
@@ -193,4 +224,3 @@ def bulk_assign_ozon_categories(
 
     conn.commit()
     return {"processed": processed, "assigned": assigned, "skipped": skipped}
-

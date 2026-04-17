@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 import json
 import os
 import sqlite3
@@ -18,6 +19,8 @@ from utils.text_normalizer import normalize_text
 BASE_URL = "https://api-seller.ozon.ru"
 DEFAULT_TIMEOUT = 30.0
 OZON_OFFER_ID_FIELDS = ("article", "internal_article", "supplier_article")
+OZON_LAST_FULL_SYNC_KEY = "ozon_last_full_sync_at"
+OZON_LAST_FULL_SYNC_STATUS_KEY = "ozon_last_full_sync_status"
 
 
 def get_env_credentials() -> tuple[str | None, str | None]:
@@ -127,6 +130,166 @@ def sync_category_tree(
         inserted += 1
     conn.commit()
     return {"inserted": inserted, "total": inserted}
+
+
+def _ensure_system_settings_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS system_settings (
+            key TEXT PRIMARY KEY,
+            value TEXT,
+            updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+
+
+def _get_setting(conn: sqlite3.Connection, key: str) -> str | None:
+    _ensure_system_settings_table(conn)
+    row = conn.execute("SELECT value FROM system_settings WHERE key = ? LIMIT 1", (str(key),)).fetchone()
+    return str(row["value"]) if row and row["value"] is not None else None
+
+
+def _set_setting(conn: sqlite3.Connection, key: str, value: str | None) -> None:
+    _ensure_system_settings_table(conn)
+    conn.execute(
+        """
+        INSERT INTO system_settings (key, value, updated_at)
+        VALUES (?, ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(key) DO UPDATE SET
+            value = excluded.value,
+            updated_at = CURRENT_TIMESTAMP
+        """,
+        (str(key), value),
+    )
+    conn.commit()
+
+
+def _list_category_pairs_for_sync(conn: sqlite3.Connection) -> list[tuple[int, int]]:
+    rows = conn.execute(
+        """
+        SELECT DISTINCT description_category_id, type_id
+        FROM ozon_category_cache
+        WHERE description_category_id IS NOT NULL
+          AND type_id IS NOT NULL
+          AND IFNULL(disabled, 0) = 0
+        ORDER BY description_category_id, type_id
+        """
+    ).fetchall()
+    return [(int(r["description_category_id"]), int(r["type_id"])) for r in rows]
+
+
+def sync_all_categories_and_attributes(
+    conn: sqlite3.Connection,
+    client_id: str | None = None,
+    api_key: str | None = None,
+    language: str = "DEFAULT",
+    max_pairs: int | None = None,
+    import_to_pim: bool = True,
+) -> dict[str, Any]:
+    tree_result = sync_category_tree(conn, client_id=client_id, api_key=api_key, language=language)
+    pairs = _list_category_pairs_for_sync(conn)
+    if max_pairs is not None and int(max_pairs) > 0:
+        pairs = pairs[: int(max_pairs)]
+
+    processed_pairs = 0
+    total_attributes = 0
+    total_required = 0
+    imported_to_pim = 0
+    errors: list[str] = []
+
+    for description_category_id, type_id in pairs:
+        try:
+            result = sync_category_attributes(
+                conn,
+                description_category_id=description_category_id,
+                type_id=type_id,
+                client_id=client_id,
+                api_key=api_key,
+                language=language,
+            )
+            processed_pairs += 1
+            total_attributes += int(result.get("total") or 0)
+            total_required += int(result.get("required") or 0)
+            if import_to_pim:
+                imported = import_cached_attributes_to_pim(
+                    conn,
+                    description_category_id=description_category_id,
+                    type_id=type_id,
+                )
+                imported_to_pim += int(imported.get("imported") or 0)
+        except Exception as e:
+            errors.append(f"cat={description_category_id}, type={type_id}: {e}")
+
+    return {
+        "tree_total": int(tree_result.get("total") or 0),
+        "pairs_total": len(pairs),
+        "pairs_processed": processed_pairs,
+        "attributes_total": total_attributes,
+        "required_total": total_required,
+        "imported_to_pim": imported_to_pim,
+        "errors": errors[:200],
+    }
+
+
+def run_monthly_ozon_autosync_if_due(
+    conn: sqlite3.Connection,
+    client_id: str | None = None,
+    api_key: str | None = None,
+    days: int = 30,
+    force: bool = False,
+    max_pairs: int | None = None,
+) -> dict[str, Any]:
+    if not is_configured(client_id, api_key):
+        return {
+            "configured": False,
+            "executed": False,
+            "due": False,
+            "reason": "Ozon credentials are not configured",
+        }
+
+    now = datetime.now(timezone.utc)
+    last_raw = _get_setting(conn, OZON_LAST_FULL_SYNC_KEY)
+    due = True
+    last_dt: datetime | None = None
+    if last_raw:
+        try:
+            last_dt = datetime.fromisoformat(last_raw)
+            if last_dt.tzinfo is None:
+                last_dt = last_dt.replace(tzinfo=timezone.utc)
+            due = (now - last_dt) >= timedelta(days=max(1, int(days)))
+        except Exception:
+            due = True
+
+    if not force and not due:
+        return {
+            "configured": True,
+            "executed": False,
+            "due": False,
+            "last_sync_at": last_raw,
+        }
+
+    result = sync_all_categories_and_attributes(
+        conn,
+        client_id=client_id,
+        api_key=api_key,
+        max_pairs=max_pairs,
+    )
+    _set_setting(conn, OZON_LAST_FULL_SYNC_KEY, now.isoformat())
+    status_text = (
+        f"pairs_processed={result.get('pairs_processed', 0)};"
+        f"attributes_total={result.get('attributes_total', 0)};"
+        f"errors={len(result.get('errors') or [])}"
+    )
+    _set_setting(conn, OZON_LAST_FULL_SYNC_STATUS_KEY, status_text)
+    return {
+        "configured": True,
+        "executed": True,
+        "due": True,
+        "last_sync_at": now.isoformat(),
+        "status": status_text,
+        "result": result,
+    }
 
 
 def list_cached_categories(conn: sqlite3.Connection, limit: int = 200) -> list[dict[str, Any]]:

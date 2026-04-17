@@ -11,7 +11,7 @@ import sqlite3
 import streamlit as st
 from openpyxl import load_workbook
 
-from db import get_connection, init_db
+from db import get_connection, init_db, get_active_db_path
 from services.attribute_service import (
     get_product_attribute_values,
     list_attribute_definitions,
@@ -26,12 +26,12 @@ from services.catalog_service import import_catalog_from_excel
 from services.duplicate_service import refresh_duplicates_for_product
 from services.source_tracking import get_field_sources, save_field_source, get_latest_field_source, field_is_manual
 from services.source_priority import can_overwrite_field
-from services.supplier_parser import fetch_supplier_page, extract_supplier_data, normalize_supplier_data
+from services.supplier_parser import parse_supplier_product_page, has_meaningful_supplier_data, fallback_search_product_data
 from services.template_matching import auto_match_template_columns, apply_saved_mapping_rules, fill_template_dataframe, apply_client_validated_values, fill_template_workbook_bytes, dataframe_to_excel_bytes, detect_template_data_start_row, sanitize_template_xlsx_bytes
 from services.template_profiles import save_template_profile, list_template_profiles, get_template_profile_columns
 from services.readiness_service import analyze_template_readiness
 from services.supplier_profiles import list_supplier_profiles, upsert_supplier_profile
-from services.ozon_api_service import is_configured, sync_category_tree, list_cached_categories, sync_category_attributes, list_cached_attributes, sync_attribute_dictionary_values, sync_all_category_dictionary_values, list_cached_attribute_values, import_cached_attributes_to_pim, suggest_mappings_for_cached_attributes, save_suggested_mappings, analyze_product_ozon_coverage, ensure_ozon_master_attributes, build_product_ozon_payload, materialize_product_ozon_attributes, preview_product_ozon_dictionary_gaps, build_product_ozon_api_attributes, build_bulk_ozon_api_payloads, build_ozon_attributes_update_request, submit_ozon_attributes_update, list_ozon_update_jobs, get_ozon_update_job, retry_ozon_update_job, list_ozon_update_job_items, save_dictionary_override, list_dictionary_overrides, delete_dictionary_override
+from services.ozon_api_service import is_configured, sync_category_tree, list_cached_categories, sync_category_attributes, list_cached_attributes, sync_attribute_dictionary_values, sync_all_category_dictionary_values, list_cached_attribute_values, import_cached_attributes_to_pim, suggest_mappings_for_cached_attributes, save_suggested_mappings, analyze_product_ozon_coverage, ensure_ozon_master_attributes, build_product_ozon_payload, materialize_product_ozon_attributes, preview_product_ozon_dictionary_gaps, build_product_ozon_api_attributes, build_bulk_ozon_api_payloads, build_ozon_attributes_update_request, submit_ozon_attributes_update, list_ozon_update_jobs, get_ozon_update_job, retry_ozon_update_job, list_ozon_update_job_items, save_dictionary_override, list_dictionary_overrides, delete_dictionary_override, sync_all_categories_and_attributes, run_monthly_ozon_autosync_if_due
 from services.ozon_category_match import bulk_assign_ozon_categories
 
 st.set_page_config(page_title="PIM", page_icon="📦", layout="wide")
@@ -62,6 +62,7 @@ TEMPLATE_TRANSFORM_OPTIONS = [
     "image_4",
     "image_5",
 ]
+OZON_CATEGORY_MIN_SCORE = 0.42
 
 
 def get_db():
@@ -1059,7 +1060,7 @@ def show_import_tab():
                     ).fetchall()
                     batch_ids = [int(r["id"]) for r in batch_rows]
                     if batch_ids:
-                        ozon_match_result = bulk_assign_ozon_categories(conn, batch_ids, min_score=0.28, force=False)
+                        ozon_match_result = bulk_assign_ozon_categories(conn, batch_ids, min_score=OZON_CATEGORY_MIN_SCORE, force=False)
                         if ozon_match_result.get("message"):
                             st.info(str(ozon_match_result["message"]))
                         else:
@@ -1163,21 +1164,13 @@ def show_catalog_tab():
     current_page = int(st.session_state.get("catalog_page", 1))
     if current_page > total_pages:
         current_page = 1
-    p1, p2, p3, p4, p5 = st.columns([1, 1, 2, 1, 1])
+    p1, p2, p3 = st.columns([1, 1, 3])
     with p1:
         page = st.selectbox("Страница", options=page_options, index=page_options.index(current_page), key="catalog_page")
     with p2:
         st.metric("Всего страниц", total_pages)
     with p3:
         st.caption(f"Всего товаров по фильтру: {total_rows}")
-    with p4:
-        if st.button("◀ Назад", disabled=int(page) <= 1, help="Перейти на предыдущую страницу каталога"):
-            st.session_state["catalog_page"] = int(page) - 1
-            st.rerun()
-    with p5:
-        if st.button("Вперед ▶", disabled=int(page) >= total_pages, help="Перейти на следующую страницу каталога"):
-            st.session_state["catalog_page"] = int(page) + 1
-            st.rerun()
     offset = (int(page) - 1) * int(page_size)
     df = load_products(
         conn,
@@ -1291,7 +1284,7 @@ def show_catalog_tab():
     cextra1, cextra2 = st.columns(2)
     with cextra1:
         if st.button("Автопривязать Ozon категории (текущая страница)", help="Автоподбор эталонной Ozon категории для товаров этой страницы"):
-            res = bulk_assign_ozon_categories(conn, [int(x) for x in ids], min_score=0.28, force=False)
+            res = bulk_assign_ozon_categories(conn, [int(x) for x in ids], min_score=OZON_CATEGORY_MIN_SCORE, force=False)
             if res.get("message"):
                 st.info(str(res["message"]))
             else:
@@ -1299,7 +1292,7 @@ def show_catalog_tab():
             st.rerun()
     with cextra2:
         if st.button("Перепривязать Ozon категории (force, текущая страница)", help="Повторный подбор Ozon категории с возможной перезаписью текущей привязки"):
-            res = bulk_assign_ozon_categories(conn, [int(x) for x in ids], min_score=0.28, force=True)
+            res = bulk_assign_ozon_categories(conn, [int(x) for x in ids], min_score=OZON_CATEGORY_MIN_SCORE, force=True)
             if res.get("message"):
                 st.info(str(res["message"]))
             else:
@@ -1413,6 +1406,18 @@ def show_catalog_tab():
             )
             st.rerun()
 
+    nav1, nav2, nav3 = st.columns([1, 1, 4])
+    with nav1:
+        if st.button("◀ Назад", disabled=int(page) <= 1, help="Перейти на предыдущую страницу каталога", key="catalog_nav_prev_bottom"):
+            st.session_state["catalog_page"] = int(page) - 1
+            st.rerun()
+    with nav2:
+        if st.button("Вперед ▶", disabled=int(page) >= total_pages, help="Перейти на следующую страницу каталога", key="catalog_nav_next_bottom"):
+            st.session_state["catalog_page"] = int(page) + 1
+            st.rerun()
+    with nav3:
+        st.caption(f"Навигация по каталогу: страница {int(page)} из {int(total_pages)}")
+
     conn.close()
 
 
@@ -1431,12 +1436,62 @@ def enrich_product_from_supplier(
         return {"ok": False, "message": "У товара нет supplier_url"}
 
     try:
-        html = fetch_supplier_page(supplier_url, timeout=float(timeout_seconds))
-        raw_data = extract_supplier_data(html, supplier_url)
-        parsed = normalize_supplier_data(raw_data)
+        parse_hints = [
+            str(product["article"] or ""),
+            str(product["supplier_article"] or ""),
+            str(product["name"] or ""),
+            str(product["brand"] or ""),
+        ]
+        parsed = parse_supplier_product_page(
+            supplier_url,
+            hints=parse_hints,
+            timeout=float(timeout_seconds),
+            max_hops=1,
+        )
+        source_url = parsed.get("resolved_url") or supplier_url
+        source_type = "supplier_page"
+        used_fallback = False
+
+        if not has_meaningful_supplier_data(parsed):
+            fallback_query_parts = [str(product["name"] or "").strip(), str(product["article"] or "").strip(), str(product["brand"] or "").strip()]
+            fallback_query = " ".join([p for p in fallback_query_parts if p])
+            fallback = fallback_search_product_data(fallback_query, timeout=float(timeout_seconds), max_results=3)
+            if fallback and has_meaningful_supplier_data(fallback):
+                for key in [
+                    "name", "brand", "category", "description", "image_url", "weight", "gross_weight",
+                    "length", "width", "height", "package_length", "package_width", "package_height"
+                ]:
+                    if parsed.get(key) in (None, "", 0, 0.0):
+                        parsed[key] = fallback.get(key)
+                merged_attrs = dict(parsed.get("attributes") or {})
+                for k, v in (fallback.get("attributes") or {}).items():
+                    if k not in merged_attrs:
+                        merged_attrs[k] = v
+                parsed["attributes"] = merged_attrs
+                if not parsed.get("image_urls"):
+                    parsed["image_urls"] = fallback.get("image_urls") or []
+                source_url = fallback.get("fallback_url") or source_url
+                source_type = "web_search_fallback"
+                used_fallback = True
+
+        if not has_meaningful_supplier_data(parsed):
+            conn.execute(
+                """
+                UPDATE products
+                SET supplier_parse_status = ?,
+                    supplier_parse_comment = ?,
+                    supplier_last_parsed_at = CURRENT_TIMESTAMP,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                ("error", "Не удалось получить полезные данные: supplier_url не содержит карточку товара", product_id),
+            )
+            conn.commit()
+            return {"ok": False, "message": "Не удалось получить полезные данные с supplier_url или через web fallback"}
 
         updates = {}
         skipped_manual_fields = []
+        weak_categories = {"товары", "каталог", "продукция", "все товары", "catalog", "products", "shop"}
         fields = [
             "name",
             "brand",
@@ -1453,17 +1508,16 @@ def enrich_product_from_supplier(
             "gross_weight",
         ]
         for field in fields:
-            source_field = field
-            if field == "gross_weight":
-                source_field = "gross_weight"
-            new_value = parsed.get(source_field)
+            new_value = parsed.get(field)
             old_value = product[field] if field in product.keys() else None
             if new_value is None:
+                continue
+            if field == "category" and str(new_value).strip().lower() in weak_categories and not force:
                 continue
             if field_is_manual(conn, product_id, field) and not force:
                 skipped_manual_fields.append(field)
                 continue
-            if not can_overwrite_field(conn, product_id, field, "supplier_page", force=force):
+            if not can_overwrite_field(conn, product_id, field, source_type, force=force):
                 skipped_manual_fields.append(field)
                 continue
             if old_value not in (None, "", 0, 0.0) and not force:
@@ -1478,7 +1532,7 @@ def enrich_product_from_supplier(
             if not clean_code:
                 continue
             attr_field_name = f"attr:{clean_code}"
-            if not can_overwrite_field(conn, product_id, attr_field_name, "supplier_page", force=force):
+            if not can_overwrite_field(conn, product_id, attr_field_name, source_type, force=force):
                 skipped_attribute_fields.append(clean_code)
                 continue
             existing_def = conn.execute(
@@ -1492,23 +1546,53 @@ def enrich_product_from_supplier(
                     (code, name, data_type, scope, entity_type, is_required, is_multi_value, unit, description, created_at, updated_at)
                     VALUES (?, ?, 'text', 'master', 'product', 0, 0, NULL, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
                     """,
-                    (clean_code, str(attr_name).strip(), f"Автосоздано из supplier page: {supplier_url}"),
+                    (clean_code, str(attr_name).strip(), f"Автосоздано из source: {source_url}"),
                 )
             set_product_attribute_value(conn, product_id, clean_code, str(attr_value))
             save_field_source(
                 conn=conn,
                 product_id=product_id,
                 field_name=attr_field_name,
-                source_type="supplier_page",
+                source_type=source_type,
                 source_value_raw=attr_value,
-                source_url=supplier_url,
-                confidence=0.6,
+                source_url=source_url,
+                confidence=0.6 if source_type == "supplier_page" else 0.45,
             )
             attributes_saved += 1
 
+        image_urls = [str(x).strip() for x in (parsed.get("image_urls") or []) if str(x).strip()]
+        if image_urls:
+            set_product_attribute_value(conn, product_id, "main_image", image_urls[0])
+            save_field_source(
+                conn=conn,
+                product_id=product_id,
+                field_name="attr:main_image",
+                source_type=source_type,
+                source_value_raw=image_urls[0],
+                source_url=source_url,
+                confidence=0.75 if source_type == "supplier_page" else 0.5,
+            )
+            if len(image_urls) > 1:
+                set_product_attribute_value(conn, product_id, "gallery_images", json.dumps(image_urls, ensure_ascii=False))
+                save_field_source(
+                    conn=conn,
+                    product_id=product_id,
+                    field_name="attr:gallery_images",
+                    source_type=source_type,
+                    source_value_raw=json.dumps(image_urls, ensure_ascii=False),
+                    source_url=source_url,
+                    confidence=0.7 if source_type == "supplier_page" else 0.45,
+                )
+
+        parse_comment = f"source={source_type}; url={source_url}"
+        if parsed.get("resolved_from_listing"):
+            parse_comment += "; listing->product resolved"
+        if used_fallback:
+            parse_comment += "; web_fallback=1"
+
         if updates:
             set_clause = ", ".join([f"{k} = ?" for k in updates.keys()])
-            params = list(updates.values()) + ["success", None, product_id]
+            params = list(updates.values()) + ["success", parse_comment[:500], product_id]
             conn.execute(
                 f"""
                 UPDATE products
@@ -1526,10 +1610,10 @@ def enrich_product_from_supplier(
                     conn=conn,
                     product_id=product_id,
                     field_name=field_name,
-                    source_type="supplier_page",
+                    source_type=source_type,
                     source_value_raw=value,
-                    source_url=supplier_url,
-                    confidence=0.7,
+                    source_url=source_url,
+                    confidence=0.7 if source_type == "supplier_page" else 0.45,
                 )
         else:
             conn.execute(
@@ -1541,22 +1625,25 @@ def enrich_product_from_supplier(
                     updated_at = CURRENT_TIMESTAMP
                 WHERE id = ?
                 """,
-                ("success", "Новых данных для записи не найдено", product_id),
+                ("success", f"Новых данных для записи не найдено; {parse_comment}"[:500], product_id),
             )
 
         conn.commit()
-        ozon_match = bulk_assign_ozon_categories(conn, [int(product_id)], min_score=0.28, force=False)
+        ozon_match = bulk_assign_ozon_categories(conn, [int(product_id)], min_score=OZON_CATEGORY_MIN_SCORE, force=False)
         skipped_msg = f", пропущено ручных полей: {len(skipped_manual_fields)}" if skipped_manual_fields else ""
         skipped_attr_msg = f", пропущено атрибутов по приоритету: {len(skipped_attribute_fields)}" if skipped_attribute_fields else ""
         ozon_msg = f", Ozon category match: {ozon_match.get('assigned', 0)}" if ozon_match.get("processed") else ""
+        fallback_msg = ", использован web fallback" if used_fallback else ""
         return {
             "ok": True,
-            "message": f"Обогащение завершено, обновлено полей: {len(updates)}, атрибутов сохранено: {attributes_saved}{skipped_msg}{skipped_attr_msg}{ozon_msg}",
+            "message": f"Обогащение завершено, обновлено полей: {len(updates)}, атрибутов сохранено: {attributes_saved}{fallback_msg}{skipped_msg}{skipped_attr_msg}{ozon_msg}",
             "updates": updates,
             "attributes": parsed.get("attributes", {}),
             "image_urls": parsed.get("image_urls", []),
             "skipped_manual_fields": skipped_manual_fields,
             "skipped_attribute_fields": skipped_attribute_fields,
+            "source_url": source_url,
+            "source_type": source_type,
         }
     except Exception as e:
         conn.execute(
@@ -1633,7 +1720,7 @@ def show_product_tab():
     ctop3, ctop4 = st.columns([1, 1])
     with ctop3:
         if st.button("Подобрать Ozon категорию", help="Подобрать эталонную Ozon категорию автоматически"):
-            res = bulk_assign_ozon_categories(conn, [int(product_id)], min_score=0.28, force=False)
+            res = bulk_assign_ozon_categories(conn, [int(product_id)], min_score=OZON_CATEGORY_MIN_SCORE, force=False)
             if res.get("message"):
                 st.info(str(res["message"]))
             else:
@@ -1641,7 +1728,7 @@ def show_product_tab():
             st.rerun()
     with ctop4:
         if st.button("Перепривязать Ozon категорию (force)", help="Повторно назначить Ozon категорию с перезаписью текущей привязки"):
-            res = bulk_assign_ozon_categories(conn, [int(product_id)], min_score=0.28, force=True)
+            res = bulk_assign_ozon_categories(conn, [int(product_id)], min_score=OZON_CATEGORY_MIN_SCORE, force=True)
             if res.get("message"):
                 st.info(str(res["message"]))
             else:
@@ -2244,13 +2331,58 @@ def show_ozon_tab():
     else:
         st.warning("Ozon-креды не заданы в этой сессии. Можно вставить их сюда вручную и сразу выполнить sync.")
 
-    top1, top2 = st.columns(2)
+    if configured and "ozon_monthly_sync_checked" not in st.session_state:
+        with st.spinner("Проверяю ежемесячное автообновление Ozon..."):
+            monthly_result = run_monthly_ozon_autosync_if_due(
+                conn,
+                client_id=client_id or None,
+                api_key=api_key or None,
+                days=30,
+                force=False,
+                max_pairs=None,
+            )
+        st.session_state["ozon_monthly_sync_checked"] = monthly_result
+    monthly_info = st.session_state.get("ozon_monthly_sync_checked")
+    if monthly_info and monthly_info.get("configured"):
+        if monthly_info.get("executed"):
+            sync_result = monthly_info.get("result") or {}
+            st.info(
+                "Ежемесячный auto-sync Ozon выполнен: "
+                f"категорийных пар обработано {int(sync_result.get('pairs_processed') or 0)} из {int(sync_result.get('pairs_total') or 0)}, "
+                f"атрибутов загружено {int(sync_result.get('attributes_total') or 0)}, "
+                f"импортировано в PIM {int(sync_result.get('imported_to_pim') or 0)}."
+            )
+        else:
+            last_sync = monthly_info.get("last_sync_at") or "-"
+            st.caption(f"Ежемесячный auto-sync Ozon не требуется. Последний полный sync: {last_sync}")
+
+    top1, top2, top3 = st.columns(3)
     with top1:
         if st.button("Синхронизировать дерево категорий Ozon", type="primary", disabled=not configured):
             result = sync_category_tree(conn, client_id=client_id or None, api_key=api_key or None)
             st.success(f"Дерево категорий обновлено, записей: {result['total']}")
             st.rerun()
     with top2:
+        if st.button("Полный sync Ozon: все категории и атрибуты", disabled=not configured):
+            with st.spinner("Идёт полный sync Ozon, это может занять время..."):
+                result = sync_all_categories_and_attributes(
+                    conn,
+                    client_id=client_id or None,
+                    api_key=api_key or None,
+                    max_pairs=None,
+                )
+            st.success(
+                "Полный sync завершён: "
+                f"пар обработано {int(result.get('pairs_processed') or 0)} из {int(result.get('pairs_total') or 0)}, "
+                f"атрибутов загружено {int(result.get('attributes_total') or 0)}, "
+                f"импортировано в PIM {int(result.get('imported_to_pim') or 0)}."
+            )
+            if result.get("errors"):
+                st.warning(f"Ошибок при полном sync: {len(result['errors'])}. Первые ошибки показаны ниже.")
+                st.dataframe(pd.DataFrame({"error": result["errors"][:100]}), use_container_width=True, hide_index=True)
+            st.session_state.pop("ozon_monthly_sync_checked", None)
+            st.rerun()
+    with top3:
         category_limit = st.number_input("Сколько категорий показать", min_value=50, max_value=2000, value=200, step=50)
 
     categories = list_cached_categories(conn, limit=int(category_limit))
@@ -3391,6 +3523,11 @@ def show_channels_tab():
 def main():
     st.title("📦 PIM")
     st.caption("PIM для контент-отдела: мастер-карточка, обогащение от поставщика, клиентские шаблоны и экспорт без лишнего ручного труда.")
+    active_db = get_active_db_path() or str(Path("data/catalog.db"))
+    st.caption(f"Текущая база данных: `{active_db}`")
+    low_db = str(active_db).lower()
+    if "\\temp\\pim\\catalog.db" in low_db or "/tmp/pim/catalog.db" in low_db:
+        st.warning("Сейчас используется временная БД. Чтобы каталог не пропадал, задай постоянный путь через переменную окружения `PIM_DB_PATH`.")
 
     with st.expander("Как здесь работать", expanded=False):
         st.markdown(
