@@ -4,6 +4,8 @@ import json
 from io import BytesIO
 import math
 from pathlib import Path
+import threading
+from datetime import datetime, timezone
 from urllib.parse import quote
 
 import pandas as pd
@@ -70,7 +72,7 @@ from services.template_matching import auto_match_template_columns, apply_saved_
 from services.template_profiles import save_template_profile, list_template_profiles, get_template_profile_columns
 from services.readiness_service import analyze_template_readiness
 from services.supplier_profiles import list_supplier_profiles, upsert_supplier_profile
-from services.ozon_api_service import is_configured, sync_category_tree, list_cached_categories, sync_category_attributes, list_cached_attributes, sync_attribute_dictionary_values, sync_all_category_dictionary_values, list_cached_attribute_values, import_cached_attributes_to_pim, suggest_mappings_for_cached_attributes, save_suggested_mappings, analyze_product_ozon_coverage, ensure_ozon_master_attributes, build_product_ozon_payload, materialize_product_ozon_attributes, preview_product_ozon_dictionary_gaps, build_product_ozon_api_attributes, build_bulk_ozon_api_payloads, build_ozon_attributes_update_request, submit_ozon_attributes_update, list_ozon_update_jobs, get_ozon_update_job, retry_ozon_update_job, list_ozon_update_job_items, save_dictionary_override, list_dictionary_overrides, delete_dictionary_override, sync_all_categories_and_attributes, run_monthly_ozon_autosync_if_due
+from services.ozon_api_service import is_configured, sync_category_tree, list_cached_categories, sync_category_attributes, list_cached_attributes, sync_attribute_dictionary_values, sync_all_category_dictionary_values, list_cached_attribute_values, import_cached_attributes_to_pim, suggest_mappings_for_cached_attributes, save_suggested_mappings, analyze_product_ozon_coverage, ensure_ozon_master_attributes, build_product_ozon_payload, materialize_product_ozon_attributes, preview_product_ozon_dictionary_gaps, build_product_ozon_api_attributes, build_bulk_ozon_api_payloads, build_ozon_attributes_update_request, submit_ozon_attributes_update, list_ozon_update_jobs, get_ozon_update_job, retry_ozon_update_job, list_ozon_update_job_items, save_dictionary_override, list_dictionary_overrides, delete_dictionary_override, sync_all_categories_and_attributes
 from services.ozon_category_match import bulk_assign_ozon_categories
 
 st.set_page_config(page_title="PIM", page_icon="📦", layout="wide")
@@ -102,12 +104,91 @@ TEMPLATE_TRANSFORM_OPTIONS = [
     "image_5",
 ]
 OZON_CATEGORY_MIN_SCORE = 0.42
+_OZON_SYNC_BG_LOCK = threading.Lock()
+_OZON_SYNC_BG_THREAD: threading.Thread | None = None
+_OZON_SYNC_BG_STATE: dict[str, object] = {
+    "running": False,
+    "started_at": None,
+    "finished_at": None,
+    "last_error": None,
+    "result": None,
+}
 
 
 def get_db():
     conn = get_connection()
     init_db(conn)
     return conn
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _set_ozon_bg_state(**kwargs) -> None:
+    with _OZON_SYNC_BG_LOCK:
+        _OZON_SYNC_BG_STATE.update(kwargs)
+
+
+def _get_ozon_bg_state() -> dict:
+    with _OZON_SYNC_BG_LOCK:
+        state = dict(_OZON_SYNC_BG_STATE)
+    state["thread_alive"] = bool(_OZON_SYNC_BG_THREAD and _OZON_SYNC_BG_THREAD.is_alive())
+    return state
+
+
+def _ozon_bg_worker(db_path: str, client_id: str, api_key: str) -> None:
+    conn = None
+    try:
+        conn = get_connection(Path(db_path))
+        init_db(conn)
+        result = sync_all_categories_and_attributes(
+            conn,
+            client_id=client_id or None,
+            api_key=api_key or None,
+            max_pairs=None,
+            import_to_pim=True,
+        )
+        _set_ozon_bg_state(
+            running=False,
+            finished_at=_now_iso(),
+            result=result,
+            last_error=None,
+        )
+    except Exception as e:
+        _set_ozon_bg_state(
+            running=False,
+            finished_at=_now_iso(),
+            result=None,
+            last_error=str(e)[:1000],
+        )
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def _start_ozon_bg_sync(client_id: str, api_key: str) -> tuple[bool, str]:
+    global _OZON_SYNC_BG_THREAD
+    state = _get_ozon_bg_state()
+    if state.get("running") and state.get("thread_alive"):
+        return False, "Фоновый Ozon sync уже выполняется."
+    active_db = _get_active_db_path() or str(Path("data/catalog.db"))
+    _set_ozon_bg_state(
+        running=True,
+        started_at=_now_iso(),
+        finished_at=None,
+        result=None,
+        last_error=None,
+        db_path=active_db,
+    )
+    _OZON_SYNC_BG_THREAD = threading.Thread(
+        target=_ozon_bg_worker,
+        args=(str(active_db), str(client_id or ""), str(api_key or "")),
+        daemon=True,
+        name="ozon-full-sync-bg",
+    )
+    _OZON_SYNC_BG_THREAD.start()
+    return True, f"Фоновый Ozon sync запущен. База: {active_db}"
 
 
 def to_attribute_code(name: str) -> str:
@@ -201,6 +282,35 @@ def load_product_ids(
         import_batch_id=import_batch_id,
         parse_filter=parse_filter,
     )
+    sql = "SELECT id FROM products"
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY id DESC"
+    if limit is not None:
+        sql += " LIMIT ? OFFSET ?"
+        params.extend([int(limit), int(offset)])
+    rows = conn.execute(sql, params).fetchall()
+    return [int(r["id"]) for r in rows]
+
+
+def load_product_ids_with_supplier_url(
+    conn,
+    search: str = "",
+    category: str = "",
+    supplier: str = "",
+    import_batch_id: str = "",
+    parse_filter: str = "Все",
+    limit: int | None = None,
+    offset: int = 0,
+) -> list[int]:
+    where, params = _build_product_filters(
+        search=search,
+        category=category,
+        supplier=supplier,
+        import_batch_id=import_batch_id,
+        parse_filter=parse_filter,
+    )
+    where.append("supplier_url IS NOT NULL AND TRIM(supplier_url) <> ''")
     sql = "SELECT id FROM products"
     if where:
         sql += " WHERE " + " AND ".join(where)
@@ -1164,6 +1274,7 @@ def show_catalog_tab():
 - `Скачать текущую страницу Excel`: выгружает только отображаемую страницу.
 - `Обновить дубли по текущей выборке`: пересчет дублей по текущей странице.
 - `Обогатить поставщика по текущей странице`: парсинг supplier_url батчами с лимитом и таймаутом.
+- `Обогатить поставщика по всей выборке фильтра`: запуск enrichment не только по странице, а по всей текущей фильтрации.
 - `Автопривязать Ozon категории`: автоподбор Ozon категории.
 - `Перепривязать Ozon категории (force)`: автоподбор с перезаписью.
             """
@@ -1252,18 +1363,38 @@ def show_catalog_tab():
         for _, row in df.iterrows()
         if str(row.get("supplier_url") or "").strip()
     ]
-    bc1, bc2 = st.columns(2)
+    filtered_supplier_candidate_ids = load_product_ids_with_supplier_url(
+        conn,
+        search=search,
+        category=category,
+        supplier=supplier,
+        import_batch_id=batch_id or "",
+        parse_filter=parse_filter,
+        limit=None,
+        offset=0,
+    )
+    bc1, bc2, bc3 = st.columns(3)
     with bc1:
-        max_bulk_enrich = st.number_input(
-            "Лимит обогащения за запуск",
+        max_bulk_enrich_page = st.number_input(
+            "Лимит (текущая страница)",
             min_value=1,
-            max_value=200,
+            max_value=1000,
             value=min(20, max(1, len(supplier_candidate_ids))),
             step=1,
-            help="Ограничивает количество товаров за один запуск, чтобы Streamlit Cloud не зависал.",
-            key="catalog_max_bulk_enrich",
+            help="Сколько товаров обогащать за один запуск по текущей странице.",
+            key="catalog_max_bulk_enrich_page",
         )
     with bc2:
+        max_bulk_enrich_filtered = st.number_input(
+            "Лимит (вся выборка фильтра)",
+            min_value=1,
+            max_value=10000,
+            value=min(300, max(1, len(filtered_supplier_candidate_ids))),
+            step=10,
+            help="Сколько товаров обогащать за один запуск по всей выборке фильтров.",
+            key="catalog_max_bulk_enrich_filtered",
+        )
+    with bc3:
         supplier_timeout_seconds = st.number_input(
             "Таймаут supplier_url, сек",
             min_value=2,
@@ -1273,12 +1404,57 @@ def show_catalog_tab():
             help="Максимальное время ожидания ответа от сайта поставщика для одного товара.",
             key="catalog_supplier_timeout_seconds",
         )
+    enrich_force = st.checkbox(
+        "Перезаписывать значения (force, кроме manual)",
+        value=False,
+        help="Если включено, enrichment сможет перезаписывать не пустые значения, но manual-поля останутся защищены.",
+        key="catalog_enrich_force",
+    )
     st.caption(
-        f"Кандидатов к обогащению на странице: {len(supplier_candidate_ids)}. "
-        f"За один запуск будет обработано до {int(max_bulk_enrich)}."
+        f"Кандидатов: страница {len(supplier_candidate_ids)}, вся выборка {len(filtered_supplier_candidate_ids)}. "
+        f"Лимиты: страница {int(max_bulk_enrich_page)}, выборка {int(max_bulk_enrich_filtered)}."
     )
 
-    b1, b2 = st.columns(2)
+    def run_supplier_enrichment_batch(candidate_ids: list[int], run_limit: int, run_label: str) -> None:
+        if not candidate_ids:
+            st.info(f"Для режима `{run_label}` нет товаров с supplier_url.")
+            return
+        target_ids = candidate_ids[: int(run_limit)]
+        progress = st.progress(0)
+        processed = 0
+        success = 0
+        failed = 0
+        used_fallback = 0
+        resolved_from_listing = 0
+        for i, pid in enumerate(target_ids, start=1):
+            current_row = get_product(conn, int(pid))
+            current_supplier_url = str(current_row["supplier_url"] or "").strip() if current_row and "supplier_url" in current_row.keys() else ""
+            try:
+                result = enrich_product_from_supplier(
+                    conn,
+                    int(pid),
+                    force=bool(enrich_force),
+                    timeout_seconds=float(supplier_timeout_seconds),
+                )
+                if result.get("ok"):
+                    success += 1
+                    if str(result.get("source_type") or "") == "web_search_fallback":
+                        used_fallback += 1
+                    if str(result.get("source_url") or "").strip() and str(result.get("source_url") or "").strip() != current_supplier_url:
+                        resolved_from_listing += 1
+                else:
+                    failed += 1
+            except Exception:
+                failed += 1
+            processed += 1
+            progress.progress(i / len(target_ids))
+        skipped_by_limit = max(0, len(candidate_ids) - len(target_ids))
+        st.success(
+            f"[{run_label}] Обогащение завершено: обработано {processed}, успешно {success}, ошибок {failed}, "
+            f"fallback {used_fallback}, listing->product {resolved_from_listing}, отложено по лимиту {skipped_by_limit}."
+        )
+
+    b1, b2, b3 = st.columns(3)
     with b1:
         if st.button("Обновить дубли по текущей выборке", help="Пересчитать кандидатов дублей только для товаров на текущей странице"):
             total = 0
@@ -1290,36 +1466,18 @@ def show_catalog_tab():
             st.success(f"Проверка дублей завершена: {total} товаров")
     with b2:
         if st.button("Обогатить поставщика по текущей странице", help="Запустить supplier parsing для товаров текущей страницы, где заполнен supplier_url"):
-            if not supplier_candidate_ids:
-                st.info("На текущей странице нет товаров с заполненным supplier_url.")
-            else:
-                target_ids = supplier_candidate_ids[: int(max_bulk_enrich)]
-                progress = st.progress(0)
-                processed = 0
-                success = 0
-                failed = 0
-                for i, pid in enumerate(target_ids, start=1):
-                    try:
-                        result = enrich_product_from_supplier(
-                            conn,
-                            int(pid),
-                            force=False,
-                            timeout_seconds=float(supplier_timeout_seconds),
-                        )
-                        if result.get("ok"):
-                            success += 1
-                        else:
-                            failed += 1
-                    except Exception:
-                        failed += 1
-                    processed += 1
-                    progress.progress(i / len(target_ids))
-                skipped_by_limit = max(0, len(supplier_candidate_ids) - len(target_ids))
-                st.success(
-                    "Обогащение поставщика завершено: "
-                    f"обработано {processed}, успешно {success}, ошибок {failed}, "
-                    f"отложено по лимиту {skipped_by_limit}."
-                )
+            run_supplier_enrichment_batch(
+                candidate_ids=supplier_candidate_ids,
+                run_limit=int(max_bulk_enrich_page),
+                run_label="Текущая страница",
+            )
+    with b3:
+        if st.button("Обогатить поставщика по всей выборке фильтра", help="Запустить supplier parsing для всех товаров текущих фильтров, где заполнен supplier_url"):
+            run_supplier_enrichment_batch(
+                candidate_ids=filtered_supplier_candidate_ids,
+                run_limit=int(max_bulk_enrich_filtered),
+                run_label="Вся выборка фильтра",
+            )
     cextra1, cextra2 = st.columns(2)
     with cextra1:
         if st.button("Автопривязать Ozon категории (текущая страница)", help="Автоподбор эталонной Ozon категории для товаров этой страницы"):
@@ -2370,31 +2528,6 @@ def show_ozon_tab():
     else:
         st.warning("Ozon-креды не заданы в этой сессии. Можно вставить их сюда вручную и сразу выполнить sync.")
 
-    if configured and "ozon_monthly_sync_checked" not in st.session_state:
-        with st.spinner("Проверяю ежемесячное автообновление Ozon..."):
-            monthly_result = run_monthly_ozon_autosync_if_due(
-                conn,
-                client_id=client_id or None,
-                api_key=api_key or None,
-                days=30,
-                force=False,
-                max_pairs=None,
-            )
-        st.session_state["ozon_monthly_sync_checked"] = monthly_result
-    monthly_info = st.session_state.get("ozon_monthly_sync_checked")
-    if monthly_info and monthly_info.get("configured"):
-        if monthly_info.get("executed"):
-            sync_result = monthly_info.get("result") or {}
-            st.info(
-                "Ежемесячный auto-sync Ozon выполнен: "
-                f"категорийных пар обработано {int(sync_result.get('pairs_processed') or 0)} из {int(sync_result.get('pairs_total') or 0)}, "
-                f"атрибутов загружено {int(sync_result.get('attributes_total') or 0)}, "
-                f"импортировано в PIM {int(sync_result.get('imported_to_pim') or 0)}."
-            )
-        else:
-            last_sync = monthly_info.get("last_sync_at") or "-"
-            st.caption(f"Ежемесячный auto-sync Ozon не требуется. Последний полный sync: {last_sync}")
-
     top1, top2, top3 = st.columns(3)
     with top1:
         if st.button("Синхронизировать дерево категорий Ozon", type="primary", disabled=not configured):
@@ -2402,27 +2535,34 @@ def show_ozon_tab():
             st.success(f"Дерево категорий обновлено, записей: {result['total']}")
             st.rerun()
     with top2:
-        if st.button("Полный sync Ozon: все категории и атрибуты", disabled=not configured):
-            with st.spinner("Идёт полный sync Ozon, это может занять время..."):
-                result = sync_all_categories_and_attributes(
-                    conn,
-                    client_id=client_id or None,
-                    api_key=api_key or None,
-                    max_pairs=None,
-                )
-            st.success(
-                "Полный sync завершён: "
-                f"пар обработано {int(result.get('pairs_processed') or 0)} из {int(result.get('pairs_total') or 0)}, "
-                f"атрибутов загружено {int(result.get('attributes_total') or 0)}, "
-                f"импортировано в PIM {int(result.get('imported_to_pim') or 0)}."
-            )
-            if result.get("errors"):
-                st.warning(f"Ошибок при полном sync: {len(result['errors'])}. Первые ошибки показаны ниже.")
-                st.dataframe(pd.DataFrame({"error": result["errors"][:100]}), use_container_width=True, hide_index=True)
-            st.session_state.pop("ozon_monthly_sync_checked", None)
-            st.rerun()
+        if st.button("Запустить полный sync Ozon в фоне", disabled=not configured):
+            ok, message = _start_ozon_bg_sync(client_id=client_id or "", api_key=api_key or "")
+            if ok:
+                st.success(message)
+            else:
+                st.info(message)
     with top3:
         category_limit = st.number_input("Сколько категорий показать", min_value=50, max_value=2000, value=200, step=50)
+
+    bg_state = _get_ozon_bg_state()
+    if bg_state.get("running"):
+        st.info(
+            "Фоновый Ozon sync выполняется. "
+            f"Старт: {bg_state.get('started_at') or '-'}."
+        )
+    elif bg_state.get("last_error"):
+        st.error(f"Фоновый Ozon sync завершился с ошибкой: {bg_state.get('last_error')}")
+    elif bg_state.get("result"):
+        r = bg_state.get("result") or {}
+        st.success(
+            "Фоновый Ozon sync завершён: "
+            f"пар обработано {int(r.get('pairs_processed') or 0)} из {int(r.get('pairs_total') or 0)}, "
+            f"атрибутов загружено {int(r.get('attributes_total') or 0)}, "
+            f"импортировано в PIM {int(r.get('imported_to_pim') or 0)}."
+        )
+        if r.get("errors"):
+            st.warning(f"Ошибок в фоновом sync: {len(r['errors'])}.")
+    st.caption("Полный Ozon sync теперь запускается в фоне и не блокирует работу с остальными разделами.")
 
     categories = list_cached_categories(conn, limit=int(category_limit))
     if categories:

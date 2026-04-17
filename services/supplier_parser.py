@@ -312,15 +312,51 @@ def _score_link_by_hints(url: str, title: str, hints: list[str]) -> float:
     return score
 
 
+def _build_strong_hint_sets(hints: list[str]) -> tuple[set[str], set[str]]:
+    strong_tokens: set[str] = set()
+    strong_phrases: set[str] = set()
+    for hint in hints:
+        clean = _clean_text(hint).lower()
+        if not clean:
+            continue
+        compact = re.sub(r"[\s\-_]+", "", clean)
+        has_digit = any(ch.isdigit() for ch in compact)
+        has_alpha = any(ch.isalpha() for ch in compact)
+        if len(compact) >= 5 and has_digit and has_alpha:
+            strong_phrases.add(compact)
+        for tok in re.findall(r"[a-zA-Zа-яА-Я0-9]+", clean):
+            if len(tok) >= 4 and (any(ch.isdigit() for ch in tok) or len(tok) >= 6):
+                strong_tokens.add(tok.lower())
+    return strong_tokens, strong_phrases
+
+
 def _best_product_url_from_listing(soup: BeautifulSoup, page_url: str, hints: list[str]) -> str | None:
     scored: list[tuple[float, str]] = []
+    strong_tokens, strong_phrases = _build_strong_hint_sets(hints)
+    has_strong_hints = bool(strong_tokens or strong_phrases)
     for a in soup.find_all("a", href=True):
         href = _clean_text(a.get("href"))
         if not href:
             continue
         full = urljoin(page_url, href)
+        low_full = full.lower()
+        # De-prioritize obvious listing/search links.
+        if re.search(r"(category=|/catalog/?$|/search|[?&]q=|[?&]s=)", low_full):
+            continue
         title = _clean_text(a.get_text(" ", strip=True))
         score = _score_link_by_hints(full, title, hints)
+        src_norm = re.sub(r"[\s\-_]+", "", f"{low_full} {title.lower()}")
+        strong_hit = False
+        for token in strong_tokens:
+            if token in low_full or token in title.lower():
+                score += 4.0
+                strong_hit = True
+        for phrase in strong_phrases:
+            if phrase in src_norm:
+                score += 6.0
+                strong_hit = True
+        if has_strong_hints and not strong_hit:
+            score -= 3.0
         if score <= 0:
             continue
         scored.append((score, full))
