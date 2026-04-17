@@ -11,7 +11,12 @@ import sqlite3
 import streamlit as st
 from openpyxl import load_workbook
 
-from db import get_connection, init_db, get_active_db_path
+from db import get_connection, init_db
+try:
+    from db import get_active_db_path as _get_active_db_path
+except Exception:
+    def _get_active_db_path():
+        return None
 from services.attribute_service import (
     get_product_attribute_values,
     list_attribute_definitions,
@@ -3523,7 +3528,7 @@ def show_channels_tab():
 def main():
     st.title("📦 PIM")
     st.caption("PIM для контент-отдела: мастер-карточка, обогащение от поставщика, клиентские шаблоны и экспорт без лишнего ручного труда.")
-    active_db = get_active_db_path() or str(Path("data/catalog.db"))
+    active_db = _get_active_db_path() or str(Path("data/catalog.db"))
     st.caption(f"Текущая база данных: `{active_db}`")
     low_db = str(active_db).lower()
     if "\\temp\\pim\\catalog.db" in low_db or "/tmp/pim/catalog.db" in low_db:
