@@ -31,7 +31,41 @@ from services.catalog_service import import_catalog_from_excel
 from services.duplicate_service import refresh_duplicates_for_product
 from services.source_tracking import get_field_sources, save_field_source, get_latest_field_source, field_is_manual
 from services.source_priority import can_overwrite_field
-from services.supplier_parser import parse_supplier_product_page, has_meaningful_supplier_data, fallback_search_product_data
+try:
+    from services import supplier_parser as _supplier_parser
+except Exception:
+    _supplier_parser = None
+
+
+def parse_supplier_product_page(url: str, hints: list[str] | None = None, timeout: float = 8.0, max_hops: int = 1) -> dict:
+    if _supplier_parser is not None and hasattr(_supplier_parser, "parse_supplier_product_page"):
+        return _supplier_parser.parse_supplier_product_page(url, hints=hints, timeout=timeout, max_hops=max_hops)
+    if _supplier_parser is not None and all(hasattr(_supplier_parser, x) for x in ("fetch_supplier_page", "extract_supplier_data", "normalize_supplier_data")):
+        html = _supplier_parser.fetch_supplier_page(url, timeout=timeout)
+        raw = _supplier_parser.extract_supplier_data(html, url)
+        parsed = _supplier_parser.normalize_supplier_data(raw)
+        parsed["resolved_url"] = url
+        parsed["resolved_from_listing"] = False
+        return parsed
+    raise RuntimeError("Supplier parser module is unavailable")
+
+
+def has_meaningful_supplier_data(parsed: dict) -> bool:
+    if _supplier_parser is not None and hasattr(_supplier_parser, "has_meaningful_supplier_data"):
+        return bool(_supplier_parser.has_meaningful_supplier_data(parsed))
+    if not parsed:
+        return False
+    for key in ("description", "image_url", "weight", "length", "width", "height", "gross_weight"):
+        if parsed.get(key) not in (None, "", 0, 0.0):
+            return True
+    attrs = parsed.get("attributes") or {}
+    return bool(attrs)
+
+
+def fallback_search_product_data(query: str, timeout: float = 8.0, max_results: int = 3) -> dict:
+    if _supplier_parser is not None and hasattr(_supplier_parser, "fallback_search_product_data"):
+        return _supplier_parser.fallback_search_product_data(query, timeout=timeout, max_results=max_results)
+    return {}
 from services.template_matching import auto_match_template_columns, apply_saved_mapping_rules, fill_template_dataframe, apply_client_validated_values, fill_template_workbook_bytes, dataframe_to_excel_bytes, detect_template_data_start_row, sanitize_template_xlsx_bytes
 from services.template_profiles import save_template_profile, list_template_profiles, get_template_profile_columns
 from services.readiness_service import analyze_template_readiness
