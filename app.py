@@ -1311,12 +1311,13 @@ def show_catalog_tab():
     )
     total_pages = max(1, int(math.ceil(total_rows / max(int(page_size), 1))))
     page_options = list(range(1, total_pages + 1))
-    current_page = int(st.session_state.get("catalog_page", 1))
+    current_page = int(st.session_state.get("catalog_page_current", st.session_state.get("catalog_page", 1)))
     if current_page > total_pages:
         current_page = 1
     p1, p2, p3 = st.columns([1, 1, 3])
     with p1:
-        page = st.selectbox("Страница", options=page_options, index=page_options.index(current_page), key="catalog_page")
+        page = st.selectbox("Страница", options=page_options, index=page_options.index(current_page), key="catalog_page_widget")
+        st.session_state["catalog_page_current"] = int(page)
     with p2:
         st.metric("Всего страниц", total_pages)
     with p3:
@@ -1606,11 +1607,11 @@ def show_catalog_tab():
     nav1, nav2, nav3 = st.columns([1, 1, 4])
     with nav1:
         if st.button("◀ Назад", disabled=int(page) <= 1, help="Перейти на предыдущую страницу каталога", key="catalog_nav_prev_bottom"):
-            st.session_state["catalog_page"] = int(page) - 1
+            st.session_state["catalog_page_current"] = int(page) - 1
             st.rerun()
     with nav2:
         if st.button("Вперед ▶", disabled=int(page) >= total_pages, help="Перейти на следующую страницу каталога", key="catalog_nav_next_bottom"):
-            st.session_state["catalog_page"] = int(page) + 1
+            st.session_state["catalog_page_current"] = int(page) + 1
             st.rerun()
     with nav3:
         st.caption(f"Навигация по каталогу: страница {int(page)} из {int(total_pages)}")
@@ -1649,8 +1650,27 @@ def enrich_product_from_supplier(
         source_type = "supplier_page"
         used_fallback = False
 
-        if not has_meaningful_supplier_data(parsed):
-            fallback_query_parts = [str(product["name"] or "").strip(), str(product["article"] or "").strip(), str(product["brand"] or "").strip()]
+        dim_fields = [
+            "weight",
+            "gross_weight",
+            "length",
+            "width",
+            "height",
+            "package_length",
+            "package_width",
+            "package_height",
+        ]
+        has_dims = any(parsed.get(k) not in (None, "", 0, 0.0) for k in dim_fields)
+        need_fallback = (not has_meaningful_supplier_data(parsed)) or bool(parsed.get("listing_only")) or (not has_dims)
+
+        if need_fallback:
+            fallback_query_parts = [
+                str(product["name"] or "").strip(),
+                str(product["article"] or "").strip(),
+                str(product["supplier_article"] or "").strip(),
+                str(product["brand"] or "").strip(),
+                "габариты",
+            ]
             fallback_query = " ".join([p for p in fallback_query_parts if p])
             fallback = fallback_search_product_data(fallback_query, timeout=float(timeout_seconds), max_results=3)
             if fallback and has_meaningful_supplier_data(fallback):

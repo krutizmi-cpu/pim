@@ -233,7 +233,59 @@ def _parse_dimensions_from_text(page_text: str) -> dict[str, float | None]:
             else:
                 out[field] = _convert_dimension(value, unit)
             break
+
+    # Parse combined patterns like "размеры 120x30x70 см" or "ДхШхВ 120*30*70 мм".
+    triplet_patterns = [
+        r"(упаков[а-яa-z\s]{0,20})?(\d+[\.,]?\d*)\s*[xх\*]\s*(\d+[\.,]?\d*)\s*[xх\*]\s*(\d+[\.,]?\d*)\s*(мм|см|м|mm|cm|m)",
+    ]
+    for pattern in triplet_patterns:
+        for match in re.finditer(pattern, lowered, flags=re.IGNORECASE):
+            prefix = (match.group(1) or "").strip()
+            v1 = _to_float(match.group(2))
+            v2 = _to_float(match.group(3))
+            v3 = _to_float(match.group(4))
+            unit = match.group(5)
+            if v1 is None or v2 is None or v3 is None:
+                continue
+            d1 = _convert_dimension(v1, unit)
+            d2 = _convert_dimension(v2, unit)
+            d3 = _convert_dimension(v3, unit)
+            if "упаков" in prefix:
+                if out["package_length"] is None:
+                    out["package_length"] = d1
+                if out["package_width"] is None:
+                    out["package_width"] = d2
+                if out["package_height"] is None:
+                    out["package_height"] = d3
+            else:
+                if out["length"] is None:
+                    out["length"] = d1
+                if out["width"] is None:
+                    out["width"] = d2
+                if out["height"] is None:
+                    out["height"] = d3
     return out
+
+
+def _parse_triplet_value(value_t: str) -> tuple[float, float, float, str] | None:
+    m = re.search(
+        r"(\d+[\.,]?\d*)\s*[xх\*]\s*(\d+[\.,]?\d*)\s*[xх\*]\s*(\d+[\.,]?\d*)\s*(мм|см|м|mm|cm|m)?",
+        value_t.lower(),
+    )
+    if not m:
+        return None
+    v1 = _to_float(m.group(1))
+    v2 = _to_float(m.group(2))
+    v3 = _to_float(m.group(3))
+    unit = m.group(4) or "см"
+    if v1 is None or v2 is None or v3 is None:
+        return None
+    return (
+        float(_convert_dimension(v1, unit) or 0.0),
+        float(_convert_dimension(v2, unit) or 0.0),
+        float(_convert_dimension(v3, unit) or 0.0),
+        unit,
+    )
 
 
 def _apply_dimension_attributes(result: dict[str, Any]) -> None:
@@ -252,6 +304,24 @@ def _apply_dimension_attributes(result: dict[str, Any]) -> None:
         value_t = _clean_text(attr_value)
         if not value_t:
             continue
+        triplet = _parse_triplet_value(value_t)
+        if triplet:
+            d1, d2, d3, _unit = triplet
+            if any(h in key_l for h in ("габарит", "размер", "дхшхв", "lwh", "dimension")):
+                if any(h in key_l for h in ("упаков", "короб", "package", "packing", "box")):
+                    if result.get("package_length") is None:
+                        result["package_length"] = d1
+                    if result.get("package_width") is None:
+                        result["package_width"] = d2
+                    if result.get("package_height") is None:
+                        result["package_height"] = d3
+                else:
+                    if result.get("length") is None:
+                        result["length"] = d1
+                    if result.get("width") is None:
+                        result["width"] = d2
+                    if result.get("height") is None:
+                        result["height"] = d3
         for field, hints in key_map.items():
             if result.get(field) is not None:
                 continue
@@ -562,8 +632,28 @@ def parse_supplier_product_page(
                 parsed = second_parsed
                 resolved_url = best_url
 
+    listing_only = parsed.get("page_kind") != "product"
+    if listing_only:
+        # Avoid writing generic listing data to all products.
+        for key in (
+            "weight",
+            "gross_weight",
+            "length",
+            "width",
+            "height",
+            "package_length",
+            "package_width",
+            "package_height",
+            "category",
+        ):
+            parsed[key] = None
+        parsed["attributes"] = {}
+        parsed["image_urls"] = []
+        parsed["image_url"] = None
+
     parsed["resolved_url"] = resolved_url
     parsed["resolved_from_listing"] = bool(resolved_url != raw_url)
+    parsed["listing_only"] = bool(listing_only)
     return parsed
 
 
