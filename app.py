@@ -72,8 +72,9 @@ from services.template_matching import auto_match_template_columns, apply_saved_
 from services.template_profiles import save_template_profile, list_template_profiles, get_template_profile_columns
 from services.readiness_service import analyze_template_readiness
 from services.supplier_profiles import list_supplier_profiles, upsert_supplier_profile
-from services.ozon_api_service import is_configured, sync_category_tree, list_cached_categories, sync_category_attributes, list_cached_attributes, sync_attribute_dictionary_values, sync_all_category_dictionary_values, list_cached_attribute_values, import_cached_attributes_to_pim, suggest_mappings_for_cached_attributes, save_suggested_mappings, analyze_product_ozon_coverage, ensure_ozon_master_attributes, build_product_ozon_payload, materialize_product_ozon_attributes, preview_product_ozon_dictionary_gaps, build_product_ozon_api_attributes, build_bulk_ozon_api_payloads, build_ozon_attributes_update_request, submit_ozon_attributes_update, list_ozon_update_jobs, get_ozon_update_job, retry_ozon_update_job, list_ozon_update_job_items, save_dictionary_override, list_dictionary_overrides, delete_dictionary_override, sync_all_categories_and_attributes
+from services.ozon_api_service import is_configured, sync_category_tree, list_cached_categories, list_cached_category_pairs, get_ozon_cache_stats, sync_category_attributes, list_cached_attributes, sync_attribute_dictionary_values, sync_all_category_dictionary_values, list_cached_attribute_values, import_cached_attributes_to_pim, import_all_cached_attributes_to_pim, suggest_mappings_for_cached_attributes, save_suggested_mappings, analyze_product_ozon_coverage, ensure_ozon_master_attributes, build_product_ozon_payload, materialize_product_ozon_attributes, preview_product_ozon_dictionary_gaps, build_product_ozon_api_attributes, build_bulk_ozon_api_payloads, build_ozon_attributes_update_request, submit_ozon_attributes_update, list_ozon_update_jobs, get_ozon_update_job, retry_ozon_update_job, list_ozon_update_job_items, save_dictionary_override, list_dictionary_overrides, delete_dictionary_override, sync_all_categories_and_attributes
 from services.ozon_category_match import bulk_assign_ozon_categories
+from services.dimension_fallback import infer_category_fields, infer_dimensions_from_catalog, is_dimension_payload_suspicious
 
 st.set_page_config(page_title="PIM", page_icon="📦", layout="wide")
 OZON_OFFER_ID_OPTIONS = ["article", "internal_article", "supplier_article"]
@@ -1628,6 +1629,7 @@ def enrich_product_from_supplier(
     product = get_product(conn, product_id)
     if not product:
         return {"ok": False, "message": "Товар не найден"}
+    product_row = dict(product)
 
     supplier_url = (product["supplier_url"] or "").strip() if product["supplier_url"] else ""
     if not supplier_url:
@@ -1649,6 +1651,8 @@ def enrich_product_from_supplier(
         source_url = parsed.get("resolved_url") or supplier_url
         source_type = "supplier_page"
         used_fallback = False
+        used_stats_fallback = False
+        field_source_types: dict[str, str] = {}
 
         dim_fields = [
             "weight",
@@ -1661,7 +1665,7 @@ def enrich_product_from_supplier(
             "package_height",
         ]
         has_dims = any(parsed.get(k) not in (None, "", 0, 0.0) for k in dim_fields)
-        need_fallback = (not has_meaningful_supplier_data(parsed)) or bool(parsed.get("listing_only")) or (not has_dims)
+        need_fallback = (not has_meaningful_supplier_data(parsed)) or bool(parsed.get("listing_only")) or (not has_dims) or is_dimension_payload_suspicious(parsed)
 
         if need_fallback:
             fallback_query_parts = [
@@ -1690,29 +1694,87 @@ def enrich_product_from_supplier(
                 source_url = fallback.get("fallback_url") or source_url
                 source_type = "web_search_fallback"
                 used_fallback = True
+                for key in [
+                    "name",
+                    "brand",
+                    "category",
+                    "description",
+                    "image_url",
+                    "weight",
+                    "gross_weight",
+                    "length",
+                    "width",
+                    "height",
+                    "package_length",
+                    "package_width",
+                    "package_height",
+                ]:
+                    if fallback.get(key) not in (None, "", 0, 0.0):
+                        field_source_types[key] = "web_search_fallback"
+
+        category_inferred = infer_category_fields(
+            {
+                "name": parsed.get("name") or product_row.get("name"),
+                "category": parsed.get("category") or product_row.get("category"),
+                "base_category": product_row.get("base_category"),
+                "subcategory": product_row.get("subcategory"),
+            }
+        )
+        weak_categories = {"товары", "каталог", "продукция", "все товары", "catalog", "products", "shop"}
+        if (
+            category_inferred.get("category")
+            and (
+                parsed.get("category") in (None, "")
+                or str(parsed.get("category") or "").strip().lower() in weak_categories
+            )
+        ):
+            parsed["category"] = category_inferred.get("category")
+            field_source_types["category"] = "name_category_inference"
+        if category_inferred.get("base_category"):
+            parsed["base_category"] = category_inferred.get("base_category")
+            field_source_types["base_category"] = "name_category_inference"
+        if category_inferred.get("subcategory"):
+            parsed["subcategory"] = category_inferred.get("subcategory")
+            field_source_types["subcategory"] = "name_category_inference"
+        if category_inferred.get("wheel_diameter_inch") is not None:
+            parsed["wheel_diameter_inch"] = category_inferred.get("wheel_diameter_inch")
+            field_source_types["wheel_diameter_inch"] = "name_category_inference"
+
+        has_dims_after_web = any(parsed.get(k) not in (None, "", 0, 0.0) for k in dim_fields)
+        if (not has_dims_after_web) or is_dimension_payload_suspicious(parsed):
+            stats_fallback = infer_dimensions_from_catalog(conn, product_row, min_samples=4)
+            if stats_fallback.get("found"):
+                for key, value in (stats_fallback.get("values") or {}).items():
+                    if parsed.get(key) in (None, "", 0, 0.0):
+                        parsed[key] = value
+                        field_source_types[key] = "category_stats_fallback"
+                used_stats_fallback = True
 
         if not has_meaningful_supplier_data(parsed):
-            conn.execute(
-                """
-                UPDATE products
-                SET supplier_parse_status = ?,
-                    supplier_parse_comment = ?,
-                    supplier_last_parsed_at = CURRENT_TIMESTAMP,
-                    updated_at = CURRENT_TIMESTAMP
-                WHERE id = ?
-                """,
-                ("error", "Не удалось получить полезные данные: supplier_url не содержит карточку товара", product_id),
-            )
-            conn.commit()
-            return {"ok": False, "message": "Не удалось получить полезные данные с supplier_url или через web fallback"}
+            if not used_stats_fallback:
+                conn.execute(
+                    """
+                    UPDATE products
+                    SET supplier_parse_status = ?,
+                        supplier_parse_comment = ?,
+                        supplier_last_parsed_at = CURRENT_TIMESTAMP,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    """,
+                    ("error", "Не удалось получить полезные данные: supplier_url не содержит карточку товара", product_id),
+                )
+                conn.commit()
+                return {"ok": False, "message": "Не удалось получить полезные данные с supplier_url или через web fallback"}
 
         updates = {}
         skipped_manual_fields = []
-        weak_categories = {"товары", "каталог", "продукция", "все товары", "catalog", "products", "shop"}
         fields = [
             "name",
             "brand",
             "category",
+            "base_category",
+            "subcategory",
+            "wheel_diameter_inch",
             "description",
             "image_url",
             "weight",
@@ -1734,7 +1796,8 @@ def enrich_product_from_supplier(
             if field_is_manual(conn, product_id, field) and not force:
                 skipped_manual_fields.append(field)
                 continue
-            if not can_overwrite_field(conn, product_id, field, source_type, force=force):
+            row_source_type = field_source_types.get(field, source_type)
+            if not can_overwrite_field(conn, product_id, field, row_source_type, force=force):
                 skipped_manual_fields.append(field)
                 continue
             if old_value not in (None, "", 0, 0.0) and not force:
@@ -1806,6 +1869,8 @@ def enrich_product_from_supplier(
             parse_comment += "; listing->product resolved"
         if used_fallback:
             parse_comment += "; web_fallback=1"
+        if used_stats_fallback:
+            parse_comment += "; category_stats_fallback=1"
 
         if updates:
             set_clause = ", ".join([f"{k} = ?" for k in updates.keys()])
@@ -1823,14 +1888,25 @@ def enrich_product_from_supplier(
                 params,
             )
             for field_name, value in updates.items():
+                row_source_type = field_source_types.get(field_name, source_type)
                 save_field_source(
                     conn=conn,
                     product_id=product_id,
                     field_name=field_name,
-                    source_type=source_type,
+                    source_type=row_source_type,
                     source_value_raw=value,
                     source_url=source_url,
-                    confidence=0.7 if source_type == "supplier_page" else 0.45,
+                    confidence=(
+                        0.72
+                        if row_source_type == "supplier_page"
+                        else 0.58
+                        if row_source_type == "web_search_fallback"
+                        else 0.38
+                        if row_source_type == "category_stats_fallback"
+                        else 0.65
+                        if row_source_type == "name_category_inference"
+                        else 0.45
+                    ),
                 )
         else:
             conn.execute(
@@ -1851,9 +1927,10 @@ def enrich_product_from_supplier(
         skipped_attr_msg = f", пропущено атрибутов по приоритету: {len(skipped_attribute_fields)}" if skipped_attribute_fields else ""
         ozon_msg = f", Ozon category match: {ozon_match.get('assigned', 0)}" if ozon_match.get("processed") else ""
         fallback_msg = ", использован web fallback" if used_fallback else ""
+        stats_msg = ", использован category-stats fallback" if used_stats_fallback else ""
         return {
             "ok": True,
-            "message": f"Обогащение завершено, обновлено полей: {len(updates)}, атрибутов сохранено: {attributes_saved}{fallback_msg}{skipped_msg}{skipped_attr_msg}{ozon_msg}",
+            "message": f"Обогащение завершено, обновлено полей: {len(updates)}, атрибутов сохранено: {attributes_saved}{fallback_msg}{stats_msg}{skipped_msg}{skipped_attr_msg}{ozon_msg}",
             "updates": updates,
             "attributes": parsed.get("attributes", {}),
             "image_urls": parsed.get("image_urls", []),
@@ -2102,20 +2179,77 @@ def show_product_tab():
 
 
 def show_attributes_tab():
-    product_id = st.session_state.get("selected_product_id")
-    if not product_id:
-        st.info("Сначала выбери товар во вкладке Каталог")
-        return
-
     conn = get_db()
+    product_id = st.session_state.get("selected_product_id")
+    st.caption("Справочник атрибутов можно фильтровать по категории Ozon, чтобы работать с большим количеством полей без шума.")
+
+    category_rows = conn.execute(
+        """
+        SELECT DISTINCT category_code
+        FROM channel_attribute_requirements
+        WHERE channel_code = 'ozon'
+          AND category_code IS NOT NULL
+          AND TRIM(category_code) <> ''
+        ORDER BY category_code
+        """
+    ).fetchall()
+    category_scope_options = ["Все"] + [str(r["category_code"]) for r in category_rows]
+
+    f1, f2, f3 = st.columns([2, 2, 2])
+    with f1:
+        attr_search = st.text_input("Поиск атрибута", value="", placeholder="Название, код, описание", key="attrs_search")
+    with f2:
+        attr_source_filter = st.selectbox("Источник атрибута", options=["Все", "Ozon", "Кастомные"], index=0, key="attrs_source_filter")
+    with f3:
+        category_scope = st.selectbox("Категория (scope)", options=category_scope_options, index=0, key="attrs_category_scope")
+
+    required_map: dict[str, int] = {}
+    if category_scope != "Все":
+        req_rows = conn.execute(
+            """
+            SELECT attribute_code, is_required
+            FROM channel_attribute_requirements
+            WHERE channel_code = 'ozon'
+              AND category_code = ?
+            """,
+            (str(category_scope),),
+        ).fetchall()
+        required_map = {str(r["attribute_code"]): int(r["is_required"] or 0) for r in req_rows}
 
     left, right = st.columns([1, 1])
 
     with left:
         st.subheader("Справочник атрибутов")
         defs = list_attribute_definitions(conn)
-        if defs:
-            st.dataframe(pd.DataFrame(defs), use_container_width=True, hide_index=True)
+        defs_df = pd.DataFrame(defs) if defs else pd.DataFrame()
+        if not defs_df.empty:
+            if attr_source_filter == "Ozon":
+                defs_df = defs_df[defs_df["code"].astype(str).str.startswith("ozon_attr_")]
+            elif attr_source_filter == "Кастомные":
+                defs_df = defs_df[~defs_df["code"].astype(str).str.startswith("ozon_attr_")]
+
+            if category_scope != "Все":
+                allowed_codes = set(required_map.keys())
+                defs_df = defs_df[defs_df["code"].astype(str).isin(allowed_codes)]
+                defs_df["is_required_for_category"] = defs_df["code"].map(lambda c: int(required_map.get(str(c), 0)))
+
+            if attr_search:
+                q = str(attr_search).strip().lower()
+                mask = (
+                    defs_df["code"].astype(str).str.lower().str.contains(q, na=False)
+                    | defs_df["name"].astype(str).str.lower().str.contains(q, na=False)
+                    | defs_df["description"].astype(str).str.lower().str.contains(q, na=False)
+                )
+                defs_df = defs_df[mask]
+
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Атрибутов", int(len(defs_df)))
+            m2.metric("Ozon", int(defs_df["code"].astype(str).str.startswith("ozon_attr_").sum()))
+            required_count = int(defs_df["is_required_for_category"].fillna(0).astype(int).sum()) if "is_required_for_category" in defs_df.columns else 0
+            m3.metric("Required (scope)", required_count)
+            st.dataframe(defs_df, use_container_width=True, hide_index=True)
+        else:
+            st.info("Справочник атрибутов пока пуст.")
 
         with st.form("new_attribute_def"):
             code = st.text_input("Код атрибута")
@@ -2140,32 +2274,44 @@ def show_attributes_tab():
                 st.rerun()
 
     with right:
-        st.subheader(f"Атрибуты товара #{product_id}")
-        values = get_product_attribute_values(conn, int(product_id))
-        if values:
-            st.dataframe(pd.DataFrame(values), use_container_width=True, hide_index=True)
+        if not product_id:
+            st.subheader("Атрибуты товара")
+            st.info("Сначала выбери товар во вкладке Каталог, чтобы редактировать его значения атрибутов.")
+        else:
+            st.subheader(f"Атрибуты товара #{product_id}")
+            values = get_product_attribute_values(conn, int(product_id))
+            values_df = pd.DataFrame(values) if values else pd.DataFrame()
+            if not values_df.empty and category_scope != "Все":
+                values_df = values_df[values_df["attribute_code"].astype(str).isin(set(required_map.keys()))]
+            if not values_df.empty:
+                st.dataframe(values_df, use_container_width=True, hide_index=True)
+            else:
+                st.caption("По текущему фильтру значения атрибутов не найдены.")
 
-        defs = list_attribute_definitions(conn)
-        def_codes = [d["code"] for d in defs] if defs else []
+            defs = list_attribute_definitions(conn)
+            if category_scope != "Все":
+                allowed_codes = set(required_map.keys())
+                defs = [d for d in defs if str(d.get("code")) in allowed_codes]
+            def_codes = [d["code"] for d in defs] if defs else []
 
-        with st.form("set_product_attr"):
-            attribute_code = st.selectbox("Атрибут", def_codes) if def_codes else st.text_input("Атрибут")
-            value = st.text_input("Значение")
-            locale = st.text_input("Locale", value="")
-            channel_code = st.text_input("Channel code", value="")
-            save_attr = st.form_submit_button("Сохранить значение")
+            with st.form("set_product_attr"):
+                attribute_code = st.selectbox("Атрибут", def_codes) if def_codes else st.text_input("Атрибут")
+                value = st.text_input("Значение")
+                locale = st.text_input("Locale", value="")
+                channel_code = st.text_input("Channel code", value="")
+                save_attr = st.form_submit_button("Сохранить значение")
 
-            if save_attr and attribute_code:
-                set_product_attribute_value(
-                    conn=conn,
-                    product_id=int(product_id),
-                    attribute_code=attribute_code,
-                    value=value,
-                    locale=locale or None,
-                    channel_code=channel_code or None,
-                )
-                st.success("Значение сохранено")
-                st.rerun()
+                if save_attr and attribute_code:
+                    set_product_attribute_value(
+                        conn=conn,
+                        product_id=int(product_id),
+                        attribute_code=attribute_code,
+                        value=value,
+                        locale=locale or None,
+                        channel_code=channel_code or None,
+                    )
+                    st.success("Значение сохранено")
+                    st.rerun()
 
     conn.close()
 
@@ -2548,7 +2694,7 @@ def show_ozon_tab():
     else:
         st.warning("Ozon-креды не заданы в этой сессии. Можно вставить их сюда вручную и сразу выполнить sync.")
 
-    top1, top2, top3 = st.columns(3)
+    top1, top2, top3, top4 = st.columns(4)
     with top1:
         if st.button("Синхронизировать дерево категорий Ozon", type="primary", disabled=not configured):
             result = sync_category_tree(conn, client_id=client_id or None, api_key=api_key or None)
@@ -2562,7 +2708,18 @@ def show_ozon_tab():
             else:
                 st.info(message)
     with top3:
-        category_limit = st.number_input("Сколько категорий показать", min_value=50, max_value=2000, value=200, step=50)
+        category_limit = st.number_input("Сколько категорий показать", min_value=100, max_value=10000, value=2000, step=100)
+    with top4:
+        if st.button("Импортировать все атрибуты Ozon из кэша в PIM"):
+            result = import_all_cached_attributes_to_pim(conn)
+            st.success(
+                "Массовый импорт завершён: "
+                f"пар обработано {int(result.get('pairs_processed') or 0)} из {int(result.get('pairs_total') or 0)}, "
+                f"атрибутов импортировано {int(result.get('imported_total') or 0)}."
+            )
+            if result.get("errors"):
+                st.warning(f"Ошибок при массовом импорте: {len(result['errors'])}.")
+            st.rerun()
 
     bg_state = _get_ozon_bg_state()
     if bg_state.get("running"):
@@ -2584,13 +2741,40 @@ def show_ozon_tab():
             st.warning(f"Ошибок в фоновом sync: {len(r['errors'])}.")
     st.caption("Полный Ozon sync теперь запускается в фоне и не блокирует работу с остальными разделами.")
 
-    categories = list_cached_categories(conn, limit=int(category_limit))
+    stats = get_ozon_cache_stats(conn)
+    s1, s2, s3, s4, s5, s6 = st.columns(6)
+    s1.metric("Узлов категорий", int(stats.get("category_nodes") or 0))
+    s2.metric("Уникальных пар cat/type", int(stats.get("category_pairs") or 0))
+    s3.metric("Атрибутов в кэше", int(stats.get("attributes_total") or 0))
+    s4.metric("Обязательных", int(stats.get("attributes_required") or 0))
+    s5.metric("Атрибутов в master", int(stats.get("attribute_defs_ozon") or 0))
+    s6.metric("Ozon requirements", int(stats.get("ozon_requirements") or 0))
+
+    category_search = st.text_input(
+        "Фильтр категорий Ozon",
+        value="",
+        placeholder="Например: велосипед, аксессуары, запчасти",
+        key="ozon_category_search",
+    )
+    category_pairs = list_cached_category_pairs(conn, search=category_search or None, limit=int(category_limit))
+    categories = list_cached_categories(conn, limit=min(1000, int(category_limit)))
+    if not categories:
+        st.warning("Кэш категорий Ozon пуст. Сначала запусти синхронизацию дерева категорий.")
     if categories:
         cat_df = pd.DataFrame(categories)
         st.markdown("### Кэш категорий Ozon")
         st.dataframe(cat_df[[c for c in ["description_category_id", "category_name", "full_path", "type_id", "type_name", "disabled", "fetched_at"] if c in cat_df.columns]], use_container_width=True, hide_index=True)
 
-        valid_rows = [row for row in categories if row.get("description_category_id") and row.get("type_id")]
+        if category_pairs:
+            pairs_df = pd.DataFrame(category_pairs)
+            st.markdown("### Уникальные пары категорий Ozon (cat/type)")
+            st.dataframe(
+                pairs_df[[c for c in ["description_category_id", "type_id", "full_path", "type_name", "disabled", "nodes", "fetched_at"] if c in pairs_df.columns]],
+                use_container_width=True,
+                hide_index=True,
+            )
+
+        valid_rows = [row for row in category_pairs if row.get("description_category_id") and row.get("type_id")]
         if valid_rows:
             category_options = [f"{row['full_path']} | cat={row['description_category_id']} | type={row['type_id']}" for row in valid_rows]
             selected_category_label = st.selectbox("Категория Ozon для загрузки атрибутов", options=category_options)

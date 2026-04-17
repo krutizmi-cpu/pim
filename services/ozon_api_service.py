@@ -172,11 +172,88 @@ def _list_category_pairs_for_sync(conn: sqlite3.Connection) -> list[tuple[int, i
         FROM ozon_category_cache
         WHERE description_category_id IS NOT NULL
           AND type_id IS NOT NULL
-          AND IFNULL(disabled, 0) = 0
         ORDER BY description_category_id, type_id
         """
     ).fetchall()
     return [(int(r["description_category_id"]), int(r["type_id"])) for r in rows]
+
+
+def list_cached_category_pairs(
+    conn: sqlite3.Connection,
+    search: str | None = None,
+    limit: int = 1000,
+) -> list[dict[str, Any]]:
+    where: list[str] = [
+        "description_category_id IS NOT NULL",
+        "type_id IS NOT NULL",
+    ]
+    params: list[Any] = []
+    if search:
+        where.append(
+            "(LOWER(IFNULL(full_path, '')) LIKE ? OR LOWER(IFNULL(category_name, '')) LIKE ? OR LOWER(IFNULL(type_name, '')) LIKE ?)"
+        )
+        term = f"%{str(search).strip().lower()}%"
+        params.extend([term, term, term])
+    sql = """
+        SELECT
+            description_category_id,
+            type_id,
+            MAX(IFNULL(full_path, category_name)) AS full_path,
+            MAX(IFNULL(category_name, '')) AS category_name,
+            MAX(IFNULL(type_name, '')) AS type_name,
+            MAX(IFNULL(disabled, 0)) AS disabled,
+            MAX(fetched_at) AS fetched_at,
+            COUNT(*) AS nodes
+        FROM ozon_category_cache
+    """
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += """
+        GROUP BY description_category_id, type_id
+        ORDER BY full_path, type_name
+        LIMIT ?
+    """
+    params.append(int(limit))
+    rows = conn.execute(sql, params).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_ozon_cache_stats(conn: sqlite3.Connection) -> dict[str, int]:
+    category_nodes = int(conn.execute("SELECT COUNT(*) FROM ozon_category_cache").fetchone()[0] or 0)
+    category_pairs = int(
+        conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM (
+                SELECT DISTINCT description_category_id, type_id
+                FROM ozon_category_cache
+                WHERE description_category_id IS NOT NULL AND type_id IS NOT NULL
+            )
+            """
+        ).fetchone()[0]
+        or 0
+    )
+    attributes_total = int(conn.execute("SELECT COUNT(*) FROM ozon_attribute_cache").fetchone()[0] or 0)
+    attributes_required = int(conn.execute("SELECT COUNT(*) FROM ozon_attribute_cache WHERE IFNULL(is_required, 0) = 1").fetchone()[0] or 0)
+    attribute_defs_ozon = int(conn.execute("SELECT COUNT(*) FROM attribute_definitions WHERE code LIKE 'ozon_attr_%'").fetchone()[0] or 0)
+    ozon_requirements = int(
+        conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM channel_attribute_requirements
+            WHERE channel_code = 'ozon' AND IFNULL(category_code, '') LIKE 'ozon:%'
+            """
+        ).fetchone()[0]
+        or 0
+    )
+    return {
+        "category_nodes": category_nodes,
+        "category_pairs": category_pairs,
+        "attributes_total": attributes_total,
+        "attributes_required": attributes_required,
+        "attribute_defs_ozon": attribute_defs_ozon,
+        "ozon_requirements": ozon_requirements,
+    }
 
 
 def sync_all_categories_and_attributes(
@@ -638,6 +715,36 @@ def import_cached_attributes_to_pim(
 
     conn.commit()
     return {"imported": imported, "required": required, "category_code": category_code}
+
+
+def import_all_cached_attributes_to_pim(conn: sqlite3.Connection, max_pairs: int | None = None) -> dict[str, Any]:
+    pairs = _list_category_pairs_for_sync(conn)
+    if max_pairs is not None and int(max_pairs) > 0:
+        pairs = pairs[: int(max_pairs)]
+
+    processed = 0
+    imported_total = 0
+    required_total = 0
+    errors: list[str] = []
+    for description_category_id, type_id in pairs:
+        try:
+            result = import_cached_attributes_to_pim(
+                conn,
+                description_category_id=int(description_category_id),
+                type_id=int(type_id),
+            )
+            processed += 1
+            imported_total += int(result.get("imported") or 0)
+            required_total += int(result.get("required") or 0)
+        except Exception as e:
+            errors.append(f"cat={description_category_id}, type={type_id}: {e}")
+    return {
+        "pairs_total": len(pairs),
+        "pairs_processed": processed,
+        "imported_total": imported_total,
+        "required_total": required_total,
+        "errors": errors[:200],
+    }
 
 
 MASTER_ATTRIBUTE_DEFAULTS = [

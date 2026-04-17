@@ -13,9 +13,9 @@ import pandas as pd
 import sqlite3
 
 from db import init_db
-from pim_enrich import enrich_product
 from services.attribute_service import set_product_attribute_value
 from services.duplicate_service import refresh_duplicates_for_product
+from services.dimension_fallback import infer_category_fields
 from services.text_utils import normalize_name
 
 
@@ -462,51 +462,29 @@ def _apply_enrichment(
     conn: sqlite3.Connection,
     product_data: dict[str, Any],
 ) -> dict[str, Any]:
-    enrich_input = {
-        "article": product_data.get("article"),
-        "supplier_article": product_data.get("supplier_article"),
-        "name": product_data.get("name"),
-        "barcode": product_data.get("barcode"),
-        "category": product_data.get("category"),
-        "supplier_url": product_data.get("supplier_url"),
-        "weight": product_data.get("weight"),
-        "length": product_data.get("length"),
-        "width": product_data.get("width"),
-        "height": product_data.get("height"),
-    }
+    # Import stage should not overwrite dimensions with generic defaults.
+    # We only infer taxonomy hints from product name when category fields are empty.
+    inferred = infer_category_fields(product_data)
+    weak_categories = {"прочее", "другое", "товары", "каталог", "продукция", "misc", "other"}
+    current_category = str(product_data.get("category") or "").strip().lower()
+    if inferred.get("category") and (not product_data.get("category") or current_category in weak_categories):
+        product_data["category"] = inferred.get("category")
+    if inferred.get("base_category") and not product_data.get("base_category"):
+        product_data["base_category"] = inferred.get("base_category")
+    if inferred.get("subcategory") and not product_data.get("subcategory"):
+        product_data["subcategory"] = inferred.get("subcategory")
+    if inferred.get("wheel_diameter_inch") is not None and product_data.get("wheel_diameter_inch") is None:
+        product_data["wheel_diameter_inch"] = inferred.get("wheel_diameter_inch")
 
-    enriched, _method = enrich_product(
-        enrich_input,
-        conn=conn,
-        openai_api_key="",
-        force=False,
-    )
-
-    if enriched.get("category"):
-        product_data["category"] = enriched.get("category")
-
-    if enriched.get("weight") is not None:
-        product_data["weight"] = enriched.get("weight")
-    if enriched.get("length") is not None:
-        product_data["length"] = enriched.get("length")
-    if enriched.get("width") is not None:
-        product_data["width"] = enriched.get("width")
-    if enriched.get("height") is not None:
-        product_data["height"] = enriched.get("height")
-
-    if enriched.get("package_length_cm") is not None:
-        product_data["package_length"] = enriched.get("package_length_cm")
-    if enriched.get("package_width_cm") is not None:
-        product_data["package_width"] = enriched.get("package_width_cm")
-    if enriched.get("package_height_cm") is not None:
-        product_data["package_height"] = enriched.get("package_height_cm")
-    if enriched.get("package_weight_kg") is not None:
-        product_data["gross_weight"] = enriched.get("package_weight_kg")
-
-    product_data["subcategory"] = enriched.get("subcategory")
-    product_data["wheel_diameter_inch"] = enriched.get("wheel_diameter_inch")
-    product_data["enrichment_status"] = enriched.get("enrich_status") or "new"
-    product_data["enrichment_comment"] = enriched.get("enrich_source") or None
+    if inferred.get("category"):
+        product_data["enrichment_status"] = "inferred"
+        product_data["enrichment_comment"] = (
+            f"name_category_inference score={float(inferred.get('category_inference_score') or 0.0):.2f}; "
+            f"matched={','.join([str(x) for x in inferred.get('category_inference_matched') or []])}"
+        )[:500]
+    else:
+        product_data["enrichment_status"] = product_data.get("enrichment_status") or "new"
+        product_data["enrichment_comment"] = product_data.get("enrichment_comment") or None
 
     return product_data
 
