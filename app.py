@@ -1982,8 +1982,8 @@ def show_catalog_tab():
         with p1:
             ps_timeout = st.number_input(
                 "Таймаут запроса, сек",
-                min_value=2,
-                max_value=30,
+                min_value=2.0,
+                max_value=30.0,
                 value=float(parser_settings.get("timeout_seconds", 8.0)),
                 step=1.0,
                 key="parser_cfg_timeout_seconds",
