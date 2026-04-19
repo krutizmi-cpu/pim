@@ -270,6 +270,38 @@ def list_catalog_categories(conn) -> list[str]:
     return preferred + legacy_only
 
 
+def _split_ozon_path_parts(path: str | None) -> list[str]:
+    text = " ".join(str(path or "").strip().split())
+    if not text:
+        return []
+    parts = [x.strip() for x in re.split(r"\s*(?:/|>|»|→|\|)\s*", text) if str(x).strip()]
+    return parts if parts else [text]
+
+
+def list_ozon_category_filters(conn) -> tuple[list[str], list[str]]:
+    rows = conn.execute(
+        """
+        SELECT DISTINCT ozon_category_path
+        FROM products
+        WHERE ozon_category_path IS NOT NULL
+          AND TRIM(ozon_category_path) <> ''
+        """
+    ).fetchall()
+    categories: set[str] = set()
+    subcategories: set[str] = set()
+    for row in rows:
+        path = str(row["ozon_category_path"] or "").strip()
+        parts = _split_ozon_path_parts(path)
+        if not parts:
+            continue
+        subcategories.add(parts[-1])
+        categories.add(parts[-2] if len(parts) >= 2 else parts[-1])
+    return (
+        sorted([x for x in categories if x], key=lambda x: x.lower()),
+        sorted([x for x in subcategories if x], key=lambda x: x.lower()),
+    )
+
+
 RU_COLUMN_MAP: dict[str, str] = {
     "id": "ID",
     "product_id": "ID товара",
@@ -776,8 +808,8 @@ def get_product(conn, product_id: int):
 def find_products_for_card(
     conn,
     search: str = "",
-    category: str = "",
-    subcategory: str = "",
+    ozon_category: str = "",
+    ozon_subcategory: str = "",
     supplier: str = "",
     limit: int = 5000,
 ) -> list[dict]:
@@ -787,24 +819,6 @@ def find_products_for_card(
         where.append("(name LIKE ? OR article LIKE ? OR internal_article LIKE ? OR supplier_article LIKE ?)")
         s = f"%{search.strip()}%"
         params.extend([s, s, s, s])
-    if category and category != "Все":
-        where.append(
-            "("
-            "LOWER(TRIM(category)) = LOWER(TRIM(?)) "
-            "OR LOWER(TRIM(base_category)) = LOWER(TRIM(?)) "
-            "OR LOWER(TRIM(IFNULL(ozon_category_path, ''))) = LOWER(TRIM(?)) "
-            "OR LOWER(IFNULL(ozon_category_path, '')) LIKE LOWER(?)"
-            ")"
-        )
-        params.extend([category, category, category, f"%{category}%"])
-    if subcategory and subcategory != "Все":
-        where.append(
-            "("
-            "LOWER(TRIM(subcategory)) = LOWER(TRIM(?)) "
-            "OR LOWER(IFNULL(ozon_category_path, '')) LIKE LOWER(?)"
-            ")"
-        )
-        params.extend([subcategory, f"%{subcategory}%"])
     if supplier and supplier != "Все":
         where.append("LOWER(TRIM(supplier_name)) = LOWER(TRIM(?))")
         params.append(supplier)
@@ -812,7 +826,8 @@ def find_products_for_card(
     sql = """
         SELECT
             id, article, internal_article, supplier_article, name,
-            category, base_category, subcategory, supplier_name, ozon_category_path
+            category, base_category, subcategory, supplier_name, ozon_category_path,
+            ozon_description_category_id, ozon_type_id
         FROM products
     """
     if where:
@@ -820,7 +835,24 @@ def find_products_for_card(
     sql += " ORDER BY id DESC LIMIT ?"
     params.append(int(limit))
     rows = conn.execute(sql, params).fetchall()
-    return [dict(r) for r in rows]
+    out: list[dict] = []
+    category_filter = str(ozon_category or "").strip().lower()
+    subcategory_filter = str(ozon_subcategory or "").strip().lower()
+    for row in rows:
+        item = dict(row)
+        parts = _split_ozon_path_parts(item.get("ozon_category_path"))
+        item["ozon_subcategory"] = parts[-1] if parts else ""
+        item["ozon_category"] = parts[-2] if len(parts) >= 2 else item["ozon_subcategory"]
+        if category_filter and category_filter != "все":
+            if str(item.get("ozon_category") or "").strip().lower() != category_filter:
+                continue
+        if subcategory_filter and subcategory_filter != "все":
+            if str(item.get("ozon_subcategory") or "").strip().lower() != subcategory_filter:
+                continue
+        out.append(item)
+        if len(out) >= int(limit):
+            break
+    return out
 
 
 def list_channel_codes(conn) -> list[str]:
@@ -2420,23 +2452,22 @@ def show_product_tab():
         card_search = st.text_input(
             "Поиск товара",
             value=st.session_state.get("card_product_search", ""),
-            placeholder="Название / артикул / внутренний артикул / артикул поставщика",
+            placeholder="Артикул или наименование товара",
             key="card_product_search",
         )
-    category_values = list_distinct_values(conn, "category")
-    subcategory_values = list_distinct_values(conn, "subcategory")
+    ozon_category_values, ozon_subcategory_values = list_ozon_category_filters(conn)
     supplier_values = list_distinct_values(conn, "supplier_name")
     with fs2:
         card_category = st.selectbox(
-            "Категория",
-            options=["Все"] + category_values,
+            "Категория Ozon",
+            options=["Все"] + ozon_category_values,
             index=0,
             key="card_product_category_filter",
         )
     with fs3:
         card_subcategory = st.selectbox(
-            "Подкатегория",
-            options=["Все"] + subcategory_values,
+            "Подкатегория Ozon",
+            options=["Все"] + ozon_subcategory_values,
             index=0,
             key="card_product_subcategory_filter",
         )
@@ -2451,8 +2482,8 @@ def show_product_tab():
     filtered_products = find_products_for_card(
         conn,
         search=card_search or "",
-        category=card_category or "",
-        subcategory=card_subcategory or "",
+        ozon_category=card_category or "",
+        ozon_subcategory=card_subcategory or "",
         supplier=card_supplier or "",
         limit=5000,
     )
@@ -2471,8 +2502,10 @@ def show_product_tab():
         format_func=lambda x: next(
             (
                 f"ID {int(row['id'])} | {str(row.get('article') or row.get('supplier_article') or '-')} | "
-                f"{str(row.get('name') or '-')} | {str(row.get('ozon_category_path') or row.get('category') or row.get('base_category') or '-')} / "
-                f"{str(row.get('subcategory') or '-')} | {str(row.get('supplier_name') or '-')}"
+                f"{str(row.get('name') or '-')} | "
+                f"{str(row.get('ozon_category') or row.get('category') or row.get('base_category') or '-')} / "
+                f"{str(row.get('ozon_subcategory') or row.get('subcategory') or '-')} | "
+                f"{str(row.get('supplier_name') or '-')}"
                 for row in filtered_products
                 if int(row["id"]) == int(x)
             ),
@@ -2493,7 +2526,7 @@ def show_product_tab():
     with st.expander("Инструкция по кнопкам раздела Карточка", expanded=False):
         st.markdown(
             """
-- `Поиск товара / Категория / Подкатегория / Поставщик`: фильтр выбора товара для редактирования.
+- `Поиск товара (артикул/наименование) / Категория Ozon / Подкатегория Ozon / Поставщик`: фильтр выбора товара для редактирования.
 - `Спарсить поставщика`: аккуратное обогащение карточки с сайта поставщика.
 - `Перезаполнить из поставщика`: force-перезапись полей из supplier page.
 - `Подобрать Ozon категорию`: автоподбор эталонной категории Ozon.
