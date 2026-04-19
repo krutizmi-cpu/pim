@@ -83,19 +83,23 @@ def _flatten_tree(
     nodes: list[dict[str, Any]],
     parent_path: str = "",
     inherited_description_category_id: int | None = None,
+    inherited_type_id: int | None = None,
+    inherited_type_name: str | None = None,
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for node in nodes or []:
         category_name = node.get("category_name") or ""
         current_path = f"{parent_path} / {category_name}".strip(" /") if category_name else parent_path
         effective_description_category_id = node.get("description_category_id") or inherited_description_category_id
+        effective_type_id = node.get("type_id") or inherited_type_id
+        effective_type_name = node.get("type_name") or inherited_type_name
         rows.append(
             {
                 "description_category_id": effective_description_category_id,
                 "category_name": category_name,
                 "path": current_path,
-                "type_id": node.get("type_id"),
-                "type_name": node.get("type_name"),
+                "type_id": effective_type_id,
+                "type_name": effective_type_name,
                 "disabled": int(bool(node.get("disabled"))),
                 "children_count": len(node.get("children") or []),
                 "raw_json": json.dumps(node, ensure_ascii=False),
@@ -106,6 +110,8 @@ def _flatten_tree(
                 node.get("children") or [],
                 current_path,
                 effective_description_category_id,
+                effective_type_id,
+                effective_type_name,
             )
         )
     return rows
@@ -267,6 +273,19 @@ def get_ozon_cache_stats(conn: sqlite3.Connection) -> dict[str, int]:
         or 0
     )
     attributes_total = int(conn.execute("SELECT COUNT(*) FROM ozon_attribute_cache").fetchone()[0] or 0)
+    attribute_pairs = int(
+        conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM (
+                SELECT DISTINCT description_category_id, type_id
+                FROM ozon_attribute_cache
+                WHERE description_category_id IS NOT NULL AND type_id IS NOT NULL
+            )
+            """
+        ).fetchone()[0]
+        or 0
+    )
     attributes_required = int(conn.execute("SELECT COUNT(*) FROM ozon_attribute_cache WHERE IFNULL(is_required, 0) = 1").fetchone()[0] or 0)
     attribute_defs_ozon = int(conn.execute("SELECT COUNT(*) FROM attribute_definitions WHERE code LIKE 'ozon_attr_%'").fetchone()[0] or 0)
     ozon_requirements = int(
@@ -282,6 +301,7 @@ def get_ozon_cache_stats(conn: sqlite3.Connection) -> dict[str, int]:
     return {
         "category_nodes": category_nodes,
         "category_pairs": category_pairs,
+        "attribute_pairs": attribute_pairs,
         "attributes_total": attributes_total,
         "attributes_required": attributes_required,
         "attribute_defs_ozon": attribute_defs_ozon,

@@ -175,7 +175,7 @@ def _start_ozon_bg_sync(client_id: str, api_key: str) -> tuple[bool, str]:
     global _OZON_SYNC_BG_THREAD
     state = _get_ozon_bg_state()
     if state.get("running") and state.get("thread_alive"):
-        return False, "Фоновый Ozon sync уже выполняется."
+        return False, "Фоновая синхронизация Ozon уже выполняется."
     active_db = _get_active_db_path() or str(Path("data/catalog.db"))
     _set_ozon_bg_state(
         running=True,
@@ -192,7 +192,7 @@ def _start_ozon_bg_sync(client_id: str, api_key: str) -> tuple[bool, str]:
         name="ozon-full-sync-bg",
     )
     _OZON_SYNC_BG_THREAD.start()
-    return True, f"Фоновый Ozon sync запущен. База: {active_db}"
+    return True, f"Фоновая синхронизация Ozon запущена. База: {active_db}"
 
 
 def to_attribute_code(name: str) -> str:
@@ -2532,7 +2532,7 @@ def show_attributes_tab():
         attr_source_filter = st.selectbox("Источник атрибута", options=["Все", "Ozon", "Кастомные"], index=0, key="attrs_source_filter")
     with f3:
         category_scope = st.selectbox(
-            "Категория (scope)",
+            "Категория (область)",
             options=category_scope_options,
             index=0,
             key="attrs_category_scope",
@@ -2587,13 +2587,13 @@ def show_attributes_tab():
 
             m1, m2, m3, m4 = st.columns(4)
             m1.metric("Атрибутов", int(len(defs_df)))
-            m2.metric("Ozon (уникальные коды)", int(defs_df["code"].astype(str).str.startswith("ozon_attr_").sum()))
+            m2.metric("Атрибутов Ozon (уникальных)", int(defs_df["code"].astype(str).str.startswith("ozon_attr_").sum()))
             required_count = int(defs_df["is_required_for_category"].fillna(0).astype(int).sum()) if "is_required_for_category" in defs_df.columns else 0
-            m3.metric("Обязательных (scope)", required_count)
+            m3.metric("Обязательных (по категории)", required_count)
             total_requirements = conn.execute(
                 "SELECT COUNT(*) FROM channel_attribute_requirements WHERE channel_code = 'ozon'"
             ).fetchone()[0]
-            m4.metric("Ozon requirements (категорийные)", int(total_requirements or 0))
+            m4.metric("Требований Ozon (категорийных)", int(total_requirements or 0))
             defs_df = defs_df.copy()
             defs_df["code_ru"] = defs_df["code"].map(humanize_attribute_code)
             st.dataframe(
@@ -2648,11 +2648,34 @@ def show_attributes_tab():
                     values_df["data_type"] = values_df["data_type"].map(lambda x: {"text": "Текст", "number": "Число", "boolean": "Да/Нет", "json": "JSON"}.get(str(x), x))
                 if "scope" in values_df.columns:
                     values_df["scope"] = values_df["scope"].map(lambda x: {"master": "Мастер", "channel": "Канал"}.get(str(x), x))
+                value_columns = [
+                    c
+                    for c in [
+                        "id",
+                        "product_id",
+                        "attribute_code_ru",
+                        "attribute_code",
+                        "name",
+                        "value",
+                        "value_text",
+                        "value_number",
+                        "value_boolean",
+                        "value_json",
+                        "data_type",
+                        "scope",
+                        "unit",
+                        "locale",
+                        "channel_code",
+                        "updated_at",
+                    ]
+                    if c in values_df.columns
+                ]
                 st.dataframe(
                     with_ru_columns(
-                        values_df,
+                        values_df[value_columns],
                         extra_map={
                             "attribute_code_ru": "Код атрибута (рус.)",
+                            "attribute_code": "Технический код",
                             "value": "Значение",
                         },
                     ),
@@ -2676,8 +2699,8 @@ def show_attributes_tab():
                     else st.text_input("Атрибут")
                 )
                 value = st.text_input("Значение")
-                locale = st.text_input("Locale", value="")
-                channel_code = st.text_input("Channel code", value="")
+                locale = st.text_input("Локаль", value="")
+                channel_code = st.text_input("Код канала", value="")
                 save_attr = st.form_submit_button("Сохранить значение")
 
                 if save_attr and attribute_code:
@@ -3065,19 +3088,19 @@ def show_ozon_tab():
             """
 **Порядок работы (рекомендуемый)**
 1. `Синхронизировать дерево категорий Ozon`
-2. `Запустить полный sync Ozon в фоне`
-3. Проверить блок покрытия sync (`Пары для проверки`, `Пары с атрибутами`, `Пропущено пар`, `%`)
+2. `Запустить полную синхронизацию Ozon в фоне`
+3. Проверить блок покрытия синхронизации (`Пары для проверки`, `Пары с атрибутами`, `Пропущено пар`, `%`)
 4. Если есть пропуски: `Досинхронизировать пропущенные категории`
 5. При необходимости импортировать в мастер: `Импортировать все атрибуты Ozon из кэша в PIM`
 
 **Кнопки верхнего блока**
 - `Синхронизировать дерево категорий Ozon`: обновляет локальный кэш дерева категорий Ozon.
-- `Запустить полный sync Ozon в фоне`: фоном проходит по категориям и подтягивает атрибуты, не блокируя UI.
+- `Запустить полную синхронизацию Ozon в фоне`: фоном проходит по категориям и подтягивает атрибуты, не блокируя UI.
 - `Импортировать все атрибуты Ozon из кэша в PIM`: переносит уже загруженные атрибуты из кэша в master-слой PIM.
 - `Досинхронизировать пропущенные категории`: подтягивает только те пары `cat/type`, где в кэше ещё нет атрибутов.
 
 **Кнопки по выбранной Ozon-категории**
-- `Синхронизировать атрибуты выбранной категории`: точечный sync атрибутов одной пары `cat/type`.
+- `Синхронизировать атрибуты выбранной категории`: точечная синхронизация атрибутов одной пары `cat/type`.
 - `Импортировать атрибуты Ozon в PIM`: перенос атрибутов выбранной пары в `attribute_definitions` и requirements.
 - `Создать стартовые mapping rules для Ozon`: создаёт стартовые правила маппинга для выбранной категории.
 - `Синхронизировать все справочники категории`: подтягивает dictionary-значения по всем dictionary-атрибутам категории.
@@ -3106,15 +3129,15 @@ def show_ozon_tab():
 
     c1, c2 = st.columns(2)
     with c1:
-        client_id = st.text_input("Ozon Client ID", value="")
+        client_id = st.text_input("Client ID Ozon", value="")
     with c2:
-        api_key = st.text_input("Ozon API Key", value="", type="password")
+        api_key = st.text_input("API Key Ozon", value="", type="password")
 
     configured = is_configured(client_id or None, api_key or None)
     if configured:
         st.success("Ozon-креды заданы, можно синхронизировать дерево и атрибуты.")
     else:
-        st.warning("Ozon-креды не заданы в этой сессии. Можно вставить их сюда вручную и сразу выполнить sync.")
+        st.warning("Ozon-креды не заданы в этой сессии. Можно вставить их сюда вручную и сразу выполнить синхронизацию.")
 
     top1, top2, top3, top4 = st.columns(4)
     with top1:
@@ -3123,7 +3146,7 @@ def show_ozon_tab():
             st.success(f"Дерево категорий обновлено, записей: {result['total']}")
             st.rerun()
     with top2:
-        if st.button("Запустить полный sync Ozon в фоне", disabled=not configured, help="Фоновая загрузка атрибутов по категориям Ozon"):
+        if st.button("Запустить полную синхронизацию Ozon в фоне", disabled=not configured, help="Фоновая загрузка атрибутов по категориям Ozon"):
             ok, message = _start_ozon_bg_sync(client_id=client_id or "", api_key=api_key or "")
             if ok:
                 st.success(message)
@@ -3146,22 +3169,22 @@ def show_ozon_tab():
     bg_state = _get_ozon_bg_state()
     if bg_state.get("running"):
         st.info(
-            "Фоновый Ozon sync выполняется. "
+            "Фоновая синхронизация Ozon выполняется. "
             f"Старт: {bg_state.get('started_at') or '-'}."
         )
     elif bg_state.get("last_error"):
-        st.error(f"Фоновый Ozon sync завершился с ошибкой: {bg_state.get('last_error')}")
+        st.error(f"Фоновая синхронизация Ozon завершилась с ошибкой: {bg_state.get('last_error')}")
     elif bg_state.get("result"):
         r = bg_state.get("result") or {}
         st.success(
-            "Фоновый Ozon sync завершён: "
+            "Фоновая синхронизация Ozon завершена: "
             f"пар обработано {int(r.get('pairs_processed') or 0)} из {int(r.get('pairs_total') or 0)}, "
             f"атрибутов загружено {int(r.get('attributes_total') or 0)}, "
             f"импортировано в PIM {int(r.get('imported_to_pim') or 0)}."
         )
         if r.get("errors"):
-            st.warning(f"Ошибок в фоновом sync: {len(r['errors'])}.")
-    st.caption("Полный Ozon sync теперь запускается в фоне и не блокирует работу с остальными разделами.")
+            st.warning(f"Ошибок в фоновой синхронизации: {len(r['errors'])}.")
+    st.caption("Полная синхронизация Ozon теперь запускается в фоне и не блокирует работу с остальными разделами.")
 
     stats = get_ozon_cache_stats(conn)
     s1, s2, s3, s4, s5, s6 = st.columns(6)
@@ -3169,8 +3192,13 @@ def show_ozon_tab():
     s2.metric("Уникальных пар категорий", int(stats.get("category_pairs") or 0))
     s3.metric("Атрибутов в кэше", int(stats.get("attributes_total") or 0))
     s4.metric("Обязательных", int(stats.get("attributes_required") or 0))
-    s5.metric("Атрибутов в master", int(stats.get("attribute_defs_ozon") or 0))
-    s6.metric("Ozon requirements (категорийные)", int(stats.get("ozon_requirements") or 0))
+    s5.metric("Атрибутов в мастере", int(stats.get("attribute_defs_ozon") or 0))
+    s6.metric("Требований Ozon (категорийных)", int(stats.get("ozon_requirements") or 0))
+    if int(stats.get("category_pairs") or 0) == 0 and int(stats.get("attribute_pairs") or 0) > 0:
+        st.warning(
+            f"В кэше категорий пока 0 пар cat/type, но в кэше атрибутов уже есть {int(stats.get('attribute_pairs') or 0)} пар. "
+            "Сначала нажми `Синхронизировать дерево категорий Ozon`, затем запусти полную синхронизацию."
+        )
 
     qc1, qc2, qc3, qc4 = st.columns([1, 1, 1, 2])
     with qc1:
@@ -3224,17 +3252,17 @@ def show_ozon_tab():
     cv1.metric("Пары для проверки", int(coverage.get("total_pairs") or 0))
     cv2.metric("Пары с атрибутами", int(coverage.get("pairs_with_attrs") or 0))
     cv3.metric("Пропущено пар", int(coverage.get("missing_pairs") or 0))
-    cv4.metric("Покрытие sync, %", float(coverage.get("coverage_percent") or 0.0))
+    cv4.metric("Покрытие синхронизации, %", float(coverage.get("coverage_percent") or 0.0))
     if int(coverage.get("missing_pairs") or 0) > 0:
         st.warning(
-            f"Ozon sync покрыт не полностью: {int(coverage.get('pairs_with_attrs') or 0)} из {int(coverage.get('total_pairs') or 0)} пар. "
+            f"Синхронизация Ozon покрыта не полностью: {int(coverage.get('pairs_with_attrs') or 0)} из {int(coverage.get('total_pairs') or 0)} пар. "
             "Ниже показан список первых пропусков."
         )
         missing_preview = coverage.get("missing_preview") or []
         if missing_preview:
             st.dataframe(with_ru_columns(pd.DataFrame(missing_preview)), use_container_width=True, hide_index=True)
     else:
-        st.success("Покрытие Ozon-sync полное для выбранных условий проверки.")
+        st.success("Покрытие синхронизации Ozon полное для выбранных условий проверки.")
 
     category_search = st.text_input(
         "Фильтр категорий Ozon",
@@ -3295,7 +3323,7 @@ def show_ozon_tab():
                 m1.metric("Атрибутов в кэше", int(len(attr_df)))
                 m2.metric("Обязательных", required_count)
                 m3.metric("Справочники", int((attr_df["dictionary_id"].fillna(0).astype(float) > 0).sum()) if "dictionary_id" in attr_df.columns else 0)
-                m4.metric("Базовых master-атрибутов", int(master_seed["total"]))
+                m4.metric("Базовых мастер-атрибутов", int(master_seed["total"]))
 
                 a1, a2 = st.columns(2)
                 with a1:
