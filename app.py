@@ -2517,40 +2517,48 @@ def enrich_product_from_supplier(
 
 def show_product_tab():
     conn = get_db()
-    st.subheader("Карточка товара")
-    st.caption("Мастер-карточка должна быть единым источником правды. Здесь можно вручную поправить данные или обогатить их с сайта поставщика.")
-    st.markdown("### Выбор товара для редактирования")
-    fs1, fs2, fs3, fs4 = st.columns([3, 2, 2, 2])
-    with fs1:
-        card_search = st.text_input(
-            "Поиск товара",
-            value=st.session_state.get("card_product_search", ""),
-            placeholder="Артикул или наименование товара",
-            key="card_product_search",
-        )
-    ozon_category_values, ozon_subcategory_values = list_ozon_category_filters(conn)
-    supplier_values = list_distinct_values(conn, "supplier_name")
-    with fs2:
-        card_category = st.selectbox(
-            "Категория Ozon",
-            options=["Все"] + ozon_category_values,
-            index=0,
-            key="card_product_category_filter",
-        )
-    with fs3:
-        card_subcategory = st.selectbox(
-            "Подкатегория Ozon",
-            options=["Все"] + ozon_subcategory_values,
-            index=0,
-            key="card_product_subcategory_filter",
-        )
-    with fs4:
-        card_supplier = st.selectbox(
-            "Поставщик",
-            options=["Все"] + supplier_values,
-            index=0,
-            key="card_product_supplier_filter",
-        )
+    st.subheader("Поиск и выбор товара для редактирования")
+    st.caption("Сначала выбери товар через фильтры, затем откроется его карточка для заполнения и обогащения.")
+    with st.container(border=True):
+        fs1, fs2, fs3, fs4, fs5 = st.columns([3, 2, 2, 2, 1])
+        with fs1:
+            card_search = st.text_input(
+                "Поиск товара",
+                value=st.session_state.get("card_product_search", ""),
+                placeholder="Артикул или наименование товара",
+                key="card_product_search",
+            )
+        ozon_category_values, ozon_subcategory_values = list_ozon_category_filters(conn)
+        supplier_values = list_distinct_values(conn, "supplier_name")
+        with fs2:
+            card_category = st.selectbox(
+                "Категория Ozon",
+                options=["Все"] + ozon_category_values,
+                index=0,
+                key="card_product_category_filter",
+            )
+        with fs3:
+            card_subcategory = st.selectbox(
+                "Подкатегория Ozon",
+                options=["Все"] + ozon_subcategory_values,
+                index=0,
+                key="card_product_subcategory_filter",
+            )
+        with fs4:
+            card_supplier = st.selectbox(
+                "Поставщик",
+                options=["Все"] + supplier_values,
+                index=0,
+                key="card_product_supplier_filter",
+            )
+        with fs5:
+            st.markdown("<br>", unsafe_allow_html=True)
+            if st.button("Сброс", key="card_filters_reset"):
+                st.session_state["card_product_search"] = ""
+                st.session_state["card_product_category_filter"] = "Все"
+                st.session_state["card_product_subcategory_filter"] = "Все"
+                st.session_state["card_product_supplier_filter"] = "Все"
+                st.rerun()
 
     filtered_products = find_products_for_card(
         conn,
@@ -2565,6 +2573,7 @@ def show_product_tab():
         conn.close()
         return
 
+    st.caption(f"Найдено товаров по фильтру: {len(filtered_products)}")
     product_options = [int(r["id"]) for r in filtered_products]
     current_product_id = int(st.session_state.get("selected_product_id") or 0)
     default_product_id = current_product_id if current_product_id in product_options else int(product_options[0])
@@ -2595,7 +2604,7 @@ def show_product_tab():
         conn.close()
         return
 
-    st.subheader(f"Редактирование: товар #{product['id']}")
+    st.subheader(f"Карточка товара #{product['id']}")
     with st.expander("Инструкция по кнопкам раздела Карточка", expanded=False):
         st.markdown(
             """
