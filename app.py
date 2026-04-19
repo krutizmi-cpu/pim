@@ -1359,6 +1359,182 @@ def dataframes_to_excel_bytes(sheets: dict[str, pd.DataFrame]) -> bytes:
     return output.getvalue()
 
 
+def _write_excel_sheet_chunked(writer: pd.ExcelWriter, sheet_name: str, df: pd.DataFrame, chunk_size: int = 900000) -> None:
+    frame = df if df is not None else pd.DataFrame()
+    if frame.empty:
+        frame.to_excel(writer, index=False, sheet_name=str(sheet_name)[:31])
+        return
+
+    total = len(frame)
+    if total <= int(chunk_size):
+        frame.to_excel(writer, index=False, sheet_name=str(sheet_name)[:31])
+        return
+
+    parts = math.ceil(total / int(chunk_size))
+    for idx in range(parts):
+        start = idx * int(chunk_size)
+        end = min((idx + 1) * int(chunk_size), total)
+        suffix = f"_{idx + 1}"
+        base = str(sheet_name)
+        safe_name = f"{base[: max(1, 31 - len(suffix))]}{suffix}"[:31]
+        frame.iloc[start:end].to_excel(writer, index=False, sheet_name=safe_name)
+
+
+def _read_excel_sheet_group(xls: pd.ExcelFile, base_sheet: str) -> pd.DataFrame | None:
+    names: list[str] = []
+    for sheet in xls.sheet_names:
+        if sheet == base_sheet or sheet.startswith(f"{base_sheet}_"):
+            names.append(sheet)
+    if not names:
+        return None
+
+    def _sort_key(name: str) -> tuple[int, int]:
+        if name == base_sheet:
+            return (0, 0)
+        suffix = name[len(base_sheet):]
+        if suffix.startswith("_"):
+            suffix = suffix[1:]
+        try:
+            return (1, int(suffix))
+        except Exception:
+            return (1, 999999)
+
+    names = sorted(names, key=_sort_key)
+    parts = [pd.read_excel(xls, sheet_name=name) for name in names]
+    if not parts:
+        return pd.DataFrame()
+    if len(parts) == 1:
+        return parts[0]
+    return pd.concat(parts, ignore_index=True)
+
+
+def _select_ozon_snapshot_df(conn, table_name: str) -> pd.DataFrame:
+    allowed_columns: dict[str, list[str]] = {
+        "ozon_category_cache": [
+            "description_category_id",
+            "category_name",
+            "full_path",
+            "type_id",
+            "type_name",
+            "disabled",
+            "children_count",
+            "fetched_at",
+        ],
+        "ozon_attribute_cache": [
+            "description_category_id",
+            "type_id",
+            "attribute_id",
+            "name",
+            "description",
+            "type",
+            "group_id",
+            "group_name",
+            "dictionary_id",
+            "is_required",
+            "is_collection",
+            "max_value_count",
+            "category_dependent",
+            "fetched_at",
+        ],
+        "ozon_attribute_value_cache": [
+            "description_category_id",
+            "type_id",
+            "attribute_id",
+            "dictionary_id",
+            "value_id",
+            "value",
+            "info",
+            "picture",
+            "fetched_at",
+        ],
+    }
+    columns = allowed_columns.get(table_name) or []
+    if not columns:
+        return pd.DataFrame()
+    query = f"SELECT {', '.join(columns)} FROM {table_name}"
+    return pd.read_sql_query(query, conn)
+
+
+def build_ozon_cache_snapshot_excel(conn, include_value_cache: bool = False) -> bytes:
+    meta_df = pd.DataFrame(
+        [
+            {
+                "generated_at": _now_iso(),
+                "db_path": _get_active_db_path() or "",
+                "include_value_cache": 1 if bool(include_value_cache) else 0,
+            }
+        ]
+    )
+    category_df = _select_ozon_snapshot_df(conn, "ozon_category_cache")
+    attribute_df = _select_ozon_snapshot_df(conn, "ozon_attribute_cache")
+    value_df = _select_ozon_snapshot_df(conn, "ozon_attribute_value_cache") if bool(include_value_cache) else pd.DataFrame()
+
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        _write_excel_sheet_chunked(writer, "meta", meta_df)
+        _write_excel_sheet_chunked(writer, "ozon_category_cache", category_df)
+        _write_excel_sheet_chunked(writer, "ozon_attribute_cache", attribute_df)
+        if bool(include_value_cache):
+            _write_excel_sheet_chunked(writer, "ozon_attribute_value_cache", value_df)
+    return output.getvalue()
+
+
+def _restore_snapshot_table(conn, table_name: str, df: pd.DataFrame | None) -> int:
+    if df is None:
+        return 0
+    if df.empty:
+        return 0
+    table_cols = [str(r["name"]) for r in conn.execute(f"PRAGMA table_info({table_name})").fetchall()]
+    if not table_cols:
+        return 0
+    allowed_cols = [c for c in df.columns if str(c) in table_cols and str(c) != "id"]
+    if not allowed_cols:
+        return 0
+    frame = df[allowed_cols].copy()
+    frame = frame.where(pd.notna(frame), None)
+    frame.to_sql(table_name, conn, if_exists="append", index=False, method="multi", chunksize=3000)
+    return int(len(frame))
+
+
+def restore_ozon_cache_snapshot_excel(conn, snapshot_bytes: bytes) -> dict:
+    try:
+        xls = pd.ExcelFile(BytesIO(snapshot_bytes))
+    except Exception as e:
+        return {"ok": False, "message": f"Не удалось открыть snapshot Excel: {e}"}
+
+    category_df = _read_excel_sheet_group(xls, "ozon_category_cache")
+    attribute_df = _read_excel_sheet_group(xls, "ozon_attribute_cache")
+    value_df = _read_excel_sheet_group(xls, "ozon_attribute_value_cache")
+
+    if category_df is None or attribute_df is None:
+        return {"ok": False, "message": "В snapshot нет обязательных листов `ozon_category_cache` и/или `ozon_attribute_cache`."}
+
+    try:
+        conn.execute("BEGIN")
+        conn.execute("DELETE FROM ozon_category_cache")
+        conn.execute("DELETE FROM ozon_attribute_cache")
+        if value_df is not None:
+            conn.execute("DELETE FROM ozon_attribute_value_cache")
+
+        restored_categories = _restore_snapshot_table(conn, "ozon_category_cache", category_df)
+        restored_attributes = _restore_snapshot_table(conn, "ozon_attribute_cache", attribute_df)
+        restored_values = 0
+        if value_df is not None:
+            restored_values = _restore_snapshot_table(conn, "ozon_attribute_value_cache", value_df)
+
+        conn.commit()
+        return {
+            "ok": True,
+            "categories": int(restored_categories),
+            "attributes": int(restored_attributes),
+            "values": int(restored_values),
+            "has_values": bool(value_df is not None),
+        }
+    except Exception as e:
+        conn.rollback()
+        return {"ok": False, "message": f"Ошибка восстановления snapshot: {e}"}
+
+
 def build_supplier_catalog_template_excel() -> bytes:
     df = pd.DataFrame(
         {
@@ -4408,6 +4584,75 @@ def show_ozon_tab():
         st.success("Ozon-креды заданы, можно синхронизировать дерево и атрибуты.")
     else:
         st.warning("Ozon-креды не заданы в этой сессии. Можно вставить их сюда вручную и сразу выполнить синхронизацию.")
+
+    with st.expander("Фиксация кэша Ozon (backup / restore)", expanded=False):
+        st.caption(
+            "Используй этот блок, чтобы не запускать полный sync заново после обновления приложения. "
+            "Сначала сохрани snapshot кэша Ozon в Excel, потом при необходимости восстанови его."
+        )
+        snap_c1, snap_c2, snap_c3 = st.columns([1, 1, 2])
+        with snap_c1:
+            snapshot_include_values = st.checkbox(
+                "Включать значения справочников",
+                value=False,
+                key="ozon_snapshot_include_values",
+                help="Лист `ozon_attribute_value_cache` может быть большим. Включай только если он нужен для dictionary-сопоставления.",
+            )
+        with snap_c2:
+            if st.button("Подготовить snapshot Ozon", key="ozon_prepare_snapshot_btn"):
+                with st.spinner("Формирую snapshot кэша Ozon..."):
+                    st.session_state["ozon_snapshot_bytes"] = build_ozon_cache_snapshot_excel(
+                        conn,
+                        include_value_cache=bool(snapshot_include_values),
+                    )
+                    st.session_state["ozon_snapshot_meta"] = {
+                        "generated_at": _now_iso(),
+                        "include_values": bool(snapshot_include_values),
+                    }
+                st.success("Snapshot подготовлен. Ниже появилась кнопка скачивания.")
+        with snap_c3:
+            snapshot_bytes = st.session_state.get("ozon_snapshot_bytes")
+            snapshot_meta = st.session_state.get("ozon_snapshot_meta") or {}
+            if snapshot_bytes:
+                meta_text = (
+                    f"Snapshot готов: {snapshot_meta.get('generated_at') or '-'} | "
+                    f"справочники: {'да' if snapshot_meta.get('include_values') else 'нет'}"
+                )
+                st.caption(meta_text)
+                st.download_button(
+                    "Скачать snapshot кэша Ozon (Excel)",
+                    data=snapshot_bytes,
+                    file_name=f"ozon_cache_snapshot_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key="ozon_download_snapshot_btn",
+                )
+            else:
+                st.caption("Сначала нажми `Подготовить snapshot Ozon`.")
+
+        restore_file = st.file_uploader(
+            "Восстановить snapshot Ozon из Excel",
+            type=["xlsx"],
+            key="ozon_restore_snapshot_file",
+        )
+        if st.button("Восстановить кэш Ozon из snapshot", key="ozon_restore_snapshot_btn"):
+            if restore_file is None:
+                st.warning("Сначала загрузи snapshot Excel файл.")
+            else:
+                with st.spinner("Восстанавливаю кэш Ozon из snapshot..."):
+                    restore_result = restore_ozon_cache_snapshot_excel(conn, restore_file.getvalue())
+                if bool(restore_result.get("ok")):
+                    msg = (
+                        "Кэш Ozon восстановлен: "
+                        f"категорий {int(restore_result.get('categories') or 0)}, "
+                        f"атрибутов {int(restore_result.get('attributes') or 0)}"
+                    )
+                    if bool(restore_result.get("has_values")):
+                        msg += f", значений справочников {int(restore_result.get('values') or 0)}"
+                    st.success(msg)
+                    st.info("Далее нажми `Импортировать все атрибуты Ozon из кэша в PIM`, чтобы восстановить master-атрибуты.")
+                    st.rerun()
+                else:
+                    st.error(str(restore_result.get("message") or "Не удалось восстановить snapshot Ozon."))
 
     top1, top2, top3, top4 = st.columns(4)
     with top1:
