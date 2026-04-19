@@ -3437,6 +3437,7 @@ def show_template_tab():
 
             st.markdown("### Автоматический матчинг")
             st.dataframe(match_df, use_container_width=True, hide_index=True)
+            st.caption("Единицы измерения конвертируются автоматически по заголовку колонки (например, см→мм, кг→г). Поле `Transform` можно вручную переопределить.")
 
             st.markdown("### Ручная правка матчинга")
             manual_rows = []

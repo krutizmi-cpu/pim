@@ -11,7 +11,7 @@ from openpyxl import load_workbook
 from services.attribute_service import list_attribute_definitions, list_channel_mapping_rules, set_product_attribute_value
 from services.source_priority import can_overwrite_field
 from services.source_tracking import save_field_source
-from services.transforms import apply_transform
+from services.transforms import apply_transform, infer_transform_rule
 
 
 BASE_PRODUCT_FIELD_ALIASES = {
@@ -159,6 +159,7 @@ def auto_match_template_columns(conn, columns: list[str]) -> list[dict]:
 
         if special:
             source_type, source_name, matched_by, transform_rule = special
+            resolved_transform = transform_rule or infer_transform_rule(col, source_type, source_name)
             matches.append(
                 {
                     "template_column": col,
@@ -166,7 +167,7 @@ def auto_match_template_columns(conn, columns: list[str]) -> list[dict]:
                     "source_type": source_type,
                     "source_name": source_name,
                     "matched_by": matched_by,
-                    "transform_rule": transform_rule,
+                    "transform_rule": resolved_transform,
                 }
             )
             continue
@@ -181,6 +182,7 @@ def auto_match_template_columns(conn, columns: list[str]) -> list[dict]:
 
         if matched:
             source_type, source_name, matched_by = matched
+            resolved_transform = infer_transform_rule(col, source_type, source_name)
             matches.append(
                 {
                     "template_column": col,
@@ -188,7 +190,7 @@ def auto_match_template_columns(conn, columns: list[str]) -> list[dict]:
                     "source_type": source_type,
                     "source_name": source_name,
                     "matched_by": matched_by,
-                    "transform_rule": None,
+                    "transform_rule": resolved_transform,
                 }
             )
             continue
@@ -217,6 +219,12 @@ def apply_saved_mapping_rules(conn, matches: list[dict], channel_code: str, cate
     for match in matches:
         rule = rule_map.get(match["template_column"])
         if rule:
+            saved_transform = rule.get("transform_rule")
+            resolved_transform = saved_transform or infer_transform_rule(
+                match["template_column"],
+                rule.get("source_type"),
+                rule.get("source_name"),
+            )
             updated.append(
                 {
                     "template_column": match["template_column"],
@@ -224,14 +232,29 @@ def apply_saved_mapping_rules(conn, matches: list[dict], channel_code: str, cate
                     "source_type": rule["source_type"],
                     "source_name": rule["source_name"],
                     "matched_by": "saved_rule",
-                    "transform_rule": rule.get("transform_rule"),
+                    "transform_rule": resolved_transform,
                 }
             )
         else:
             if "transform_rule" not in match:
-                match["transform_rule"] = None
+                match["transform_rule"] = infer_transform_rule(
+                    match.get("template_column"),
+                    match.get("source_type"),
+                    match.get("source_name"),
+                )
             updated.append(match)
     return updated
+
+
+def _resolve_transform_rule(match: dict) -> str | None:
+    explicit = match.get("transform_rule")
+    if explicit not in (None, ""):
+        return str(explicit)
+    return infer_transform_rule(
+        match.get("template_column"),
+        match.get("source_type"),
+        match.get("source_name"),
+    )
 
 
 def build_product_value_map(conn, product_id: int) -> dict[str, object]:
@@ -296,7 +319,8 @@ def fill_template_dataframe(conn, template_df: pd.DataFrame, product_ids: list[i
             if match["status"] != "matched":
                 row_data[col] = None
                 continue
-            row_data[col] = apply_transform(value_map.get(match["source_name"]), match.get("transform_rule"))
+            transform_rule = _resolve_transform_rule(match)
+            row_data[col] = apply_transform(value_map.get(match["source_name"]), transform_rule)
         rows.append(row_data)
     return pd.DataFrame(rows)
 
@@ -487,7 +511,8 @@ def fill_template_workbook_bytes(
             source_name = match.get("source_name")
             if not template_column or template_column not in column_map or not source_name:
                 continue
-            value = apply_transform(value_map.get(source_name), match.get("transform_rule"))
+            transform_rule = _resolve_transform_rule(match)
+            value = apply_transform(value_map.get(source_name), transform_rule)
             ws.cell(row=target_row, column=column_map[template_column]).value = value
 
     output = BytesIO()
