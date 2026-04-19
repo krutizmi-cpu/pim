@@ -3133,54 +3133,115 @@ def show_product_tab():
 def show_attributes_tab():
     conn = get_db()
     product_id = st.session_state.get("selected_product_id")
-    st.caption("Справочник атрибутов можно фильтровать по категории Ozon, чтобы работать с большим количеством полей без шума.")
+    def _reset_attrs_filters():
+        st.session_state["attrs_search"] = ""
+        st.session_state["attrs_source_filter"] = "Все"
+        st.session_state["attrs_category_scope"] = "Все"
+        st.session_state["attrs_only_required"] = False
+        st.session_state["attrs_rows_limit"] = 300
 
-    scope_labels = _build_ozon_scope_labels(conn)
-    category_scope_options = ["Все"] + sorted(scope_labels.keys())
+    st.subheader("Атрибуты")
+    st.caption("Рабочее место по атрибутам: фильтруй справочник, проверяй значения у выбранного товара и добавляй новые поля без путаницы.")
+    with st.expander("Инструкция по разделу Атрибуты", expanded=False):
+        st.markdown(
+            """
+1. В `Фильтры атрибутов` выбери источник (`Ozon`/`Кастомные`) и при необходимости `Категория Ozon`.
+2. Вкладка `Справочник атрибутов` показывает доступные поля по текущим фильтрам.
+3. Вкладка `Атрибуты выбранного товара` показывает заполненные значения текущего товара и позволяет быстро изменить поле.
+4. Вкладка `Добавить/обновить атрибут` используется, когда появилось новое поле из клиентского шаблона.
+
+`Только обязательные` работает в связке с выбранной Ozon-категорией.
+`Лимит строк` нужен для удобной навигации по большим справочникам.
+            """
+        )
+
+    selected_product = None
     if product_id:
         selected_product = conn.execute(
             """
-            SELECT ozon_description_category_id, ozon_type_id
+            SELECT id, article, name, supplier_name, ozon_category_path, ozon_description_category_id, ozon_type_id
             FROM products
             WHERE id = ?
             LIMIT 1
             """,
             (int(product_id),),
         ).fetchone()
-        if selected_product:
+
+    scope_labels = _build_ozon_scope_labels(conn)
+    category_scope_options = ["Все"] + sorted(scope_labels.keys())
+    if selected_product:
+        scoped_code = None
+        try:
+            desc_id = int(selected_product["ozon_description_category_id"] or 0)
+            type_id = int(selected_product["ozon_type_id"] or 0)
+            if desc_id > 0 and type_id > 0:
+                scoped_code = f"ozon:{desc_id}:{type_id}"
+        except Exception:
             scoped_code = None
-            try:
-                desc_id = int(selected_product["ozon_description_category_id"] or 0)
-                type_id = int(selected_product["ozon_type_id"] or 0)
-                if desc_id > 0 and type_id > 0:
-                    scoped_code = f"ozon:{desc_id}:{type_id}"
-            except Exception:
-                scoped_code = None
-            marker = st.session_state.get("attrs_scope_product_marker")
-            if scoped_code and scoped_code in category_scope_options and marker != int(product_id):
-                current_scope = st.session_state.get("attrs_category_scope")
-                if current_scope in (None, "", "Все"):
-                    st.session_state["attrs_category_scope"] = scoped_code
-            st.session_state["attrs_scope_product_marker"] = int(product_id)
+        marker = st.session_state.get("attrs_scope_product_marker")
+        if scoped_code and scoped_code in category_scope_options and marker != int(selected_product["id"]):
+            current_scope = st.session_state.get("attrs_category_scope")
+            if current_scope in (None, "", "Все"):
+                st.session_state["attrs_category_scope"] = scoped_code
+        st.session_state["attrs_scope_product_marker"] = int(selected_product["id"])
+
     current_scope_value = st.session_state.get("attrs_category_scope")
     if current_scope_value not in category_scope_options:
         st.session_state["attrs_category_scope"] = "Все"
         current_scope_value = "Все"
     scope_index = category_scope_options.index(current_scope_value) if current_scope_value in category_scope_options else 0
 
-    f1, f2, f3 = st.columns([2, 2, 2])
-    with f1:
-        attr_search = st.text_input("Поиск атрибута", value="", placeholder="Название, код, описание", key="attrs_search")
-    with f2:
-        attr_source_filter = st.selectbox("Источник атрибута", options=["Все", "Ozon", "Кастомные"], index=0, key="attrs_source_filter")
-    with f3:
-        category_scope = st.selectbox(
-            "Категория (область)",
-            options=category_scope_options,
-            index=scope_index,
-            key="attrs_category_scope",
-            format_func=lambda x: "Все" if x == "Все" else scope_labels.get(x, x),
+    with st.container(border=True):
+        st.markdown("### Фильтры атрибутов")
+        f1, f2, f3, f4, f5, f6 = st.columns([2.2, 1.2, 2.2, 1.2, 1.1, 0.7])
+        with f1:
+            attr_search = st.text_input(
+                "Поиск",
+                value=st.session_state.get("attrs_search", ""),
+                placeholder="Название или описание атрибута",
+                key="attrs_search",
+            )
+        with f2:
+            source_options = ["Все", "Ozon", "Кастомные"]
+            source_value = st.session_state.get("attrs_source_filter", "Все")
+            source_index = source_options.index(source_value) if source_value in source_options else 0
+            attr_source_filter = st.selectbox(
+                "Источник",
+                options=source_options,
+                index=source_index,
+                key="attrs_source_filter",
+            )
+        with f3:
+            category_scope = st.selectbox(
+                "Категория Ozon (область)",
+                options=category_scope_options,
+                index=scope_index,
+                key="attrs_category_scope",
+                format_func=lambda x: "Все" if x == "Все" else scope_labels.get(x, x),
+            )
+        with f4:
+            only_required = st.checkbox(
+                "Только обязательные",
+                value=bool(st.session_state.get("attrs_only_required", False)),
+                key="attrs_only_required",
+            )
+        with f5:
+            limit_options = [100, 300, 1000, 3000]
+            limit_value = int(st.session_state.get("attrs_rows_limit", 300))
+            limit_index = limit_options.index(limit_value) if limit_value in limit_options else 1
+            rows_limit = st.selectbox("Лимит строк", options=limit_options, index=limit_index, key="attrs_rows_limit")
+        with f6:
+            st.markdown("<br>", unsafe_allow_html=True)
+            st.button("Сброс", key="attrs_filters_reset", on_click=_reset_attrs_filters)
+
+    if selected_product:
+        st.success(f"Выбран товар: ID {selected_product['id']} | {selected_product['article'] or '-'} | {selected_product['name'] or '-'}")
+        st.caption(
+            f"Поставщик: {selected_product['supplier_name'] or '-'} | "
+            f"Ozon категория: {selected_product['ozon_category_path'] or '-'}"
         )
+    else:
+        st.warning("Товар не выбран. Выбери товар во вкладке `Карточка` или `Каталог`, чтобы редактировать значения атрибутов.")
 
     required_map: dict[str, int] = {}
     if category_scope != "Все":
@@ -3195,57 +3256,60 @@ def show_attributes_tab():
         ).fetchall()
         required_map = {str(r["attribute_code"]): int(r["is_required"] or 0) for r in req_rows}
 
-    left, right = st.columns([1, 1])
+    defs = list_attribute_definitions(conn)
+    defs_df = pd.DataFrame(defs) if defs else pd.DataFrame()
+    if not defs_df.empty:
+        if attr_source_filter == "Ozon":
+            defs_df = defs_df[defs_df["code"].astype(str).str.startswith("ozon_attr_")]
+        elif attr_source_filter == "Кастомные":
+            defs_df = defs_df[~defs_df["code"].astype(str).str.startswith("ozon_attr_")]
 
-    with left:
-        st.subheader("Справочник атрибутов")
-        defs = list_attribute_definitions(conn)
-        defs_df = pd.DataFrame(defs) if defs else pd.DataFrame()
-        if not defs_df.empty:
-            if attr_source_filter == "Ozon":
-                defs_df = defs_df[defs_df["code"].astype(str).str.startswith("ozon_attr_")]
-            elif attr_source_filter == "Кастомные":
-                defs_df = defs_df[~defs_df["code"].astype(str).str.startswith("ozon_attr_")]
+        if category_scope != "Все":
+            allowed_codes = set(required_map.keys())
+            defs_df = defs_df[defs_df["code"].astype(str).isin(allowed_codes)]
+            defs_df["is_required_for_category"] = defs_df["code"].map(lambda c: int(required_map.get(str(c), 0)))
 
-            if category_scope != "Все":
-                allowed_codes = set(required_map.keys())
-                defs_df = defs_df[defs_df["code"].astype(str).isin(allowed_codes)]
-                defs_df["is_required_for_category"] = defs_df["code"].map(lambda c: int(required_map.get(str(c), 0)))
+        if only_required and category_scope != "Все":
+            defs_df = defs_df[defs_df["is_required_for_category"].fillna(0).astype(int) == 1]
 
-            if attr_search:
-                q = str(attr_search).strip().lower()
-                mask = (
-                    defs_df["code"].astype(str).str.lower().str.contains(q, na=False)
-                    | defs_df["name"].astype(str).str.lower().str.contains(q, na=False)
-                    | defs_df["description"].astype(str).str.lower().str.contains(q, na=False)
-                )
-                defs_df = defs_df[mask]
+        if attr_search:
+            q = str(attr_search).strip().lower()
+            mask = (
+                defs_df["code"].astype(str).str.lower().str.contains(q, na=False)
+                | defs_df["name"].astype(str).str.lower().str.contains(q, na=False)
+                | defs_df["description"].astype(str).str.lower().str.contains(q, na=False)
+            )
+            defs_df = defs_df[mask]
 
-            data_type_ru = {"text": "Текст", "number": "Число", "boolean": "Да/Нет", "json": "JSON"}
-            scope_ru = {"master": "Мастер", "channel": "Канал"}
-            if "data_type" in defs_df.columns:
-                defs_df["data_type"] = defs_df["data_type"].map(lambda x: data_type_ru.get(str(x), x))
-            if "scope" in defs_df.columns:
-                defs_df["scope"] = defs_df["scope"].map(lambda x: scope_ru.get(str(x), x))
-            entity_type_ru = {"product": "Товар", "channel": "Канал", "category": "Категория"}
-            if "entity_type" in defs_df.columns:
-                defs_df["entity_type"] = defs_df["entity_type"].map(lambda x: entity_type_ru.get(str(x), x))
+        data_type_ru = {"text": "Текст", "number": "Число", "boolean": "Да/Нет", "json": "JSON"}
+        scope_ru = {"master": "Мастер", "channel": "Канал"}
+        entity_type_ru = {"product": "Товар", "channel": "Канал", "category": "Категория"}
+        defs_df = defs_df.copy()
+        if "data_type" in defs_df.columns:
+            defs_df["data_type"] = defs_df["data_type"].map(lambda x: data_type_ru.get(str(x), x))
+        if "scope" in defs_df.columns:
+            defs_df["scope"] = defs_df["scope"].map(lambda x: scope_ru.get(str(x), x))
+        if "entity_type" in defs_df.columns:
+            defs_df["entity_type"] = defs_df["entity_type"].map(lambda x: entity_type_ru.get(str(x), x))
 
-            m1, m2, m3, m4 = st.columns(4)
-            m1.metric("Атрибутов", int(len(defs_df)))
-            m2.metric("Атрибутов Ozon (уникальных)", int(defs_df["code"].astype(str).str.startswith("ozon_attr_").sum()))
-            required_count = int(defs_df["is_required_for_category"].fillna(0).astype(int).sum()) if "is_required_for_category" in defs_df.columns else 0
-            m3.metric("Обязательных (по категории)", required_count)
-            total_requirements = conn.execute(
-                "SELECT COUNT(*) FROM channel_attribute_requirements WHERE channel_code = 'ozon'"
-            ).fetchone()[0]
-            m4.metric("Требований Ozon (категорийных)", int(total_requirements or 0))
-            if category_scope == "Все":
-                st.caption("Чтобы увидеть обязательные атрибуты конкретной Ozon-категории, выбери `Категория (область)`.")
-            custom_count = int(len(defs_df) - int(defs_df["code"].astype(str).str.startswith("ozon_attr_").sum()))
-            if custom_count > 0:
-                st.caption(f"Дополнительно в справочнике есть {custom_count} кастомных атрибутов (вне Ozon).")
-            defs_df = defs_df.copy()
+    filtered_defs_count = int(len(defs_df)) if not defs_df.empty else 0
+    tabs = st.tabs(["Справочник атрибутов", "Атрибуты выбранного товара", "Добавить/обновить атрибут"])
+
+    with tabs[0]:
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Атрибутов по фильтру", filtered_defs_count)
+        ozon_count = int(defs_df["code"].astype(str).str.startswith("ozon_attr_").sum()) if not defs_df.empty and "code" in defs_df.columns else 0
+        m2.metric("Из них Ozon", ozon_count)
+        required_count = int(defs_df["is_required_for_category"].fillna(0).astype(int).sum()) if not defs_df.empty and "is_required_for_category" in defs_df.columns else 0
+        m3.metric("Обязательных (scope)", required_count)
+        total_requirements = conn.execute(
+            "SELECT COUNT(*) FROM channel_attribute_requirements WHERE channel_code = 'ozon'"
+        ).fetchone()[0]
+        m4.metric("Всего Ozon requirements", int(total_requirements or 0))
+
+        if defs_df.empty:
+            st.info("По текущим фильтрам атрибуты не найдены.")
+        else:
             defs_view_columns = [
                 c
                 for c in [
@@ -3262,52 +3326,34 @@ def show_attributes_tab():
                 ]
                 if c in defs_df.columns
             ]
+            limit_n = int(rows_limit or 300)
+            defs_to_show = defs_df.head(limit_n)
             st.dataframe(
-                with_ru_columns(
-                    defs_df[defs_view_columns] if defs_view_columns else defs_df,
-                ),
+                with_ru_columns(defs_to_show[defs_view_columns] if defs_view_columns else defs_to_show),
                 use_container_width=True,
                 hide_index=True,
             )
-        else:
-            st.info("Справочник атрибутов пока пуст.")
+            if len(defs_df) > limit_n:
+                st.caption(f"Показаны первые {limit_n} строк из {len(defs_df)}. Для полного списка увеличь `Лимит строк`.")
 
-        with st.form("new_attribute_def"):
-            code = st.text_input("Код атрибута")
-            name = st.text_input("Название атрибута")
-            data_type = st.selectbox("Тип", ["text", "number", "boolean", "json"])
-            scope = st.selectbox(
-                "Область",
-                ["master", "channel"],
-                format_func=lambda x: {"master": "Мастер", "channel": "Канал"}.get(str(x), str(x)),
+            st.download_button(
+                "Скачать текущий список атрибутов (Excel)",
+                data=export_current_df(with_ru_columns(defs_df[defs_view_columns] if defs_view_columns else defs_df)),
+                file_name="attributes_filtered.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="attrs_export_filtered_excel",
             )
-            unit = st.text_input("Ед. изм.")
-            description = st.text_input("Описание")
-            add_def = st.form_submit_button("Добавить / обновить атрибут")
 
-            if add_def and code and name:
-                upsert_attribute_definition(
-                    conn=conn,
-                    code=code.strip(),
-                    name=name.strip(),
-                    data_type=data_type,
-                    scope=scope,
-                    unit=unit or None,
-                    description=description or None,
-                )
-                st.success("Атрибут сохранён")
-                st.rerun()
-
-    with right:
+    with tabs[1]:
         if not product_id:
-            st.subheader("Атрибуты товара")
-            st.info("Сначала выбери товар во вкладке Каталог, чтобы редактировать его значения атрибутов.")
+            st.info("Нет выбранного товара. Сначала выбери товар, затем вернись в эту вкладку.")
         else:
-            st.subheader(f"Атрибуты товара #{product_id}")
+            st.markdown(f"### Значения атрибутов товара #{int(product_id)}")
             values = get_product_attribute_values(conn, int(product_id))
             values_df = pd.DataFrame(values) if values else pd.DataFrame()
             if not values_df.empty and category_scope != "Все":
                 values_df = values_df[values_df["attribute_code"].astype(str).isin(set(required_map.keys()))]
+
             if not values_df.empty:
                 values_df = values_df.copy()
                 if "data_type" in values_df.columns:
@@ -3317,8 +3363,6 @@ def show_attributes_tab():
                 value_columns = [
                     c
                     for c in [
-                        "id",
-                        "product_id",
                         "name",
                         "value",
                         "value_text",
@@ -3335,25 +3379,24 @@ def show_attributes_tab():
                     if c in values_df.columns
                 ]
                 st.dataframe(
-                    with_ru_columns(
-                        values_df[value_columns],
-                        extra_map={
-                            "value": "Значение",
-                        },
-                    ),
+                    with_ru_columns(values_df[value_columns], extra_map={"value": "Значение"}),
                     use_container_width=True,
                     hide_index=True,
                 )
             else:
-                st.caption("По текущему фильтру значения атрибутов не найдены.")
+                st.caption("По текущему фильтру значения атрибутов у выбранного товара не найдены.")
 
-            defs = list_attribute_definitions(conn)
+            editable_defs = list_attribute_definitions(conn)
             if category_scope != "Все":
                 allowed_codes = set(required_map.keys())
-                defs = [d for d in defs if str(d.get("code")) in allowed_codes]
-            def_codes = [d["code"] for d in defs] if defs else []
-            def_labels = {code: humanize_attribute_code(code) for code in def_codes}
+                editable_defs = [d for d in editable_defs if str(d.get("code")) in allowed_codes]
+            def_codes = [d["code"] for d in editable_defs] if editable_defs else []
+            def_labels = {
+                code: str(next((d.get("name") for d in editable_defs if str(d.get("code")) == str(code)), None) or humanize_attribute_code(code))
+                for code in def_codes
+            }
 
+            st.markdown("### Быстрое редактирование значения")
             with st.form("set_product_attr"):
                 attribute_code = (
                     st.selectbox("Атрибут", def_codes, format_func=lambda x: def_labels.get(x, x))
@@ -3361,9 +3404,9 @@ def show_attributes_tab():
                     else st.text_input("Атрибут")
                 )
                 value = st.text_input("Значение")
-                locale = st.text_input("Локаль", value="")
-                channel_code = st.text_input("Код канала", value="")
-                save_attr = st.form_submit_button("Сохранить значение")
+                locale = st.text_input("Локаль (опционально)", value="")
+                channel_code = st.text_input("Код канала (опционально)", value="")
+                save_attr = st.form_submit_button("Сохранить значение", type="primary")
 
                 if save_attr and attribute_code:
                     set_product_attribute_value(
@@ -3374,8 +3417,40 @@ def show_attributes_tab():
                         locale=locale or None,
                         channel_code=channel_code or None,
                     )
-                    st.success("Значение сохранено")
+                    st.success("Значение атрибута сохранено.")
                     st.rerun()
+
+    with tabs[2]:
+        st.markdown("### Добавление/обновление атрибута")
+        st.caption("Этот блок нужен, когда в клиентском шаблоне появилось новое поле, которого ещё нет в PIM.")
+        with st.form("new_attribute_def"):
+            code = st.text_input("Код атрибута", placeholder="например: rost_rebenka_ot")
+            name = st.text_input("Название атрибута", placeholder="например: Рост ребёнка от")
+            r1, r2 = st.columns(2)
+            with r1:
+                data_type = st.selectbox("Тип данных", ["text", "number", "boolean", "json"])
+            with r2:
+                scope = st.selectbox(
+                    "Область",
+                    ["master", "channel"],
+                    format_func=lambda x: {"master": "Мастер", "channel": "Канал"}.get(str(x), str(x)),
+                )
+            unit = st.text_input("Единица измерения (опционально)")
+            description = st.text_area("Описание (опционально)", height=90)
+            add_def = st.form_submit_button("Добавить / обновить атрибут", type="primary")
+
+            if add_def and code and name:
+                upsert_attribute_definition(
+                    conn=conn,
+                    code=code.strip(),
+                    name=name.strip(),
+                    data_type=data_type,
+                    scope=scope,
+                    unit=unit or None,
+                    description=description or None,
+                )
+                st.success("Атрибут сохранён в справочнике.")
+                st.rerun()
 
     conn.close()
 
