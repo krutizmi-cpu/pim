@@ -284,6 +284,8 @@ RU_COLUMN_MAP: dict[str, str] = {
     "data_type": "Тип данных",
     "scope": "Область",
     "entity_type": "Сущность",
+    "channel_code": "Канал",
+    "locale": "Локаль",
     "is_required": "Обязательный",
     "is_required_for_category": "Обязательный для категории",
     "is_collection": "Множественный",
@@ -292,6 +294,10 @@ RU_COLUMN_MAP: dict[str, str] = {
     "group_name": "Группа",
     "max_value_count": "Макс. значений",
     "value": "Значение",
+    "value_text": "Текстовое значение",
+    "value_number": "Числовое значение",
+    "value_boolean": "Булево значение",
+    "value_json": "JSON значение",
     "value_id": "ID значения",
     "info": "Инфо",
     "picture": "Картинка",
@@ -304,6 +310,15 @@ RU_COLUMN_MAP: dict[str, str] = {
     "transform_rule": "Правило трансформации",
     "matched_by": "Метод сопоставления",
     "status": "Статус",
+}
+
+ATTRIBUTE_CODE_RU_OVERRIDES: dict[str, str] = {
+    "main_image": "Главное изображение",
+    "gallery_images": "Галерея изображений",
+    "article": "Артикул",
+    "supplier_article": "Артикул поставщика",
+    "internal_article": "Внутренний артикул",
+    "image_url": "Ссылка на фото",
 }
 
 
@@ -320,6 +335,8 @@ def humanize_attribute_code(code: str | None) -> str:
     text = str(code or "").strip()
     if not text:
         return ""
+    if text in ATTRIBUTE_CODE_RU_OVERRIDES:
+        return ATTRIBUTE_CODE_RU_OVERRIDES[text]
     if text.startswith("ozon_attr_"):
         attr_id = text.replace("ozon_attr_", "", 1)
         return f"Ozon атрибут ID {attr_id}"
@@ -2561,11 +2578,22 @@ def show_attributes_tab():
                 )
                 defs_df = defs_df[mask]
 
-            m1, m2, m3 = st.columns(3)
+            data_type_ru = {"text": "Текст", "number": "Число", "boolean": "Да/Нет", "json": "JSON"}
+            scope_ru = {"master": "Мастер", "channel": "Канал"}
+            if "data_type" in defs_df.columns:
+                defs_df["data_type"] = defs_df["data_type"].map(lambda x: data_type_ru.get(str(x), x))
+            if "scope" in defs_df.columns:
+                defs_df["scope"] = defs_df["scope"].map(lambda x: scope_ru.get(str(x), x))
+
+            m1, m2, m3, m4 = st.columns(4)
             m1.metric("Атрибутов", int(len(defs_df)))
-            m2.metric("Ozon", int(defs_df["code"].astype(str).str.startswith("ozon_attr_").sum()))
+            m2.metric("Ozon (уникальные коды)", int(defs_df["code"].astype(str).str.startswith("ozon_attr_").sum()))
             required_count = int(defs_df["is_required_for_category"].fillna(0).astype(int).sum()) if "is_required_for_category" in defs_df.columns else 0
-            m3.metric("Required (scope)", required_count)
+            m3.metric("Обязательных (scope)", required_count)
+            total_requirements = conn.execute(
+                "SELECT COUNT(*) FROM channel_attribute_requirements WHERE channel_code = 'ozon'"
+            ).fetchone()[0]
+            m4.metric("Ozon requirements (категорийные)", int(total_requirements or 0))
             defs_df = defs_df.copy()
             defs_df["code_ru"] = defs_df["code"].map(humanize_attribute_code)
             st.dataframe(
@@ -2616,6 +2644,10 @@ def show_attributes_tab():
             if not values_df.empty:
                 values_df = values_df.copy()
                 values_df["attribute_code_ru"] = values_df["attribute_code"].map(humanize_attribute_code)
+                if "data_type" in values_df.columns:
+                    values_df["data_type"] = values_df["data_type"].map(lambda x: {"text": "Текст", "number": "Число", "boolean": "Да/Нет", "json": "JSON"}.get(str(x), x))
+                if "scope" in values_df.columns:
+                    values_df["scope"] = values_df["scope"].map(lambda x: {"master": "Мастер", "channel": "Канал"}.get(str(x), x))
                 st.dataframe(
                     with_ru_columns(
                         values_df,
@@ -3134,11 +3166,11 @@ def show_ozon_tab():
     stats = get_ozon_cache_stats(conn)
     s1, s2, s3, s4, s5, s6 = st.columns(6)
     s1.metric("Узлов категорий", int(stats.get("category_nodes") or 0))
-    s2.metric("Уникальных пар cat/type", int(stats.get("category_pairs") or 0))
+    s2.metric("Уникальных пар категорий", int(stats.get("category_pairs") or 0))
     s3.metric("Атрибутов в кэше", int(stats.get("attributes_total") or 0))
     s4.metric("Обязательных", int(stats.get("attributes_required") or 0))
     s5.metric("Атрибутов в master", int(stats.get("attribute_defs_ozon") or 0))
-    s6.metric("Ozon requirements", int(stats.get("ozon_requirements") or 0))
+    s6.metric("Ozon requirements (категорийные)", int(stats.get("ozon_requirements") or 0))
 
     qc1, qc2, qc3, qc4 = st.columns([1, 1, 1, 2])
     with qc1:
@@ -3149,7 +3181,7 @@ def show_ozon_tab():
         )
     with qc2:
         coverage_include_disabled = st.checkbox(
-            "Включая disabled",
+            "Включая отключённые",
             value=False,
             key="ozon_coverage_include_disabled",
         )

@@ -82,14 +82,16 @@ def _post(
 def _flatten_tree(
     nodes: list[dict[str, Any]],
     parent_path: str = "",
+    inherited_description_category_id: int | None = None,
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for node in nodes or []:
         category_name = node.get("category_name") or ""
         current_path = f"{parent_path} / {category_name}".strip(" /") if category_name else parent_path
+        effective_description_category_id = node.get("description_category_id") or inherited_description_category_id
         rows.append(
             {
-                "description_category_id": node.get("description_category_id"),
+                "description_category_id": effective_description_category_id,
                 "category_name": category_name,
                 "path": current_path,
                 "type_id": node.get("type_id"),
@@ -103,6 +105,7 @@ def _flatten_tree(
             _flatten_tree(
                 node.get("children") or [],
                 current_path,
+                effective_description_category_id,
             )
         )
     return rows
