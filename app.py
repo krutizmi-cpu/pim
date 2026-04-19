@@ -265,12 +265,12 @@ RU_COLUMN_MAP: dict[str, str] = {
     "import_batch_id": "Партия импорта",
     "supplier_parse_status": "Статус парсинга",
     "supplier_parse_comment": "Комментарий парсинга",
-    "ozon_description_category_id": "Ozon category_id",
-    "ozon_type_id": "Ozon type_id",
+    "ozon_description_category_id": "ID категории Ozon",
+    "ozon_type_id": "ID типа Ozon",
     "ozon_category_path": "Ozon категория",
     "ozon_category_confidence": "Уверенность Ozon",
-    "description_category_id": "Ozon category_id",
-    "type_id": "Ozon type_id",
+    "description_category_id": "ID категории Ozon",
+    "type_id": "ID типа Ozon",
     "type_name": "Тип категории Ozon",
     "category_name": "Название категории Ozon",
     "full_path": "Путь категории Ozon",
@@ -380,6 +380,20 @@ def _build_ozon_scope_labels(conn) -> dict[str, str]:
         type_name = str(cat["type_name"] or "").strip() if cat else ""
         if full_path or type_name:
             labels[code] = f"{full_path or '-'} | {type_name or '-'} | cat={desc_id}, type={type_id}"
+        else:
+            fallback = conn.execute(
+                """
+                SELECT MAX(category_name) AS category_name
+                FROM ozon_category_cache
+                WHERE description_category_id = ?
+                """,
+                (desc_id,),
+            ).fetchone()
+            category_name = str(fallback["category_name"] or "").strip() if fallback else ""
+            if category_name:
+                labels[code] = f"{category_name} | тип={type_id} | cat={desc_id}"
+            else:
+                labels[code] = f"Ozon категория {desc_id} | тип {type_id}"
     return labels
 
 
@@ -2307,7 +2321,7 @@ def show_product_tab():
                 )
                 st.success(
                     f"Импорт в справочник выполнен: {int(import_result.get('imported') or 0)} атрибутов, "
-                    f"required: {int(import_result.get('required') or 0)}."
+                    f"обязательных: {int(import_result.get('required') or 0)}."
                 )
                 st.rerun()
         with oz2:
@@ -2343,7 +2357,7 @@ def show_product_tab():
             req_df["filled"] = req_df["current_value"].map(lambda x: 0 if x in (None, "", "None") else 1)
             r1, r2, r3 = st.columns(3)
             r1.metric("Всего атрибутов категории", int(len(req_df)))
-            r2.metric("Required", int(req_df["is_required"].fillna(0).astype(int).sum()))
+            r2.metric("Обязательных", int(req_df["is_required"].fillna(0).astype(int).sum()))
             r3.metric("Заполнено значениями", int(req_df["filled"].sum()))
             st.dataframe(
                 with_ru_columns(
@@ -2524,6 +2538,36 @@ def show_attributes_tab():
 
     scope_labels = _build_ozon_scope_labels(conn)
     category_scope_options = ["Все"] + sorted(scope_labels.keys())
+    if product_id:
+        selected_product = conn.execute(
+            """
+            SELECT ozon_description_category_id, ozon_type_id
+            FROM products
+            WHERE id = ?
+            LIMIT 1
+            """,
+            (int(product_id),),
+        ).fetchone()
+        if selected_product:
+            scoped_code = None
+            try:
+                desc_id = int(selected_product["ozon_description_category_id"] or 0)
+                type_id = int(selected_product["ozon_type_id"] or 0)
+                if desc_id > 0 and type_id > 0:
+                    scoped_code = f"ozon:{desc_id}:{type_id}"
+            except Exception:
+                scoped_code = None
+            marker = st.session_state.get("attrs_scope_product_marker")
+            if scoped_code and scoped_code in category_scope_options and marker != int(product_id):
+                current_scope = st.session_state.get("attrs_category_scope")
+                if current_scope in (None, "", "Все"):
+                    st.session_state["attrs_category_scope"] = scoped_code
+            st.session_state["attrs_scope_product_marker"] = int(product_id)
+    current_scope_value = st.session_state.get("attrs_category_scope")
+    if current_scope_value not in category_scope_options:
+        st.session_state["attrs_category_scope"] = "Все"
+        current_scope_value = "Все"
+    scope_index = category_scope_options.index(current_scope_value) if current_scope_value in category_scope_options else 0
 
     f1, f2, f3 = st.columns([2, 2, 2])
     with f1:
@@ -2534,7 +2578,7 @@ def show_attributes_tab():
         category_scope = st.selectbox(
             "Категория (область)",
             options=category_scope_options,
-            index=0,
+            index=scope_index,
             key="attrs_category_scope",
             format_func=lambda x: "Все" if x == "Все" else scope_labels.get(x, x),
         )
@@ -2584,6 +2628,9 @@ def show_attributes_tab():
                 defs_df["data_type"] = defs_df["data_type"].map(lambda x: data_type_ru.get(str(x), x))
             if "scope" in defs_df.columns:
                 defs_df["scope"] = defs_df["scope"].map(lambda x: scope_ru.get(str(x), x))
+            entity_type_ru = {"product": "Товар", "channel": "Канал", "category": "Категория"}
+            if "entity_type" in defs_df.columns:
+                defs_df["entity_type"] = defs_df["entity_type"].map(lambda x: entity_type_ru.get(str(x), x))
 
             m1, m2, m3, m4 = st.columns(4)
             m1.metric("Атрибутов", int(len(defs_df)))
@@ -2594,6 +2641,11 @@ def show_attributes_tab():
                 "SELECT COUNT(*) FROM channel_attribute_requirements WHERE channel_code = 'ozon'"
             ).fetchone()[0]
             m4.metric("Требований Ozon (категорийных)", int(total_requirements or 0))
+            if category_scope == "Все":
+                st.caption("Чтобы увидеть обязательные атрибуты конкретной Ozon-категории, выбери `Категория (область)`.")
+            custom_count = int(len(defs_df) - int(defs_df["code"].astype(str).str.startswith("ozon_attr_").sum()))
+            if custom_count > 0:
+                st.caption(f"Дополнительно в справочнике есть {custom_count} кастомных атрибутов (вне Ozon).")
             defs_df = defs_df.copy()
             defs_df["code_ru"] = defs_df["code"].map(humanize_attribute_code)
             st.dataframe(
@@ -2613,7 +2665,11 @@ def show_attributes_tab():
             code = st.text_input("Код атрибута")
             name = st.text_input("Название атрибута")
             data_type = st.selectbox("Тип", ["text", "number", "boolean", "json"])
-            scope = st.selectbox("Область", ["master", "channel"])
+            scope = st.selectbox(
+                "Область",
+                ["master", "channel"],
+                format_func=lambda x: {"master": "Мастер", "channel": "Канал"}.get(str(x), str(x)),
+            )
             unit = st.text_input("Ед. изм.")
             description = st.text_input("Описание")
             add_def = st.form_submit_button("Добавить / обновить атрибут")
@@ -3354,7 +3410,7 @@ def show_ozon_tab():
                     mm1, mm2, mm3 = st.columns(3)
                     mm1.metric("Matched по эвристике/правилам", int((mapping_df["status"] == "matched").sum()))
                     mm2.metric("Без маппинга", int((mapping_df["status"] != "matched").sum()))
-                    mm3.metric("Required без маппинга", int(((mapping_df["is_required"] == 1) & (mapping_df["status"] != "matched")).sum()))
+                    mm3.metric("Обязательных без маппинга", int(((mapping_df["is_required"] == 1) & (mapping_df["status"] != "matched")).sum()))
 
                     st.markdown("### Предлагаемые Ozon mapping rules")
                     st.dataframe(
@@ -3377,7 +3433,7 @@ def show_ozon_tab():
                 if dictionary_attrs:
                     st.markdown("### Справочники значений Ozon")
                     dd1, dd2, dd3 = st.columns(3)
-                    dd1.metric("Dictionary-атрибутов", int(len(dictionary_attrs)))
+                    dd1.metric("Атрибутов-справочников", int(len(dictionary_attrs)))
                     cached_dict_attr_count = conn.execute(
                         "SELECT COUNT(DISTINCT attribute_id) FROM ozon_attribute_value_cache WHERE description_category_id = ? AND type_id = ?",
                         (int(selected_row["description_category_id"]), int(selected_row["type_id"])),
@@ -3400,7 +3456,7 @@ def show_ozon_tab():
                         st.success(f"Синхронизировано справочников: {result['synced_attributes']}, значений: {result['synced_values']}")
 
                     dict_options = [f"{row['name']} | attr={row['attribute_id']} | dict={row['dictionary_id']}" for row in dictionary_attrs]
-                    selected_dict_label = st.selectbox("Dictionary-атрибут", options=dict_options, key="ozon_dict_attr")
+                    selected_dict_label = st.selectbox("Атрибут-справочник", options=dict_options, key="ozon_dict_attr")
                     selected_dict_row = dictionary_attrs[dict_options.index(selected_dict_label)]
                     d1, d2 = st.columns(2)
                     with d1:
@@ -3537,7 +3593,7 @@ def show_ozon_tab():
                         key=bulk_select_key,
                     )
                     required_only_mode = st.checkbox(
-                        "Работать только с обязательными Ozon-атрибутами (required)",
+                        "Работать только с обязательными Ozon-атрибутами",
                         value=False,
                         key=f"ozon_required_only_{selected_product_id}",
                     )
@@ -3560,7 +3616,7 @@ def show_ozon_tab():
                         p1, p2, p3, p4 = st.columns(4)
                         p1.metric("Готово к автозаполнению", int((preview_df["status"] == "ready").sum()))
                         p2.metric("Пусто после маппинга", int((preview_df["status"] == "empty").sum()))
-                        p3.metric("Required ready", int(((preview_df["status"] == "ready") & (preview_df["is_required"] == 1)).sum()))
+                        p3.metric("Обязательных готово", int(((preview_df["status"] == "ready") & (preview_df["is_required"] == 1)).sum()))
                         p4.metric("Dictionary не сматчено", int((preview_df["status"] == "dictionary_unmatched").sum()))
 
                         action1, action2 = st.columns(2)
@@ -3575,11 +3631,11 @@ def show_ozon_tab():
                                 )
                                 summary = coverage["summary"]
                                 cc1, cc2, cc3, cc4 = st.columns(4)
-                                cc1.metric("Ready %", int(summary["readiness_pct"]))
-                                cc2.metric("Required всего", int(summary["required_total"]))
-                                cc3.metric("Required закрыто", int(summary["required_covered"]))
-                                cc4.metric("Required пусто", int(summary["required_missing"]))
-                                st.caption(f"Required dictionary_unmatched: {int(summary.get('required_dictionary_unmatched') or 0)}")
+                                cc1.metric("Готовность, %", int(summary["readiness_pct"]))
+                                cc2.metric("Обязательных всего", int(summary["required_total"]))
+                                cc3.metric("Обязательных закрыто", int(summary["required_covered"]))
+                                cc4.metric("Обязательных пусто", int(summary["required_missing"]))
+                                st.caption(f"Обязательных с несопоставленным справочником: {int(summary.get('required_dictionary_unmatched') or 0)}")
                                 if summary["readiness_pct"] == 100:
                                     st.success("Обязательные Ozon-атрибуты по этой категории закрыты.")
                                 else:
