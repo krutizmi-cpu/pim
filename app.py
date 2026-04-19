@@ -413,6 +413,31 @@ def humanize_attribute_code(code: str | None) -> str:
     return " ".join(text.replace("_", " ").split()).capitalize()
 
 
+def format_source_name_ui(
+    source_name: str | None,
+    source_type: str | None = None,
+    attr_name_map: dict[str, str] | None = None,
+) -> str:
+    value = str(source_name or "").strip()
+    if not value:
+        return ""
+
+    stype = str(source_type or "").strip().lower()
+    if stype == "attribute":
+        if attr_name_map and value in attr_name_map and str(attr_name_map[value]).strip():
+            return str(attr_name_map[value]).strip()
+        return humanize_attribute_code(value)
+
+    if stype == "column":
+        if value in RU_COLUMN_MAP:
+            return str(RU_COLUMN_MAP[value])
+        return humanize_attribute_code(value)
+
+    if attr_name_map and value in attr_name_map and str(attr_name_map[value]).strip():
+        return str(attr_name_map[value]).strip()
+    return humanize_attribute_code(value)
+
+
 def _build_ozon_scope_labels(conn) -> dict[str, str]:
     rows = conn.execute(
         """
@@ -2745,7 +2770,6 @@ def show_product_tab():
         ).fetchall()
         if ozon_req_rows:
             req_df = pd.DataFrame([dict(r) for r in ozon_req_rows])
-            req_df["attribute_code_ru"] = req_df["attribute_code"].map(humanize_attribute_code)
             req_df["filled"] = req_df["current_value"].map(lambda x: 0 if x in (None, "", "None") else 1)
             r1, r2, r3 = st.columns(3)
             r1.metric("Всего атрибутов категории", int(len(req_df)))
@@ -2755,8 +2779,6 @@ def show_product_tab():
                 with_ru_columns(
                     req_df[
                         [
-                            "attribute_code",
-                            "attribute_code_ru",
                             "attribute_name",
                             "data_type",
                             "unit",
@@ -2765,7 +2787,6 @@ def show_product_tab():
                         ]
                     ],
                     extra_map={
-                        "attribute_code_ru": "Код атрибута (рус.)",
                         "attribute_name": "Название атрибута",
                         "current_value": "Текущее значение",
                     },
@@ -2903,9 +2924,10 @@ def show_product_tab():
                 hide_index=True,
                 key=f"card_attr_editor_{int(product_id)}_{selected_channel}_{selected_scope or 'all'}",
                 disabled=["attribute_code", "attribute_code_ru", "name", "data_type", "is_required", "current_value"],
+                column_order=["name", "data_type", "is_required", "current_value", "new_value"],
                 column_config={
-                    "attribute_code_ru": st.column_config.TextColumn("Код атрибута (рус.)"),
-                    "attribute_code": st.column_config.TextColumn("Технический код"),
+                    "attribute_code_ru": None,
+                    "attribute_code": None,
                     "name": st.column_config.TextColumn("Название"),
                     "data_type": st.column_config.TextColumn("Тип данных"),
                     "is_required": st.column_config.NumberColumn("Обязательный", format="%d"),
@@ -3215,13 +3237,25 @@ def show_attributes_tab():
             if custom_count > 0:
                 st.caption(f"Дополнительно в справочнике есть {custom_count} кастомных атрибутов (вне Ozon).")
             defs_df = defs_df.copy()
-            defs_df["code_ru"] = defs_df["code"].map(humanize_attribute_code)
+            defs_view_columns = [
+                c
+                for c in [
+                    "name",
+                    "data_type",
+                    "scope",
+                    "entity_type",
+                    "is_required",
+                    "is_multi_value",
+                    "unit",
+                    "description",
+                    "is_required_for_category",
+                    "updated_at",
+                ]
+                if c in defs_df.columns
+            ]
             st.dataframe(
                 with_ru_columns(
-                    defs_df,
-                    extra_map={
-                        "code_ru": "Код атрибута (рус.)",
-                    },
+                    defs_df[defs_view_columns] if defs_view_columns else defs_df,
                 ),
                 use_container_width=True,
                 hide_index=True,
@@ -3267,7 +3301,6 @@ def show_attributes_tab():
                 values_df = values_df[values_df["attribute_code"].astype(str).isin(set(required_map.keys()))]
             if not values_df.empty:
                 values_df = values_df.copy()
-                values_df["attribute_code_ru"] = values_df["attribute_code"].map(humanize_attribute_code)
                 if "data_type" in values_df.columns:
                     values_df["data_type"] = values_df["data_type"].map(lambda x: {"text": "Текст", "number": "Число", "boolean": "Да/Нет", "json": "JSON"}.get(str(x), x))
                 if "scope" in values_df.columns:
@@ -3277,8 +3310,6 @@ def show_attributes_tab():
                     for c in [
                         "id",
                         "product_id",
-                        "attribute_code_ru",
-                        "attribute_code",
                         "name",
                         "value",
                         "value_text",
@@ -3298,8 +3329,6 @@ def show_attributes_tab():
                     with_ru_columns(
                         values_df[value_columns],
                         extra_map={
-                            "attribute_code_ru": "Код атрибута (рус.)",
-                            "attribute_code": "Технический код",
                             "value": "Значение",
                         },
                     ),
@@ -3318,7 +3347,7 @@ def show_attributes_tab():
 
             with st.form("set_product_attr"):
                 attribute_code = (
-                    st.selectbox("Атрибут", def_codes, format_func=lambda x: f"{def_labels.get(x, x)} ({x})")
+                    st.selectbox("Атрибут", def_codes, format_func=lambda x: def_labels.get(x, x))
                     if def_codes
                     else st.text_input("Атрибут")
                 )
@@ -3443,6 +3472,7 @@ def show_template_tab():
                 st.caption("Атрибуты и требования этого шаблона уже были зарегистрированы ранее.")
 
         defs = list_attribute_definitions(conn)
+        attr_name_map = {str(d["code"]): str(d.get("name") or humanize_attribute_code(d["code"])) for d in defs}
         source_options = [("column", c) for c in [
             "article", "internal_article", "supplier_article", "name", "barcode", "brand", "description",
             "weight", "length", "width", "height", "package_length", "package_width", "package_height",
@@ -3487,6 +3517,16 @@ def show_template_tab():
                     st.session_state[f"tmpl_transform_{idx}"] = transform_rule
 
         match_df = pd.DataFrame(matches)
+        match_df_view = match_df.copy()
+        if not match_df_view.empty and "source_name" in match_df_view.columns:
+            match_df_view["source_name"] = match_df_view.apply(
+                lambda r: format_source_name_ui(
+                    r.get("source_name"),
+                    source_type=r.get("source_type"),
+                    attr_name_map=attr_name_map,
+                ),
+                axis=1,
+            )
         matched_count = int((match_df["status"] == "matched").sum()) if not match_df.empty else 0
         unmatched_count = int((match_df["status"] != "matched").sum()) if not match_df.empty else 0
 
@@ -3536,7 +3576,7 @@ def show_template_tab():
             st.dataframe(pd.DataFrame({"template_column": list(template_df.columns)}), use_container_width=True, hide_index=True)
 
             st.markdown("### Автоматический матчинг")
-            st.dataframe(match_df, use_container_width=True, hide_index=True)
+            st.dataframe(match_df_view, use_container_width=True, hide_index=True)
             st.caption("Единицы измерения конвертируются автоматически по заголовку колонки (например, см→мм, кг→г). Поле `Transform` можно вручную переопределить.")
 
             st.markdown("### Ручная правка матчинга")
@@ -3555,7 +3595,17 @@ def show_template_tab():
                 with c3:
                     allowed_names = [name for stype, name in source_options if stype == source_type] if source_type != "skip" else [""]
                     current_name = match["source_name"] if match["source_name"] in allowed_names else (allowed_names[0] if allowed_names else "")
-                    source_name = st.selectbox("Источник", options=allowed_names, index=(allowed_names.index(current_name) if current_name in allowed_names else 0), key=f"tmpl_name_{idx}") if allowed_names else st.text_input("Источник", value="", key=f"tmpl_name_{idx}")
+                    source_name = st.selectbox(
+                        "Источник",
+                        options=allowed_names,
+                        index=(allowed_names.index(current_name) if current_name in allowed_names else 0),
+                        key=f"tmpl_name_{idx}",
+                        format_func=lambda x, stype=source_type: format_source_name_ui(
+                            x,
+                            source_type=stype,
+                            attr_name_map=attr_name_map,
+                        ),
+                    ) if allowed_names else st.text_input("Источник", value="", key=f"tmpl_name_{idx}")
                 with c4:
                     current_transform = match.get("transform_rule") if match.get("transform_rule") in TEMPLATE_TRANSFORM_OPTIONS else ""
                     transform_rule = st.selectbox(
@@ -4051,6 +4101,20 @@ def show_ozon_tab():
                     )
                 )
                 if not mapping_df.empty:
+                    defs_for_mapping = list_attribute_definitions(conn)
+                    mapping_attr_name_map = {
+                        str(d["code"]): str(d.get("name") or humanize_attribute_code(d["code"]))
+                        for d in defs_for_mapping
+                    } if defs_for_mapping else {}
+                    if "source_name" in mapping_df.columns:
+                        mapping_df["source_name"] = mapping_df.apply(
+                            lambda r: format_source_name_ui(
+                                r.get("source_name"),
+                                source_type=r.get("source_type"),
+                                attr_name_map=mapping_attr_name_map,
+                            ),
+                            axis=1,
+                        )
                     mm1, mm2, mm3 = st.columns(3)
                     mm1.metric("Matched по эвристике/правилам", int((mapping_df["status"] == "matched").sum()))
                     mm2.metric("Без маппинга", int((mapping_df["status"] != "matched").sum()))
@@ -5068,14 +5132,23 @@ def show_channels_tab():
     with col1:
         st.markdown("### Требования канала")
         reqs = list_channel_requirements(conn, channel_code=channel_code, category_code=category_code or None)
-        if reqs:
-            st.dataframe(pd.DataFrame(reqs), use_container_width=True, hide_index=True)
-
         defs = list_attribute_definitions(conn)
+        attr_name_map = {str(d["code"]): str(d.get("name") or humanize_attribute_code(d["code"])) for d in defs} if defs else {}
+        if reqs:
+            req_df = pd.DataFrame(reqs)
+            if "attribute_code" in req_df.columns:
+                req_df["attribute_name"] = req_df["attribute_code"].map(lambda x: format_source_name_ui(x, "attribute", attr_name_map))
+                req_df = req_df.drop(columns=["attribute_code"], errors="ignore")
+            st.dataframe(with_ru_columns(req_df, extra_map={"attribute_name": "Атрибут"}), use_container_width=True, hide_index=True)
+
         def_codes = [d["code"] for d in defs] if defs else []
 
         with st.form("channel_req_form"):
-            attribute_code = st.selectbox("Обязательный атрибут", def_codes) if def_codes else st.text_input("Код атрибута")
+            attribute_code = st.selectbox(
+                "Обязательный атрибут",
+                def_codes,
+                format_func=lambda x: format_source_name_ui(x, "attribute", attr_name_map),
+            ) if def_codes else st.text_input("Атрибут")
             is_required = st.checkbox("Обязательный", value=True)
             sort_order = st.number_input("Порядок", min_value=1, value=100, step=1)
             notes = st.text_input("Комментарий")
@@ -5098,15 +5171,28 @@ def show_channels_tab():
         st.markdown("### Mapping rules")
         rules = list_channel_mapping_rules(conn, channel_code=channel_code, category_code=category_code or None)
         if rules:
-            st.dataframe(pd.DataFrame(rules), use_container_width=True, hide_index=True)
+            rules_df = pd.DataFrame(rules)
+            if not rules_df.empty and "source_name" in rules_df.columns:
+                rules_df["source_name"] = rules_df.apply(
+                    lambda r: format_source_name_ui(
+                        r.get("source_name"),
+                        source_type=r.get("source_type"),
+                        attr_name_map=attr_name_map,
+                    ),
+                    axis=1,
+                )
+            st.dataframe(with_ru_columns(rules_df), use_container_width=True, hide_index=True)
 
-        defs = list_attribute_definitions(conn)
         def_codes = [d["code"] for d in defs] if defs else []
 
         with st.form("channel_rule_form"):
             target_field = st.text_input("Поле канала")
             source_type = st.selectbox("Источник", ["attribute", "column", "constant"])
-            source_name = st.selectbox("Source name", def_codes) if source_type == "attribute" and def_codes else st.text_input("Source name")
+            source_name = st.selectbox(
+                "Source name",
+                def_codes,
+                format_func=lambda x: format_source_name_ui(x, "attribute", attr_name_map),
+            ) if source_type == "attribute" and def_codes else st.text_input("Source name")
             transform_rule = st.text_input("Transform rule")
             is_required = st.checkbox("Обязательное поле", value=False)
             save_rule = st.form_submit_button("Сохранить mapping")
