@@ -15,6 +15,28 @@ STOP_TOKENS = {
 GENERIC_CATEGORY_TOKENS = {"прочее", "товары", "другое", "разное", "other", "misc"}
 
 
+def _split_ozon_path(path: str | None) -> list[str]:
+    text = " ".join(str(path or "").strip().split())
+    if not text:
+        return []
+    parts = [x.strip() for x in re.split(r"\s*(?:/|>|»|→|\|)\s*", text) if str(x).strip()]
+    return parts if parts else [text]
+
+
+def _derive_catalog_categories_from_ozon_path(path: str | None) -> dict[str, str]:
+    parts = _split_ozon_path(path)
+    if not parts:
+        return {"category": "", "base_category": "", "subcategory": ""}
+    leaf = parts[-1]
+    parent = parts[-2] if len(parts) >= 2 else leaf
+    # Ozon leaf is canonical category; parent is base category context.
+    return {
+        "category": leaf,
+        "base_category": parent,
+        "subcategory": leaf,
+    }
+
+
 def _normalize(text: str | None) -> str:
     return " ".join(str(text or "").strip().lower().replace("ё", "е").split())
 
@@ -144,6 +166,10 @@ def bulk_assign_ozon_categories(
     categories = _category_candidates(conn)
     if not categories:
         return {"processed": 0, "assigned": 0, "skipped": 0, "message": "Кэш категорий Ozon пуст"}
+    category_by_key = {
+        (int(c["description_category_id"]), int(c["type_id"])): c
+        for c in categories
+    }
 
     assigned = 0
     skipped = 0
@@ -153,7 +179,7 @@ def bulk_assign_ozon_categories(
         row = conn.execute(
             """
             SELECT id, name, category, base_category, subcategory,
-                   ozon_description_category_id, ozon_type_id, ozon_category_confidence
+                   ozon_description_category_id, ozon_type_id, ozon_category_path, ozon_category_confidence
             FROM products
             WHERE id = ?
             LIMIT 1
@@ -168,6 +194,43 @@ def bulk_assign_ozon_categories(
         existing_type = product.get("ozon_type_id")
         existing_conf = float(product.get("ozon_category_confidence") or 0.0)
         if existing_id and existing_type and not force:
+            key = (int(existing_id), int(existing_type))
+            existing_cat = category_by_key.get(key)
+            existing_path = str(product.get("ozon_category_path") or (existing_cat or {}).get("full_path") or "").strip()
+            derived = _derive_catalog_categories_from_ozon_path(existing_path)
+            if existing_path and (
+                str(product.get("category") or "").strip() != str(derived.get("category") or "").strip()
+                or not str(product.get("base_category") or "").strip()
+                or not str(product.get("subcategory") or "").strip()
+            ):
+                conn.execute(
+                    """
+                    UPDATE products
+                    SET category = ?,
+                        base_category = CASE WHEN IFNULL(TRIM(base_category), '') = '' THEN ? ELSE base_category END,
+                        subcategory = CASE WHEN IFNULL(TRIM(subcategory), '') = '' THEN ? ELSE subcategory END,
+                        ozon_category_path = ?,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    """,
+                    (
+                        str(derived.get("category") or product.get("category") or ""),
+                        str(derived.get("base_category") or ""),
+                        str(derived.get("subcategory") or ""),
+                        existing_path,
+                        int(product_id),
+                    ),
+                )
+                save_field_source(
+                    conn=conn,
+                    product_id=int(product_id),
+                    field_name="category",
+                    source_type="ozon_category_match",
+                    source_value_raw=str(derived.get("category") or ""),
+                    source_url=existing_path,
+                    confidence=max(0.6, float(existing_conf)),
+                    is_manual=False,
+                )
             skipped += 1
             continue
 
@@ -182,12 +245,27 @@ def bulk_assign_ozon_categories(
             skipped += 1
             continue
 
+        derived = _derive_catalog_categories_from_ozon_path(str(match["full_path"] or ""))
+        desired_category = str(derived.get("category") or product.get("category") or "")
+        desired_base = str(derived.get("base_category") or "")
+        desired_sub = str(derived.get("subcategory") or "")
+        current_base = str(product.get("base_category") or "").strip()
+        current_sub = str(product.get("subcategory") or "").strip()
+        if not force:
+            if current_base:
+                desired_base = current_base
+            if current_sub:
+                desired_sub = current_sub
+
         conn.execute(
             """
             UPDATE products
             SET ozon_description_category_id = ?,
                 ozon_type_id = ?,
                 ozon_category_path = ?,
+                category = ?,
+                base_category = ?,
+                subcategory = ?,
                 ozon_category_confidence = ?,
                 updated_at = CURRENT_TIMESTAMP
             WHERE id = ?
@@ -196,6 +274,9 @@ def bulk_assign_ozon_categories(
                 int(match["description_category_id"]),
                 int(match["type_id"]),
                 str(match["full_path"] or ""),
+                desired_category,
+                desired_base,
+                desired_sub,
                 float(match["score"]),
                 int(product_id),
             ),
@@ -220,6 +301,38 @@ def bulk_assign_ozon_categories(
             confidence=float(match["score"]),
             is_manual=False,
         )
+        save_field_source(
+            conn=conn,
+            product_id=int(product_id),
+            field_name="category",
+            source_type="ozon_category_match",
+            source_value_raw=desired_category,
+            source_url=str(match["full_path"] or ""),
+            confidence=float(match["score"]),
+            is_manual=False,
+        )
+        if force or not current_base:
+            save_field_source(
+                conn=conn,
+                product_id=int(product_id),
+                field_name="base_category",
+                source_type="ozon_category_match",
+                source_value_raw=desired_base,
+                source_url=str(match["full_path"] or ""),
+                confidence=float(match["score"]),
+                is_manual=False,
+            )
+        if force or not current_sub:
+            save_field_source(
+                conn=conn,
+                product_id=int(product_id),
+                field_name="subcategory",
+                source_type="ozon_category_match",
+                source_value_raw=desired_sub,
+                source_url=str(match["full_path"] or ""),
+                confidence=float(match["score"]),
+                is_manual=False,
+            )
         assigned += 1
 
     conn.commit()

@@ -4,6 +4,7 @@ import json
 import hashlib
 from io import BytesIO
 import math
+import re
 from pathlib import Path
 import threading
 from datetime import datetime, timezone
@@ -230,20 +231,43 @@ def list_distinct_values(conn, column_name: str) -> list[str]:
 def list_catalog_categories(conn) -> list[str]:
     rows = conn.execute(
         """
-        SELECT DISTINCT TRIM(value) AS value
-        FROM (
-            SELECT category AS value FROM products
-            UNION ALL
-            SELECT base_category AS value FROM products
-            UNION ALL
-            SELECT subcategory AS value FROM products
-        )
-        WHERE value IS NOT NULL
-          AND TRIM(value) <> ''
-        ORDER BY value
+        SELECT category, base_category, subcategory, ozon_category_path
+        FROM products
         """
     ).fetchall()
-    return [str(r["value"]) for r in rows if r["value"]]
+    if not rows:
+        return []
+
+    def split_ozon_path(path: str | None) -> list[str]:
+        text = " ".join(str(path or "").strip().split())
+        if not text:
+            return []
+        chunks = [x.strip() for x in re.split(r"\s*(?:/|>|»|→|\|)\s*", text) if str(x).strip()]
+        return chunks if chunks else [text]
+
+    ozon_values: set[str] = set()
+    legacy_values: set[str] = set()
+    for row in rows:
+        category = str(row["category"] or "").strip()
+        base_category = str(row["base_category"] or "").strip()
+        subcategory = str(row["subcategory"] or "").strip()
+        ozon_path = str(row["ozon_category_path"] or "").strip()
+
+        if ozon_path:
+            parts = split_ozon_path(ozon_path)
+            ozon_values.add(ozon_path)
+            if parts:
+                ozon_values.add(parts[-1])
+            if len(parts) >= 2:
+                ozon_values.add(parts[-2])
+
+        for value in (category, base_category, subcategory):
+            if value:
+                legacy_values.add(value)
+
+    preferred = sorted([v for v in ozon_values if v], key=lambda x: x.lower())
+    legacy_only = sorted([v for v in legacy_values if v and v not in ozon_values], key=lambda x: x.lower())
+    return preferred + legacy_only
 
 
 RU_COLUMN_MAP: dict[str, str] = {
@@ -519,6 +543,7 @@ def apply_mass_product_updates(
         row = conn.execute(
             """
             SELECT id, article, supplier_article, name, category, supplier_name, supplier_url, base_category, subcategory, brand
+                 , ozon_description_category_id, ozon_type_id
             FROM products
             WHERE id = ?
             LIMIT 1
@@ -529,8 +554,11 @@ def apply_mass_product_updates(
             continue
         current = dict(row)
         row_updates: dict[str, str] = {}
+        ozon_locked = bool(int(current.get("ozon_description_category_id") or 0) > 0 and int(current.get("ozon_type_id") or 0) > 0)
         for field, value in updates.items():
             if value is None:
+                continue
+            if ozon_locked and field in {"category", "base_category", "subcategory"}:
                 continue
             if only_empty and not _is_blank_value(current.get(field)):
                 continue
@@ -581,7 +609,7 @@ def render_section_help() -> None:
 
 **Каталог**
 - `Поиск`: быстрый поиск по названию/артикулу/штрихкоду.
-- `Категория` / `Поставщик`: фильтры из базы (выпадающие меню).
+- `Категория` / `Поставщик`: фильтры из выпадающих меню; категория в приоритете берётся из Ozon-эталона.
 - `Размер страницы` / `Страница` / `◀ Назад` / `Вперед ▶`: постраничная навигация.
 - `Обновить дубли`: пересчитать дубли по текущей странице.
 - `Обогатить поставщика`: массовый парсинг supplier_url по текущей странице.
@@ -623,8 +651,16 @@ def _build_product_filters(
         params.extend([s, s, s, s])
 
     if category:
-        where.append("(LOWER(TRIM(category)) = LOWER(TRIM(?)) OR LOWER(TRIM(base_category)) = LOWER(TRIM(?)) OR LOWER(TRIM(subcategory)) = LOWER(TRIM(?)))")
-        params.extend([category, category, category])
+        where.append(
+            "("
+            "LOWER(TRIM(category)) = LOWER(TRIM(?)) "
+            "OR LOWER(TRIM(base_category)) = LOWER(TRIM(?)) "
+            "OR LOWER(TRIM(subcategory)) = LOWER(TRIM(?)) "
+            "OR LOWER(TRIM(IFNULL(ozon_category_path, ''))) = LOWER(TRIM(?)) "
+            "OR LOWER(IFNULL(ozon_category_path, '')) LIKE LOWER(?)"
+            ")"
+        )
+        params.extend([category, category, category, category, f"%{category}%"])
 
     if supplier:
         where.append("LOWER(TRIM(supplier_name)) = LOWER(TRIM(?))")
@@ -752,11 +788,23 @@ def find_products_for_card(
         s = f"%{search.strip()}%"
         params.extend([s, s, s, s])
     if category and category != "Все":
-        where.append("(LOWER(TRIM(category)) = LOWER(TRIM(?)) OR LOWER(TRIM(base_category)) = LOWER(TRIM(?)))")
-        params.extend([category, category])
+        where.append(
+            "("
+            "LOWER(TRIM(category)) = LOWER(TRIM(?)) "
+            "OR LOWER(TRIM(base_category)) = LOWER(TRIM(?)) "
+            "OR LOWER(TRIM(IFNULL(ozon_category_path, ''))) = LOWER(TRIM(?)) "
+            "OR LOWER(IFNULL(ozon_category_path, '')) LIKE LOWER(?)"
+            ")"
+        )
+        params.extend([category, category, category, f"%{category}%"])
     if subcategory and subcategory != "Все":
-        where.append("LOWER(TRIM(subcategory)) = LOWER(TRIM(?))")
-        params.append(subcategory)
+        where.append(
+            "("
+            "LOWER(TRIM(subcategory)) = LOWER(TRIM(?)) "
+            "OR LOWER(IFNULL(ozon_category_path, '')) LIKE LOWER(?)"
+            ")"
+        )
+        params.extend([subcategory, f"%{subcategory}%"])
     if supplier and supplier != "Все":
         where.append("LOWER(TRIM(supplier_name)) = LOWER(TRIM(?))")
         params.append(supplier)
@@ -764,7 +812,7 @@ def find_products_for_card(
     sql = """
         SELECT
             id, article, internal_article, supplier_article, name,
-            category, base_category, subcategory, supplier_name
+            category, base_category, subcategory, supplier_name, ozon_category_path
         FROM products
     """
     if where:
@@ -1618,7 +1666,7 @@ def show_catalog_tab():
     conn = get_db()
     st.subheader("Каталог")
     st.caption("Здесь быстрый контроль по каталогу: поиск, последняя загрузка, статус supplier enrichment и переход в карточку товара.")
-    st.info("Фильтры `Категория` и `Поставщик` берутся из базы и выбираются только из выпадающих списков.")
+    st.info("Фильтр `Категория` учитывает Ozon-эталон в приоритете (ozon_category_path), затем категории из каталога.")
     with st.expander("Инструкция по кнопкам раздела Каталог", expanded=False):
         st.markdown(
             """
@@ -2166,6 +2214,7 @@ def enrich_product_from_supplier(
 
         updates = {}
         skipped_manual_fields = []
+        has_ozon_priority = bool(int(product.get("ozon_description_category_id") or 0) > 0 and int(product.get("ozon_type_id") or 0) > 0)
         fields = [
             "name",
             "brand",
@@ -2188,6 +2237,9 @@ def enrich_product_from_supplier(
             new_value = parsed.get(field)
             old_value = product[field] if field in product.keys() else None
             if new_value is None:
+                continue
+            if has_ozon_priority and field in {"category", "base_category", "subcategory"} and not force:
+                skipped_manual_fields.append(f"{field}:ozon_priority")
                 continue
             if field == "category" and str(new_value).strip().lower() in weak_categories and not force:
                 continue
@@ -2419,7 +2471,7 @@ def show_product_tab():
         format_func=lambda x: next(
             (
                 f"ID {int(row['id'])} | {str(row.get('article') or row.get('supplier_article') or '-')} | "
-                f"{str(row.get('name') or '-')} | {str(row.get('category') or row.get('base_category') or '-')} / "
+                f"{str(row.get('name') or '-')} | {str(row.get('ozon_category_path') or row.get('category') or row.get('base_category') or '-')} / "
                 f"{str(row.get('subcategory') or '-')} | {str(row.get('supplier_name') or '-')}"
                 for row in filtered_products
                 if int(row["id"]) == int(x)
@@ -2512,7 +2564,7 @@ def show_product_tab():
     top1, top2, top3, top4 = st.columns(4)
     top1.metric("Артикул", product["article"] or "-")
     top2.metric("Бренд", product["brand"] or "-")
-    top3.metric("Категория", product["base_category"] or product["category"] or "-")
+    top3.metric("Категория", product["ozon_category_path"] or product["base_category"] or product["category"] or "-")
     top4.metric("Поставщик", product["supplier_name"] or "-")
 
     ctop1, ctop2 = st.columns([1, 1])
@@ -2839,17 +2891,17 @@ def show_product_tab():
             category_options = [""] + sorted(set(category_values + ([str(product["category"])] if product["category"] else [])))
             category_default = str(product["category"] or "")
             category_idx = category_options.index(category_default) if category_default in category_options else 0
-            category = st.selectbox("Категория (из базы)", options=category_options, index=category_idx)
+            category = st.selectbox("Категория (приоритет Ozon)", options=category_options, index=category_idx)
 
             base_options = [""] + sorted(set(category_values + ([str(product["base_category"])] if product["base_category"] else [])))
             base_default = str(product["base_category"] or "")
             base_idx = base_options.index(base_default) if base_default in base_options else 0
-            base_category = st.selectbox("Базовая категория (из базы)", options=base_options, index=base_idx)
+            base_category = st.selectbox("Базовая категория (приоритет Ozon)", options=base_options, index=base_idx)
 
             sub_options = [""] + sorted(set(category_values + ([str(product["subcategory"])] if product["subcategory"] else [])))
             sub_default = str(product["subcategory"] or "")
             sub_idx = sub_options.index(sub_default) if sub_default in sub_options else 0
-            subcategory = st.selectbox("Подкатегория (из базы)", options=sub_options, index=sub_idx)
+            subcategory = st.selectbox("Подкатегория (приоритет Ozon)", options=sub_options, index=sub_idx)
             wheel_diameter_inch = st.number_input(
                 "Диаметр колеса, inch",
                 value=float(product["wheel_diameter_inch"] or 0.0),
@@ -3232,7 +3284,7 @@ def show_template_tab():
     with t2:
         known_categories = [""] + list_catalog_categories(conn)
         category_code = st.selectbox(
-            "Категория шаблона/профиля (из базы)",
+            "Категория шаблона/профиля (приоритет Ozon)",
             options=known_categories,
             index=0,
             key="template_category_select",
