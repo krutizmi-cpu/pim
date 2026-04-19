@@ -141,6 +141,97 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+PARSER_SETTINGS_DEFAULTS: dict[str, object] = {
+    "timeout_seconds": 8.0,
+    "max_hops": 1,
+    "fallback_max_results": 4,
+    "enable_web_fallback": True,
+    "enable_ozon_fallback": True,
+    "enable_yandex_fallback": True,
+    "enable_stats_fallback": True,
+    "enable_defaults_fallback": True,
+}
+
+
+def _ensure_system_settings_table(conn) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS system_settings (
+            key TEXT PRIMARY KEY,
+            value TEXT,
+            updated_at TEXT
+        )
+        """
+    )
+    conn.commit()
+
+
+def _get_system_setting(conn, key: str, default: object = None) -> object:
+    _ensure_system_settings_table(conn)
+    row = conn.execute("SELECT value FROM system_settings WHERE key = ? LIMIT 1", (str(key),)).fetchone()
+    if not row:
+        return default
+    return row["value"]
+
+
+def _set_system_setting(conn, key: str, value: object) -> None:
+    _ensure_system_settings_table(conn)
+    conn.execute(
+        """
+        INSERT INTO system_settings (key, value, updated_at)
+        VALUES (?, ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(key) DO UPDATE SET
+            value = excluded.value,
+            updated_at = CURRENT_TIMESTAMP
+        """,
+        (str(key), str(value) if value is not None else None),
+    )
+    conn.commit()
+
+
+def _to_bool_setting(value: object, default: bool) -> bool:
+    if value is None:
+        return bool(default)
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "on"}:
+        return True
+    if text in {"0", "false", "no", "off"}:
+        return False
+    return bool(default)
+
+
+def load_parser_settings(conn) -> dict[str, object]:
+    _ensure_system_settings_table(conn)
+    timeout_raw = _get_system_setting(conn, "parser.timeout_seconds", PARSER_SETTINGS_DEFAULTS["timeout_seconds"])
+    max_hops_raw = _get_system_setting(conn, "parser.max_hops", PARSER_SETTINGS_DEFAULTS["max_hops"])
+    max_results_raw = _get_system_setting(conn, "parser.fallback_max_results", PARSER_SETTINGS_DEFAULTS["fallback_max_results"])
+    settings = {
+        "timeout_seconds": float(timeout_raw) if str(timeout_raw).strip() not in {"", "None"} else float(PARSER_SETTINGS_DEFAULTS["timeout_seconds"]),
+        "max_hops": int(float(max_hops_raw)) if str(max_hops_raw).strip() not in {"", "None"} else int(PARSER_SETTINGS_DEFAULTS["max_hops"]),
+        "fallback_max_results": int(float(max_results_raw)) if str(max_results_raw).strip() not in {"", "None"} else int(PARSER_SETTINGS_DEFAULTS["fallback_max_results"]),
+        "enable_web_fallback": _to_bool_setting(_get_system_setting(conn, "parser.enable_web_fallback", PARSER_SETTINGS_DEFAULTS["enable_web_fallback"]), bool(PARSER_SETTINGS_DEFAULTS["enable_web_fallback"])),
+        "enable_ozon_fallback": _to_bool_setting(_get_system_setting(conn, "parser.enable_ozon_fallback", PARSER_SETTINGS_DEFAULTS["enable_ozon_fallback"]), bool(PARSER_SETTINGS_DEFAULTS["enable_ozon_fallback"])),
+        "enable_yandex_fallback": _to_bool_setting(_get_system_setting(conn, "parser.enable_yandex_fallback", PARSER_SETTINGS_DEFAULTS["enable_yandex_fallback"]), bool(PARSER_SETTINGS_DEFAULTS["enable_yandex_fallback"])),
+        "enable_stats_fallback": _to_bool_setting(_get_system_setting(conn, "parser.enable_stats_fallback", PARSER_SETTINGS_DEFAULTS["enable_stats_fallback"]), bool(PARSER_SETTINGS_DEFAULTS["enable_stats_fallback"])),
+        "enable_defaults_fallback": _to_bool_setting(_get_system_setting(conn, "parser.enable_defaults_fallback", PARSER_SETTINGS_DEFAULTS["enable_defaults_fallback"]), bool(PARSER_SETTINGS_DEFAULTS["enable_defaults_fallback"])),
+    }
+    settings["timeout_seconds"] = max(2.0, min(30.0, float(settings["timeout_seconds"])))
+    settings["max_hops"] = max(1, min(3, int(settings["max_hops"])))
+    settings["fallback_max_results"] = max(1, min(12, int(settings["fallback_max_results"])))
+    return settings
+
+
+def save_parser_settings(conn, settings: dict[str, object]) -> None:
+    _set_system_setting(conn, "parser.timeout_seconds", float(settings.get("timeout_seconds", PARSER_SETTINGS_DEFAULTS["timeout_seconds"])))
+    _set_system_setting(conn, "parser.max_hops", int(settings.get("max_hops", PARSER_SETTINGS_DEFAULTS["max_hops"])))
+    _set_system_setting(conn, "parser.fallback_max_results", int(settings.get("fallback_max_results", PARSER_SETTINGS_DEFAULTS["fallback_max_results"])))
+    _set_system_setting(conn, "parser.enable_web_fallback", 1 if bool(settings.get("enable_web_fallback", True)) else 0)
+    _set_system_setting(conn, "parser.enable_ozon_fallback", 1 if bool(settings.get("enable_ozon_fallback", True)) else 0)
+    _set_system_setting(conn, "parser.enable_yandex_fallback", 1 if bool(settings.get("enable_yandex_fallback", True)) else 0)
+    _set_system_setting(conn, "parser.enable_stats_fallback", 1 if bool(settings.get("enable_stats_fallback", True)) else 0)
+    _set_system_setting(conn, "parser.enable_defaults_fallback", 1 if bool(settings.get("enable_defaults_fallback", True)) else 0)
+
+
 def _set_ozon_bg_state(**kwargs) -> None:
     with _OZON_SYNC_BG_LOCK:
         _OZON_SYNC_BG_STATE.update(kwargs)
@@ -1769,6 +1860,7 @@ def show_import_tab():
 
 def show_catalog_tab():
     conn = get_db()
+    parser_settings = load_parser_settings(conn)
     st.subheader("Каталог")
     st.caption("Здесь быстрый контроль по каталогу: поиск, последняя загрузка, статус supplier enrichment и переход в карточку товара.")
     st.info("Фильтр `Категория` учитывает Ozon-эталон в приоритете (ozon_category_path), затем категории из каталога.")
@@ -1784,6 +1876,81 @@ def show_catalog_tab():
 - `Перепривязать Ozon категории (force)`: автоподбор с перезаписью.
             """
         )
+    with st.expander("Настройки парсинга и автообогащения", expanded=False):
+        st.caption("Пайплайн: supplier_url карточка -> Ozon fallback -> Яндекс.Маркет fallback -> web fallback -> category stats/defaults.")
+        p1, p2, p3 = st.columns(3)
+        with p1:
+            ps_timeout = st.number_input(
+                "Таймаут запроса, сек",
+                min_value=2,
+                max_value=30,
+                value=float(parser_settings.get("timeout_seconds", 8.0)),
+                step=1.0,
+                key="parser_cfg_timeout_seconds",
+            )
+            ps_max_hops = st.number_input(
+                "Переходов с листинга в карточку",
+                min_value=1,
+                max_value=3,
+                value=int(parser_settings.get("max_hops", 1)),
+                step=1,
+                key="parser_cfg_max_hops",
+            )
+            ps_max_results = st.number_input(
+                "Лимит кандидатов fallback",
+                min_value=1,
+                max_value=12,
+                value=int(parser_settings.get("fallback_max_results", 4)),
+                step=1,
+                key="parser_cfg_max_results",
+            )
+        with p2:
+            ps_web = st.checkbox(
+                "Включить web fallback",
+                value=bool(parser_settings.get("enable_web_fallback", True)),
+                key="parser_cfg_enable_web_fallback",
+            )
+            ps_ozon = st.checkbox(
+                "Пробовать Ozon (ozon.ru)",
+                value=bool(parser_settings.get("enable_ozon_fallback", True)),
+                key="parser_cfg_enable_ozon_fallback",
+            )
+            ps_yandex = st.checkbox(
+                "Пробовать Яндекс Маркет",
+                value=bool(parser_settings.get("enable_yandex_fallback", True)),
+                key="parser_cfg_enable_yandex_fallback",
+            )
+        with p3:
+            ps_stats = st.checkbox(
+                "Fallback габаритов из каталога",
+                value=bool(parser_settings.get("enable_stats_fallback", True)),
+                key="parser_cfg_enable_stats_fallback",
+            )
+            ps_defaults = st.checkbox(
+                "Fallback габаритов из defaults",
+                value=bool(parser_settings.get("enable_defaults_fallback", True)),
+                key="parser_cfg_enable_defaults_fallback",
+            )
+            ps_include_without_url = st.checkbox(
+                "Обогащать товары без supplier_url",
+                value=bool(st.session_state.get("catalog_enrich_include_without_url", True)),
+                key="catalog_enrich_include_without_url",
+                help="Если включено, товары без URL поставщика тоже пойдут в fallback-поиск.",
+            )
+        if st.button("Сохранить настройки парсинга", key="parser_cfg_save_button", type="primary"):
+            new_settings = {
+                "timeout_seconds": float(ps_timeout),
+                "max_hops": int(ps_max_hops),
+                "fallback_max_results": int(ps_max_results),
+                "enable_web_fallback": bool(ps_web),
+                "enable_ozon_fallback": bool(ps_ozon),
+                "enable_yandex_fallback": bool(ps_yandex),
+                "enable_stats_fallback": bool(ps_stats),
+                "enable_defaults_fallback": bool(ps_defaults),
+            }
+            save_parser_settings(conn, new_settings)
+            st.success("Настройки парсинга сохранены.")
+            st.rerun()
 
     category_values = list_catalog_categories(conn)
     supplier_values = list_distinct_values(conn, "supplier_name")
@@ -1879,6 +2046,22 @@ def show_catalog_tab():
         limit=None,
         offset=0,
     )
+    all_filtered_candidate_ids = load_product_ids(
+        conn,
+        search=search,
+        category=category,
+        supplier=supplier,
+        import_batch_id=batch_id or "",
+        parse_filter=parse_filter,
+        limit=None,
+        offset=0,
+    )
+    include_without_url = bool(st.session_state.get("catalog_enrich_include_without_url", True))
+    effective_filtered_candidate_ids = (
+        [int(x) for x in all_filtered_candidate_ids]
+        if include_without_url
+        else [int(x) for x in filtered_supplier_candidate_ids]
+    )
     bc1, bc2, bc3 = st.columns(3)
     with bc1:
         max_bulk_enrich_page = st.number_input(
@@ -1905,7 +2088,7 @@ def show_catalog_tab():
             "Таймаут supplier_url, сек",
             min_value=2,
             max_value=30,
-            value=8,
+            value=int(float(parser_settings.get("timeout_seconds", 8.0))),
             step=1,
             help="Максимальное время ожидания ответа от сайта поставщика для одного товара.",
             key="catalog_supplier_timeout_seconds",
@@ -1918,12 +2101,13 @@ def show_catalog_tab():
     )
     st.caption(
         f"Кандидатов: страница {len(supplier_candidate_ids)}, вся выборка {len(filtered_supplier_candidate_ids)}. "
+        f"включая без supplier_url: {len(all_filtered_candidate_ids)}. "
         f"Лимиты: страница {int(max_bulk_enrich_page)}, выборка {int(max_bulk_enrich_filtered)}."
     )
 
     def run_supplier_enrichment_batch(candidate_ids: list[int], run_limit: int, run_label: str) -> None:
         if not candidate_ids:
-            st.info(f"Для режима `{run_label}` нет товаров с supplier_url.")
+            st.info(f"Для режима `{run_label}` нет товаров для обогащения.")
             return
         target_ids = candidate_ids[: int(run_limit)]
         progress = st.progress(0)
@@ -1941,6 +2125,7 @@ def show_catalog_tab():
                     int(pid),
                     force=bool(enrich_force),
                     timeout_seconds=float(supplier_timeout_seconds),
+                    parser_settings=parser_settings,
                 )
                 if result.get("ok"):
                     success += 1
@@ -1978,9 +2163,9 @@ def show_catalog_tab():
                 run_label="Текущая страница",
             )
     with b3:
-        if st.button("Обогатить поставщика по всей выборке фильтра", help="Запустить supplier parsing для всех товаров текущих фильтров, где заполнен supplier_url"):
+        if st.button("Обогатить поставщика по всей выборке фильтра", help="Запустить supplier parsing для всей выборки фильтров. При включенной опции обработаются и товары без supplier_url через fallback-поиск."):
             run_supplier_enrichment_batch(
-                candidate_ids=filtered_supplier_candidate_ids,
+                candidate_ids=effective_filtered_candidate_ids,
                 run_limit=int(max_bulk_enrich_filtered),
                 run_label="Вся выборка фильтра",
             )
@@ -2128,12 +2313,23 @@ def enrich_product_from_supplier(
     conn,
     product_id: int,
     force: bool = False,
-    timeout_seconds: float = 8.0,
+    timeout_seconds: float | None = None,
+    parser_settings: dict[str, object] | None = None,
 ) -> dict:
     product = get_product(conn, product_id)
     if not product:
         return {"ok": False, "message": "Товар не найден"}
     product_row = dict(product)
+    settings = dict(parser_settings or load_parser_settings(conn))
+    effective_timeout = float(timeout_seconds if timeout_seconds is not None else settings.get("timeout_seconds", 8.0))
+    effective_timeout = max(2.0, min(30.0, float(effective_timeout)))
+    max_hops = max(1, min(3, int(settings.get("max_hops", 1))))
+    fallback_max_results = max(1, min(12, int(settings.get("fallback_max_results", 4))))
+    enable_web_fallback = bool(settings.get("enable_web_fallback", True))
+    enable_ozon_fallback = bool(settings.get("enable_ozon_fallback", True))
+    enable_yandex_fallback = bool(settings.get("enable_yandex_fallback", True))
+    enable_stats_fallback = bool(settings.get("enable_stats_fallback", True))
+    enable_defaults_fallback = bool(settings.get("enable_defaults_fallback", True))
 
     supplier_url = (product["supplier_url"] or "").strip() if product["supplier_url"] else ""
 
@@ -2164,8 +2360,8 @@ def enrich_product_from_supplier(
                 parsed = parse_supplier_product_page(
                     effective_supplier_url,
                     hints=parse_hints,
-                    timeout=float(timeout_seconds),
-                    max_hops=1,
+                    timeout=float(effective_timeout),
+                    max_hops=max_hops,
                 )
                 source_url = parsed.get("resolved_url") or effective_supplier_url
             except Exception as parse_error:
@@ -2187,7 +2383,7 @@ def enrich_product_from_supplier(
         has_dims = any(parsed.get(k) not in (None, "", 0, 0.0) for k in dim_fields)
         need_fallback = (not has_meaningful_supplier_data(parsed)) or bool(parsed.get("listing_only")) or (not has_dims) or is_dimension_payload_suspicious(parsed) or (not supplier_url)
 
-        if need_fallback:
+        if need_fallback and enable_web_fallback:
             preferred_domain = ""
             try:
                 preferred_domain = (urlparse(str(source_url or supplier_url)).netloc or "").lower().replace("www.", "")
@@ -2201,13 +2397,40 @@ def enrich_product_from_supplier(
                 "габариты",
             ]
             fallback_query = " ".join([p for p in fallback_query_parts if p])
-            fallback = fallback_search_product_data(
-                fallback_query,
-                timeout=float(timeout_seconds),
-                max_results=4,
-                hints=parse_hints,
-                preferred_domain=preferred_domain or None,
-            )
+            fallback = {}
+            fallback_stage = "generic_web"
+            if enable_ozon_fallback:
+                fallback = fallback_search_product_data(
+                    fallback_query,
+                    timeout=float(effective_timeout),
+                    max_results=int(fallback_max_results),
+                    hints=parse_hints,
+                    preferred_domain="ozon.ru",
+                )
+                if fallback:
+                    fallback_stage = "ozon_search_fallback"
+
+            if (not fallback) and enable_yandex_fallback:
+                fallback = fallback_search_product_data(
+                    fallback_query,
+                    timeout=float(effective_timeout),
+                    max_results=int(fallback_max_results),
+                    hints=parse_hints,
+                    preferred_domain="market.yandex.ru",
+                )
+                if fallback:
+                    fallback_stage = "yandex_search_fallback"
+
+            if not fallback:
+                fallback = fallback_search_product_data(
+                    fallback_query,
+                    timeout=float(effective_timeout),
+                    max_results=int(fallback_max_results),
+                    hints=parse_hints,
+                    preferred_domain=preferred_domain or None,
+                )
+                if fallback:
+                    fallback_stage = "web_search_fallback"
             if fallback and has_meaningful_supplier_data(fallback):
                 for key in [
                     "name", "brand", "category", "description", "image_url", "weight", "gross_weight",
@@ -2223,7 +2446,7 @@ def enrich_product_from_supplier(
                 if not parsed.get("image_urls"):
                     parsed["image_urls"] = fallback.get("image_urls") or []
                 source_url = fallback.get("fallback_url") or source_url
-                source_type = "web_search_fallback"
+                source_type = str(fallback_stage)
                 used_fallback = True
                 for key in [
                     "name",
@@ -2241,7 +2464,7 @@ def enrich_product_from_supplier(
                     "package_height",
                 ]:
                     if fallback.get(key) not in (None, "", 0, 0.0):
-                        field_source_types[key] = "web_search_fallback"
+                        field_source_types[key] = str(fallback_stage)
             elif not supplier_url:
                 source_type = "web_search_fallback"
                 source_url = source_url or ""
@@ -2276,14 +2499,15 @@ def enrich_product_from_supplier(
 
         has_dims_after_web = any(parsed.get(k) not in (None, "", 0, 0.0) for k in dim_fields)
         if (not has_dims_after_web) or is_dimension_payload_suspicious(parsed):
-            stats_fallback = infer_dimensions_from_catalog(conn, product_row, min_samples=4)
-            if stats_fallback.get("found"):
-                for key, value in (stats_fallback.get("values") or {}).items():
-                    if parsed.get(key) in (None, "", 0, 0.0):
-                        parsed[key] = value
-                        field_source_types[key] = "category_stats_fallback"
-                used_stats_fallback = True
-            else:
+            if enable_stats_fallback:
+                stats_fallback = infer_dimensions_from_catalog(conn, product_row, min_samples=4)
+                if stats_fallback.get("found"):
+                    for key, value in (stats_fallback.get("values") or {}).items():
+                        if parsed.get(key) in (None, "", 0, 0.0):
+                            parsed[key] = value
+                            field_source_types[key] = "category_stats_fallback"
+                    used_stats_fallback = True
+            if ((not used_stats_fallback) or is_dimension_payload_suspicious(parsed)) and enable_defaults_fallback:
                 defaults_fallback = infer_dimensions_from_category_defaults(
                     conn,
                     {
@@ -2517,6 +2741,7 @@ def enrich_product_from_supplier(
 
 def show_product_tab():
     conn = get_db()
+    parser_settings = load_parser_settings(conn)
     st.subheader("Поиск и выбор товара для редактирования")
     st.caption("Сначала выбери товар через фильтры, затем откроется его карточка для заполнения и обогащения.")
     with st.container(border=True):
@@ -2605,6 +2830,23 @@ def show_product_tab():
         return
 
     st.subheader(f"Карточка товара #{product['id']}")
+    with st.expander("Текущие настройки парсинга", expanded=False):
+        st.caption(
+            "Порядок fallback: supplier_url -> Ozon -> Яндекс Маркет -> web -> category stats/defaults. "
+            "Изменить настройки можно во вкладке Каталог."
+        )
+        st.write(
+            {
+                "timeout_seconds": parser_settings.get("timeout_seconds"),
+                "max_hops": parser_settings.get("max_hops"),
+                "fallback_max_results": parser_settings.get("fallback_max_results"),
+                "enable_web_fallback": parser_settings.get("enable_web_fallback"),
+                "enable_ozon_fallback": parser_settings.get("enable_ozon_fallback"),
+                "enable_yandex_fallback": parser_settings.get("enable_yandex_fallback"),
+                "enable_stats_fallback": parser_settings.get("enable_stats_fallback"),
+                "enable_defaults_fallback": parser_settings.get("enable_defaults_fallback"),
+            }
+        )
     with st.expander("Инструкция по кнопкам раздела Карточка", expanded=False):
         st.markdown(
             """
@@ -2685,7 +2927,7 @@ def show_product_tab():
     ctop1, ctop2 = st.columns([1, 1])
     with ctop1:
         if st.button("Спарсить поставщика", type="primary", help="Обогатить карточку с сайта поставщика без жесткой перезаписи ручных значений"):
-            result = enrich_product_from_supplier(conn, int(product_id), force=False)
+            result = enrich_product_from_supplier(conn, int(product_id), force=False, parser_settings=parser_settings)
             if result["ok"]:
                 st.success(result["message"])
                 if result.get("updates"):
@@ -2695,7 +2937,7 @@ def show_product_tab():
                 st.error(result["message"])
     with ctop2:
         if st.button("Перезаполнить из поставщика", help="Жесткая перезапись значений из supplier page (force-режим)"):
-            result = enrich_product_from_supplier(conn, int(product_id), force=True)
+            result = enrich_product_from_supplier(conn, int(product_id), force=True, parser_settings=parser_settings)
             if result["ok"]:
                 st.success(result["message"])
                 if result.get("updates"):

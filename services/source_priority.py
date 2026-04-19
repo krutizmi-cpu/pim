@@ -9,7 +9,13 @@ SOURCE_PRIORITY = {
     "manual": 100,
     "client_validated": 90,
     "supplier_page": 70,
+    "ozon_search_fallback": 62,
+    "yandex_search_fallback": 60,
+    "web_search_fallback": 58,
     "ai": 50,
+    "name_category_inference": 40,
+    "category_stats_fallback": 35,
+    "category_defaults_fallback": 30,
     "default": 10,
 }
 

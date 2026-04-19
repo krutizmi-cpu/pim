@@ -149,10 +149,13 @@ def _is_listing_like_url(url: str) -> bool:
     return bool(re.search(r"(category=|/catalog/?$|/search|[?&]q=|[?&]s=|/catalog/\?|/search\?)", low))
 
 
-def _is_blocked_search_domain(url: str) -> bool:
+def _is_blocked_search_domain(url: str, preferred_domain: str | None = None) -> bool:
     host = (urlparse(url).netloc or "").lower()
     if not host:
         return True
+    pref = str(preferred_domain or "").lower().replace("www.", "").strip()
+    if pref and pref in host.replace("www.", ""):
+        return False
     return any(d in host for d in SEARCH_BLOCKED_DOMAINS)
 
 
@@ -884,7 +887,7 @@ def parse_supplier_product_page(
     return parsed
 
 
-def _search_duckduckgo_links(query: str, timeout: float, max_links: int) -> list[str]:
+def _search_duckduckgo_links(query: str, timeout: float, max_links: int, preferred_domain: str | None = None) -> list[str]:
     links: list[str] = []
     try:
         search_url = f"https://duckduckgo.com/html/?q={quote_plus(query)}"
@@ -894,7 +897,7 @@ def _search_duckduckgo_links(query: str, timeout: float, max_links: int) -> list
             normalized = _normalize_result_url(str(a.get("href") or ""))
             if not normalized:
                 continue
-            if _is_blocked_search_domain(normalized):
+            if _is_blocked_search_domain(normalized, preferred_domain=preferred_domain):
                 continue
             links.append(normalized)
             if len(links) >= max_links:
@@ -904,7 +907,7 @@ def _search_duckduckgo_links(query: str, timeout: float, max_links: int) -> list
     return links
 
 
-def _search_bing_links(query: str, timeout: float, max_links: int) -> list[str]:
+def _search_bing_links(query: str, timeout: float, max_links: int, preferred_domain: str | None = None) -> list[str]:
     links: list[str] = []
     try:
         search_url = f"https://www.bing.com/search?q={quote_plus(query)}"
@@ -914,7 +917,7 @@ def _search_bing_links(query: str, timeout: float, max_links: int) -> list[str]:
             href = _normalize_result_url(str(a.get("href") or ""))
             if not href:
                 continue
-            if _is_blocked_search_domain(href):
+            if _is_blocked_search_domain(href, preferred_domain=preferred_domain):
                 continue
             links.append(href)
             if len(links) >= max_links:
@@ -976,8 +979,22 @@ def fallback_search_product_data(
 
     for q in query_variants:
         candidate_links: list[str] = []
-        candidate_links.extend(_search_duckduckgo_links(q, timeout=timeout, max_links=max(6, int(max_results) * 3)))
-        candidate_links.extend(_search_bing_links(q, timeout=timeout, max_links=max(6, int(max_results) * 3)))
+        candidate_links.extend(
+            _search_duckduckgo_links(
+                q,
+                timeout=timeout,
+                max_links=max(6, int(max_results) * 3),
+                preferred_domain=preferred_domain,
+            )
+        )
+        candidate_links.extend(
+            _search_bing_links(
+                q,
+                timeout=timeout,
+                max_links=max(6, int(max_results) * 3),
+                preferred_domain=preferred_domain,
+            )
+        )
         for link in candidate_links:
             if link in seen_links:
                 continue
