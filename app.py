@@ -1978,6 +1978,21 @@ def show_catalog_tab():
         )
     with st.expander("Настройки парсинга и автообогащения", expanded=False):
         st.caption("Пайплайн: supplier_url карточка -> Ozon fallback -> Яндекс.Маркет fallback -> web fallback -> category stats/defaults.")
+        # Защита от mixed numeric types на старых сессиях Streamlit:
+        # если в session_state остался int/str от прошлой версии виджета, приводим типы заранее.
+        def _coerce_state_number(key: str, default_value: object, caster):
+            if key in st.session_state:
+                try:
+                    st.session_state[key] = caster(st.session_state.get(key))
+                except Exception:
+                    st.session_state[key] = caster(default_value)
+
+        _coerce_state_number("parser_cfg_timeout_seconds", parser_settings.get("timeout_seconds", 8.0), float)
+        _coerce_state_number("parser_cfg_min_fallback_score", parser_settings.get("min_fallback_score", 3.0), float)
+        _coerce_state_number("parser_cfg_max_hops", parser_settings.get("max_hops", 1), int)
+        _coerce_state_number("parser_cfg_max_results", parser_settings.get("fallback_max_results", 4), int)
+        _coerce_state_number("parser_cfg_min_name_overlap", parser_settings.get("min_name_overlap", 2), int)
+
         p1, p2, p3 = st.columns(3)
         with p1:
             ps_timeout = st.number_input(
