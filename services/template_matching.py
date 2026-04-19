@@ -235,9 +235,11 @@ def apply_saved_mapping_rules(conn, matches: list[dict], channel_code: str, cate
 
 
 def build_product_value_map(conn, product_id: int) -> dict[str, object]:
-    product = conn.execute("SELECT * FROM products WHERE id = ?", (int(product_id),)).fetchone()
-    if not product:
+    product_row = conn.execute("SELECT * FROM products WHERE id = ?", (int(product_id),)).fetchone()
+    if not product_row:
         return {}
+    # sqlite3.Row doesn't support .get(); normalize once to a plain dict.
+    product = dict(product_row)
 
     value_map = dict(product)
 
