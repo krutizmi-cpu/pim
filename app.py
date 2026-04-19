@@ -7,7 +7,7 @@ import math
 from pathlib import Path
 import threading
 from datetime import datetime, timezone
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 import pandas as pd
 import sqlite3
@@ -65,9 +65,21 @@ def has_meaningful_supplier_data(parsed: dict) -> bool:
     return bool(attrs)
 
 
-def fallback_search_product_data(query: str, timeout: float = 8.0, max_results: int = 3) -> dict:
+def fallback_search_product_data(
+    query: str,
+    timeout: float = 8.0,
+    max_results: int = 3,
+    hints: list[str] | None = None,
+    preferred_domain: str | None = None,
+) -> dict:
     if _supplier_parser is not None and hasattr(_supplier_parser, "fallback_search_product_data"):
-        return _supplier_parser.fallback_search_product_data(query, timeout=timeout, max_results=max_results)
+        return _supplier_parser.fallback_search_product_data(
+            query,
+            timeout=timeout,
+            max_results=max_results,
+            hints=hints,
+            preferred_domain=preferred_domain,
+        )
     return {}
 from services.template_matching import auto_match_template_columns, apply_saved_mapping_rules, fill_template_dataframe, apply_client_validated_values, fill_template_workbook_bytes, dataframe_to_excel_bytes, detect_template_data_start_row, sanitize_template_xlsx_bytes
 from services.template_profiles import save_template_profile, list_template_profiles, get_template_profile_columns
@@ -2023,6 +2035,11 @@ def enrich_product_from_supplier(
         need_fallback = (not has_meaningful_supplier_data(parsed)) or bool(parsed.get("listing_only")) or (not has_dims) or is_dimension_payload_suspicious(parsed) or (not supplier_url)
 
         if need_fallback:
+            preferred_domain = ""
+            try:
+                preferred_domain = (urlparse(str(source_url or supplier_url)).netloc or "").lower().replace("www.", "")
+            except Exception:
+                preferred_domain = ""
             fallback_query_parts = [
                 str(product["name"] or "").strip(),
                 str(product["article"] or "").strip(),
@@ -2031,7 +2048,13 @@ def enrich_product_from_supplier(
                 "габариты",
             ]
             fallback_query = " ".join([p for p in fallback_query_parts if p])
-            fallback = fallback_search_product_data(fallback_query, timeout=float(timeout_seconds), max_results=3)
+            fallback = fallback_search_product_data(
+                fallback_query,
+                timeout=float(timeout_seconds),
+                max_results=4,
+                hints=parse_hints,
+                preferred_domain=preferred_domain or None,
+            )
             if fallback and has_meaningful_supplier_data(fallback):
                 for key in [
                     "name", "brand", "category", "description", "image_url", "weight", "gross_weight",

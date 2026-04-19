@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import re
 from typing import Any
-from urllib.parse import quote_plus, urljoin, urlparse
+from urllib.parse import parse_qs, quote_plus, unquote, urljoin, urlparse
 
 import httpx
 from bs4 import BeautifulSoup
@@ -30,6 +30,33 @@ GENERIC_CATEGORY_WORDS = {
     "catalog",
     "shop",
 }
+
+GENERIC_PRODUCT_PAGE_WORDS = {
+    "каталог",
+    "товары",
+    "продукция",
+    "поиск",
+    "главная",
+    "новинки",
+    "catalog",
+    "products",
+    "search",
+    "shop",
+}
+
+SEARCH_BLOCKED_DOMAINS = (
+    "duckduckgo.com",
+    "bing.com",
+    "google.",
+    "yandex.",
+    "youtube.com",
+    "facebook.com",
+    "instagram.com",
+    "tiktok.com",
+    "vk.com",
+    "ok.ru",
+    "wikipedia.org",
+)
 
 DIMENSION_PATTERNS = {
     "weight": [r"вес[^\d]{0,20}(\d+[\.,]?\d*)\s*(кг|г)", r"weight[^\d]{0,20}(\d+[\.,]?\d*)\s*(kg|g)"],
@@ -79,6 +106,157 @@ def _convert_weight(value: float | None, unit: str | None) -> float | None:
 def _clean_text(value: Any) -> str:
     return " ".join(str(value or "").strip().split())
 
+
+def _compact_text(value: str | None) -> str:
+    return re.sub(r"[\s\-_]+", "", _clean_text(value).lower())
+
+
+def _is_probably_product_code(token: str) -> bool:
+    token = str(token or "").strip().lower()
+    if len(token) < 4:
+        return False
+    has_digit = any(ch.isdigit() for ch in token)
+    has_alpha = any(ch.isalpha() for ch in token)
+    return has_digit and has_alpha
+
+
+def _build_hint_tokens(hints: list[str] | None) -> tuple[list[str], list[str]]:
+    strong_phrases: list[str] = []
+    tokens: list[str] = []
+    seen_tokens: set[str] = set()
+    seen_phrases: set[str] = set()
+    for raw in hints or []:
+        clean = _clean_text(raw).lower()
+        if not clean:
+            continue
+        compact = _compact_text(clean)
+        if len(compact) >= 4 and _is_probably_product_code(compact) and compact not in seen_phrases:
+            seen_phrases.add(compact)
+            strong_phrases.append(compact)
+        for tok in re.findall(r"[a-zA-Zа-яА-Я0-9]+", clean):
+            low = tok.lower()
+            if len(low) < 3:
+                continue
+            if low in seen_tokens:
+                continue
+            seen_tokens.add(low)
+            tokens.append(low)
+    return strong_phrases, tokens
+
+
+def _is_listing_like_url(url: str) -> bool:
+    low = str(url or "").lower()
+    return bool(re.search(r"(category=|/catalog/?$|/search|[?&]q=|[?&]s=|/catalog/\?|/search\?)", low))
+
+
+def _is_blocked_search_domain(url: str) -> bool:
+    host = (urlparse(url).netloc or "").lower()
+    if not host:
+        return True
+    return any(d in host for d in SEARCH_BLOCKED_DOMAINS)
+
+
+def _normalize_result_url(href: str) -> str | None:
+    candidate = _clean_text(href)
+    if not candidate:
+        return None
+    if candidate.startswith("//"):
+        candidate = "https:" + candidate
+    if candidate.startswith("/"):
+        candidate = urljoin("https://duckduckgo.com", candidate)
+    if not candidate.lower().startswith(("http://", "https://")):
+        return None
+    parsed = urlparse(candidate)
+    if "duckduckgo.com" in parsed.netloc:
+        qs = parse_qs(parsed.query or "")
+        if "uddg" in qs and qs["uddg"]:
+            target = unquote(str(qs["uddg"][0]))
+            if target.lower().startswith(("http://", "https://")):
+                candidate = target
+    return candidate
+
+
+def _extract_article_like_value(parsed: dict[str, Any]) -> str:
+    attrs = parsed.get("attributes") or {}
+    for key, value in attrs.items():
+        key_l = _clean_text(key).lower()
+        if key_l in ("артикул", "код товара", "sku", "article", "код", "модель"):
+            value_t = _clean_text(value)
+            if value_t:
+                return value_t
+    name = _clean_text(parsed.get("name") or "")
+    m = re.search(r"\b([a-zа-я0-9][a-zа-я0-9\-_]{3,})\b", name, flags=re.IGNORECASE)
+    return m.group(1) if m else ""
+
+
+def _data_quality_score(parsed: dict[str, Any]) -> float:
+    score = 0.0
+    if _clean_text(parsed.get("name")):
+        score += 1.2
+    if _clean_text(parsed.get("description")):
+        score += 1.3
+    if parsed.get("image_url"):
+        score += 1.2
+    dims = ("weight", "gross_weight", "length", "width", "height", "package_length", "package_width", "package_height")
+    filled_dims = sum(1 for k in dims if parsed.get(k) not in (None, "", 0, 0.0))
+    score += min(2.5, float(filled_dims) * 0.5)
+    attrs = parsed.get("attributes") or {}
+    score += min(2.0, float(len(attrs)) * 0.12)
+    if parsed.get("page_kind") == "product":
+        score += 1.4
+    if parsed.get("listing_only"):
+        score -= 2.5
+    return score
+
+
+def _relevance_score(
+    parsed: dict[str, Any],
+    url: str,
+    hints: list[str] | None = None,
+    preferred_domain: str | None = None,
+) -> float:
+    score = _data_quality_score(parsed)
+    low_url = str(url or "").lower()
+    name = _clean_text(parsed.get("name") or "").lower()
+    title = _clean_text(parsed.get("title") or "").lower()
+    article_like = _clean_text(_extract_article_like_value(parsed)).lower()
+    source_text = f"{low_url} {name} {title} {article_like}"
+    source_compact = _compact_text(source_text)
+
+    strong_phrases, tokens = _build_hint_tokens(hints)
+    strong_hits = 0
+    for phrase in strong_phrases:
+        if phrase and phrase in source_compact:
+            score += 4.5
+            strong_hits += 1
+    token_hits = 0
+    for tok in tokens:
+        if len(tok) < 3:
+            continue
+        if tok in source_text:
+            score += 0.5 if len(tok) < 5 else 0.9
+            token_hits += 1
+
+    if strong_phrases and strong_hits == 0:
+        score -= 4.0
+    if tokens and token_hits == 0:
+        score -= 1.5
+
+    if preferred_domain:
+        pref = preferred_domain.lower().replace("www.", "")
+        host = (urlparse(url).netloc or "").lower().replace("www.", "")
+        if pref and pref in host:
+            score += 1.8
+        else:
+            score -= 0.8
+
+    if _is_listing_like_url(low_url):
+        score -= 1.2
+    if _clean_text(name).lower() in GENERIC_PRODUCT_PAGE_WORDS:
+        score -= 2.0
+    if not _clean_text(name):
+        score -= 0.8
+    return score
 
 def _extract_json_ld_products(soup: BeautifulSoup) -> list[dict[str, Any]]:
     products: list[dict[str, Any]] = []
@@ -401,6 +579,16 @@ def _build_strong_hint_sets(hints: list[str]) -> tuple[set[str], set[str]]:
 
 
 def _best_product_url_from_listing(soup: BeautifulSoup, page_url: str, hints: list[str]) -> str | None:
+    urls = _ranked_product_urls_from_listing(soup, page_url=page_url, hints=hints, max_urls=1)
+    return urls[0] if urls else None
+
+
+def _ranked_product_urls_from_listing(
+    soup: BeautifulSoup,
+    page_url: str,
+    hints: list[str],
+    max_urls: int = 6,
+) -> list[str]:
     scored: list[tuple[float, str]] = []
     strong_tokens, strong_phrases = _build_strong_hint_sets(hints)
     has_strong_hints = bool(strong_tokens or strong_phrases)
@@ -431,9 +619,18 @@ def _best_product_url_from_listing(soup: BeautifulSoup, page_url: str, hints: li
             continue
         scored.append((score, full))
     if not scored:
-        return None
+        return []
     scored.sort(key=lambda x: x[0], reverse=True)
-    return scored[0][1]
+    ranked: list[str] = []
+    seen: set[str] = set()
+    for _, url in scored:
+        if url in seen:
+            continue
+        seen.add(url)
+        ranked.append(url)
+        if len(ranked) >= max(1, int(max_urls)):
+            break
+    return ranked
 
 
 def _detect_page_kind(soup: BeautifulSoup, page_url: str, raw_product_count: int) -> str:
@@ -612,25 +809,54 @@ def parse_supplier_product_page(
     if not raw_url:
         raise ValueError("Пустой supplier_url")
 
+    preferred_domain = (urlparse(raw_url).netloc or "").lower().replace("www.", "")
+    clean_hints = [h for h in (hints or []) if _clean_text(h)]
+
     html = fetch_supplier_page(raw_url, timeout=timeout)
     raw = extract_supplier_data(html, raw_url)
     parsed = normalize_supplier_data(raw)
     resolved_url = raw_url
+    best_score = _relevance_score(parsed, resolved_url, hints=clean_hints, preferred_domain=preferred_domain)
 
-    if parsed.get("page_kind") != "product" and max_hops > 0:
+    should_try_candidates = (
+        max_hops > 0
+        and (
+            parsed.get("page_kind") != "product"
+            or not has_meaningful_supplier_data(parsed)
+            or _is_listing_like_url(raw_url)
+        )
+    )
+    if should_try_candidates:
         soup = BeautifulSoup(html, "html.parser")
-        best_url = _best_product_url_from_listing(
+        ranked_urls = _ranked_product_urls_from_listing(
             soup,
             page_url=raw_url,
-            hints=[h for h in (hints or []) if _clean_text(h)],
+            hints=clean_hints,
+            max_urls=max(2, min(8, int(max_hops) * 4)),
         )
-        if best_url and best_url != raw_url:
-            second_html = fetch_supplier_page(best_url, timeout=timeout)
-            second_raw = extract_supplier_data(second_html, best_url)
-            second_parsed = normalize_supplier_data(second_raw)
-            if has_meaningful_supplier_data(second_parsed):
+        if not ranked_urls:
+            ranked_urls = list(raw.get("candidate_product_urls") or [])[: max(2, min(8, int(max_hops) * 4))]
+
+        for candidate_url in ranked_urls:
+            if candidate_url == raw_url:
+                continue
+            try:
+                second_html = fetch_supplier_page(candidate_url, timeout=timeout)
+                second_raw = extract_supplier_data(second_html, candidate_url)
+                second_parsed = normalize_supplier_data(second_raw)
+            except Exception:
+                continue
+
+            candidate_score = _relevance_score(
+                second_parsed,
+                candidate_url,
+                hints=clean_hints,
+                preferred_domain=preferred_domain,
+            )
+            if candidate_score > best_score:
                 parsed = second_parsed
-                resolved_url = best_url
+                resolved_url = candidate_url
+                best_score = candidate_score
 
     listing_only = parsed.get("page_kind") != "product"
     if listing_only:
@@ -654,53 +880,136 @@ def parse_supplier_product_page(
     parsed["resolved_url"] = resolved_url
     parsed["resolved_from_listing"] = bool(resolved_url != raw_url)
     parsed["listing_only"] = bool(listing_only)
+    parsed["relevance_score"] = round(float(best_score), 3)
     return parsed
 
 
-def fallback_search_product_data(query: str, timeout: float = 8.0, max_results: int = 3) -> dict[str, Any]:
+def _search_duckduckgo_links(query: str, timeout: float, max_links: int) -> list[str]:
+    links: list[str] = []
+    try:
+        search_url = f"https://duckduckgo.com/html/?q={quote_plus(query)}"
+        html = fetch_supplier_page(search_url, timeout=timeout)
+        soup = BeautifulSoup(html, "html.parser")
+        for a in soup.select("a.result__a, .result__title a, a[href]"):
+            normalized = _normalize_result_url(str(a.get("href") or ""))
+            if not normalized:
+                continue
+            if _is_blocked_search_domain(normalized):
+                continue
+            links.append(normalized)
+            if len(links) >= max_links:
+                break
+    except Exception:
+        return []
+    return links
+
+
+def _search_bing_links(query: str, timeout: float, max_links: int) -> list[str]:
+    links: list[str] = []
+    try:
+        search_url = f"https://www.bing.com/search?q={quote_plus(query)}"
+        html = fetch_supplier_page(search_url, timeout=timeout)
+        soup = BeautifulSoup(html, "html.parser")
+        for a in soup.select("li.b_algo h2 a, h2 a[href], a[href]"):
+            href = _normalize_result_url(str(a.get("href") or ""))
+            if not href:
+                continue
+            if _is_blocked_search_domain(href):
+                continue
+            links.append(href)
+            if len(links) >= max_links:
+                break
+    except Exception:
+        return []
+    return links
+
+
+def _build_search_queries(
+    query: str,
+    hints: list[str] | None = None,
+    preferred_domain: str | None = None,
+) -> list[str]:
+    base = _clean_text(query)
+    if not base:
+        return []
+    strong_phrases, tokens = _build_hint_tokens((hints or []) + [base])
+    variants: list[str] = [base]
+    if strong_phrases:
+        variants.append(f"\"{strong_phrases[0]}\" {base}")
+    if tokens:
+        variants.append(" ".join(tokens[:5]))
+    if preferred_domain:
+        dom = preferred_domain.lower().replace("www.", "").strip()
+        if dom:
+            variants.append(f"site:{dom} {base}")
+            if strong_phrases:
+                variants.append(f"site:{dom} \"{strong_phrases[0]}\"")
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for v in variants:
+        clean = _clean_text(v)
+        if not clean or clean in seen:
+            continue
+        seen.add(clean)
+        deduped.append(clean)
+    return deduped[:5]
+
+
+def fallback_search_product_data(
+    query: str,
+    timeout: float = 8.0,
+    max_results: int = 3,
+    hints: list[str] | None = None,
+    preferred_domain: str | None = None,
+) -> dict[str, Any]:
     text_query = _clean_text(query)
     if not text_query:
         return {}
 
-    try:
-        search_url = f"https://duckduckgo.com/html/?q={quote_plus(text_query)}"
-        html = fetch_supplier_page(search_url, timeout=timeout)
-        soup = BeautifulSoup(html, "html.parser")
-        links: list[str] = []
-        for a in soup.select("a.result__a, a[href]"):
-            href = _clean_text(a.get("href"))
-            if not href:
-                continue
-            if href.startswith("/"):
-                href = urljoin("https://duckduckgo.com", href)
-            if not href.lower().startswith(("http://", "https://")):
-                continue
-            if "duckduckgo.com" in href:
-                continue
-            links.append(href)
-            if len(links) >= max(3, int(max_results) * 2):
-                break
+    query_variants = _build_search_queries(text_query, hints=hints, preferred_domain=preferred_domain)
+    all_hints = [text_query] + [h for h in (hints or []) if _clean_text(h)]
+    seen_links: set[str] = set()
+    best: dict[str, Any] | None = None
+    best_score = -999.0
+    considered = 0
+    max_candidates = max(6, int(max_results) * 6)
 
-        best: dict[str, Any] | None = None
-        best_score = -1
-        for link in links[: max(1, int(max_results))]:
+    for q in query_variants:
+        candidate_links: list[str] = []
+        candidate_links.extend(_search_duckduckgo_links(q, timeout=timeout, max_links=max(6, int(max_results) * 3)))
+        candidate_links.extend(_search_bing_links(q, timeout=timeout, max_links=max(6, int(max_results) * 3)))
+        for link in candidate_links:
+            if link in seen_links:
+                continue
+            seen_links.add(link)
+            considered += 1
+            if considered > max_candidates:
+                break
             try:
-                page_html = fetch_supplier_page(link, timeout=timeout)
-                parsed = normalize_supplier_data(extract_supplier_data(page_html, link))
+                parsed = parse_supplier_product_page(link, hints=all_hints, timeout=timeout, max_hops=1)
             except Exception:
                 continue
-            score = 0
-            if parsed.get("description"):
-                score += 2
-            if parsed.get("image_url"):
-                score += 2
-            if any(parsed.get(x) is not None for x in ("weight", "length", "width", "height", "gross_weight")):
-                score += 2
-            score += min(3, len(parsed.get("attributes") or {}))
-            if score > best_score:
-                best_score = score
+
+            resolved = str(parsed.get("resolved_url") or link)
+            score = _relevance_score(
+                parsed,
+                resolved,
+                hints=all_hints,
+                preferred_domain=preferred_domain,
+            )
+            if q != text_query:
+                score += 0.2
+            if score > best_score and has_meaningful_supplier_data(parsed):
                 best = parsed
-                best["fallback_url"] = link
-        return best or {}
-    except Exception:
+                best_score = score
+                best["fallback_url"] = resolved
+                best["fallback_query"] = q
+                best["fallback_score"] = round(float(score), 3)
+        if considered > max_candidates:
+            break
+
+    if not best:
         return {}
+    if best_score < 1.8 and not any(best.get(k) not in (None, "", 0, 0.0) for k in ("weight", "length", "width", "height", "image_url")):
+        return {}
+    return best
