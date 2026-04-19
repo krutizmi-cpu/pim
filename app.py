@@ -3475,7 +3475,22 @@ def show_template_tab():
     t1, t2 = st.columns([1, 1])
     with t1:
         channel_code = st.text_input("Код клиента / канала", value="onlinetrade", key="template_channel_code")
-    existing_profiles = list_template_profiles(conn, channel_code=channel_code or None)
+    all_profiles = list_template_profiles(conn, channel_code=None)
+    profile_scope_options = ["Текущий канал", "Все каналы"]
+    profile_scope_value = st.session_state.get("template_profile_scope", "Текущий канал")
+    if profile_scope_value not in profile_scope_options:
+        profile_scope_value = "Текущий канал"
+    profile_scope = st.selectbox(
+        "Показывать профили",
+        options=profile_scope_options,
+        index=profile_scope_options.index(profile_scope_value),
+        key="template_profile_scope",
+    )
+    existing_profiles = (
+        [p for p in all_profiles if str(p.get("channel_code") or "").strip() == str(channel_code or "").strip()]
+        if profile_scope == "Текущий канал"
+        else all_profiles
+    )
     category_options, category_labels = _build_ozon_template_category_options(conn, channel_code=channel_code, limit=5000)
     with t2:
         category_code = st.selectbox(
@@ -3494,10 +3509,27 @@ def show_template_tab():
         selected_profile_id = st.selectbox(
             "Загрузить сохранённый профиль",
             options=profile_options,
-            format_func=lambda x: "-- нет --" if x is None else next((f"{p['profile_name']} (#{p['id']})" for p in existing_profiles if p['id'] == x), str(x)),
+            format_func=lambda x: "-- нет --" if x is None else next(
+                (
+                    f"{p['profile_name']} | канал={p.get('channel_code') or '-'} | категория={p.get('category_code') or '-'} (#{p['id']})"
+                    for p in existing_profiles
+                    if p["id"] == x
+                ),
+                str(x),
+            ),
         )
 
     st.caption("Категория профиля берётся из Ozon-эталона (`ozon:description_category_id:type_id`).")
+    if not all_profiles:
+        st.warning("В текущей БД пока нет сохранённых профилей шаблонов.")
+    elif not existing_profiles and profile_scope == "Текущий канал":
+        channels = sorted(set([str(p.get("channel_code") or "") for p in all_profiles if str(p.get("channel_code") or "").strip()]))
+        channels_text = ", ".join(channels[:8]) if channels else "-"
+        st.info(
+            f"Для канала `{channel_code or '-'}` профилей нет. "
+            f"Есть профили в других каналах: {channels_text}. "
+            f"Переключи `Показывать профили` на `Все каналы`."
+        )
 
     uploaded = st.file_uploader("Загрузить Excel-шаблон клиента", type=["xlsx", "xls"], key="client_template")
     if uploaded is None:
