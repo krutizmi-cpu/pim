@@ -4,6 +4,7 @@ from datetime import datetime, timedelta, timezone
 import json
 import os
 import sqlite3
+import time
 from difflib import SequenceMatcher
 from typing import Any
 
@@ -47,29 +48,48 @@ def _headers(client_id: str | None = None, api_key: str | None = None) -> dict[s
     }
 
 
-def _post(path: str, payload: dict[str, Any], client_id: str | None = None, api_key: str | None = None) -> dict[str, Any]:
-    with httpx.Client(base_url=BASE_URL, timeout=DEFAULT_TIMEOUT) as client:
-        response = client.post(path, headers=_headers(client_id, api_key), json=payload)
-        response.raise_for_status()
-        data = response.json()
-    if isinstance(data, dict) and data.get("message") and data.get("code"):
-        raise RuntimeError(f"Ozon API error {data.get('code')}: {data.get('message')}")
-    return data if isinstance(data, dict) else {"result": data}
+def _post(
+    path: str,
+    payload: dict[str, Any],
+    client_id: str | None = None,
+    api_key: str | None = None,
+    max_retries: int = 5,
+    retry_backoff_seconds: float = 1.2,
+) -> dict[str, Any]:
+    attempts = max(1, int(max_retries))
+    for attempt in range(1, attempts + 1):
+        try:
+            with httpx.Client(base_url=BASE_URL, timeout=DEFAULT_TIMEOUT) as client:
+                response = client.post(path, headers=_headers(client_id, api_key), json=payload)
+                response.raise_for_status()
+                data = response.json()
+            if isinstance(data, dict) and data.get("message") and data.get("code"):
+                raise RuntimeError(f"Ozon API error {data.get('code')}: {data.get('message')}")
+            return data if isinstance(data, dict) else {"result": data}
+        except httpx.HTTPStatusError as e:
+            status_code = int(e.response.status_code) if e.response is not None else 0
+            retriable = status_code in (429, 500, 502, 503, 504)
+            if (not retriable) or (attempt >= attempts):
+                raise
+            time.sleep(float(retry_backoff_seconds) * attempt)
+        except (httpx.TimeoutException, httpx.RequestError):
+            if attempt >= attempts:
+                raise
+            time.sleep(float(retry_backoff_seconds) * attempt)
+    raise RuntimeError("Не удалось выполнить запрос к Ozon API")
 
 
 def _flatten_tree(
     nodes: list[dict[str, Any]],
     parent_path: str = "",
-    inherited_description_category_id: int | None = None,
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for node in nodes or []:
         category_name = node.get("category_name") or ""
         current_path = f"{parent_path} / {category_name}".strip(" /") if category_name else parent_path
-        effective_description_category_id = node.get("description_category_id") or inherited_description_category_id
         rows.append(
             {
-                "description_category_id": effective_description_category_id,
+                "description_category_id": node.get("description_category_id"),
                 "category_name": category_name,
                 "path": current_path,
                 "type_id": node.get("type_id"),
@@ -83,7 +103,6 @@ def _flatten_tree(
             _flatten_tree(
                 node.get("children") or [],
                 current_path,
-                effective_description_category_id,
             )
         )
     return rows
@@ -165,16 +184,27 @@ def _set_setting(conn: sqlite3.Connection, key: str, value: str | None) -> None:
     conn.commit()
 
 
-def _list_category_pairs_for_sync(conn: sqlite3.Connection) -> list[tuple[int, int]]:
-    rows = conn.execute(
-        """
+def _list_category_pairs_for_sync(
+    conn: sqlite3.Connection,
+    only_leaf: bool = True,
+    include_disabled: bool = False,
+) -> list[tuple[int, int]]:
+    where: list[str] = [
+        "description_category_id IS NOT NULL",
+        "type_id IS NOT NULL",
+    ]
+    if not include_disabled:
+        where.append("IFNULL(disabled, 0) = 0")
+    if only_leaf:
+        where.append("IFNULL(children_count, 0) = 0")
+    sql = """
         SELECT DISTINCT description_category_id, type_id
         FROM ozon_category_cache
-        WHERE description_category_id IS NOT NULL
-          AND type_id IS NOT NULL
-        ORDER BY description_category_id, type_id
-        """
-    ).fetchall()
+    """
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY description_category_id, type_id"
+    rows = conn.execute(sql).fetchall()
     return [(int(r["description_category_id"]), int(r["type_id"])) for r in rows]
 
 
@@ -256,6 +286,176 @@ def get_ozon_cache_stats(conn: sqlite3.Connection) -> dict[str, int]:
     }
 
 
+def _list_missing_category_pairs(
+    conn: sqlite3.Connection,
+    only_leaf: bool = True,
+    include_disabled: bool = False,
+    limit: int = 2000,
+) -> list[dict[str, Any]]:
+    where: list[str] = [
+        "c.description_category_id IS NOT NULL",
+        "c.type_id IS NOT NULL",
+    ]
+    if not include_disabled:
+        where.append("IFNULL(c.disabled, 0) = 0")
+    if only_leaf:
+        where.append("IFNULL(c.children_count, 0) = 0")
+    sql = """
+        SELECT
+            c.description_category_id,
+            c.type_id,
+            MAX(IFNULL(c.full_path, c.category_name)) AS full_path,
+            MAX(IFNULL(c.type_name, '')) AS type_name
+        FROM ozon_category_cache c
+        LEFT JOIN (
+            SELECT DISTINCT description_category_id, type_id
+            FROM ozon_attribute_cache
+            WHERE description_category_id IS NOT NULL AND type_id IS NOT NULL
+        ) a
+          ON a.description_category_id = c.description_category_id
+         AND a.type_id = c.type_id
+    """
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+        sql += " AND a.description_category_id IS NULL"
+    else:
+        sql += " WHERE a.description_category_id IS NULL"
+    sql += """
+        GROUP BY c.description_category_id, c.type_id
+        ORDER BY full_path, type_name
+        LIMIT ?
+    """
+    rows = conn.execute(sql, (int(limit),)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_ozon_sync_coverage(
+    conn: sqlite3.Connection,
+    only_leaf: bool = True,
+    include_disabled: bool = False,
+    missing_preview_limit: int = 200,
+) -> dict[str, Any]:
+    where: list[str] = [
+        "description_category_id IS NOT NULL",
+        "type_id IS NOT NULL",
+    ]
+    if not include_disabled:
+        where.append("IFNULL(disabled, 0) = 0")
+    if only_leaf:
+        where.append("IFNULL(children_count, 0) = 0")
+    where_sql = " AND ".join(where)
+    where_c = [
+        "c.description_category_id IS NOT NULL",
+        "c.type_id IS NOT NULL",
+    ]
+    if not include_disabled:
+        where_c.append("IFNULL(c.disabled, 0) = 0")
+    if only_leaf:
+        where_c.append("IFNULL(c.children_count, 0) = 0")
+    where_sql_c = " AND ".join(where_c)
+
+    total_pairs = int(
+        conn.execute(
+            f"""
+            SELECT COUNT(*)
+            FROM (
+                SELECT DISTINCT description_category_id, type_id
+                FROM ozon_category_cache
+                WHERE {where_sql}
+            )
+            """
+        ).fetchone()[0]
+        or 0
+    )
+    pairs_with_attrs = int(
+        conn.execute(
+            f"""
+            SELECT COUNT(*)
+            FROM (
+                SELECT DISTINCT c.description_category_id, c.type_id
+                FROM ozon_category_cache c
+                JOIN ozon_attribute_cache a
+                  ON a.description_category_id = c.description_category_id
+                 AND a.type_id = c.type_id
+                WHERE {where_sql_c}
+            )
+            """
+        ).fetchone()[0]
+        or 0
+    )
+    missing_pairs = max(0, total_pairs - pairs_with_attrs)
+    coverage_percent = round((pairs_with_attrs / total_pairs) * 100.0, 2) if total_pairs > 0 else 0.0
+
+    missing_preview = _list_missing_category_pairs(
+        conn,
+        only_leaf=only_leaf,
+        include_disabled=include_disabled,
+        limit=max(1, int(missing_preview_limit)),
+    )
+    return {
+        "total_pairs": total_pairs,
+        "pairs_with_attrs": pairs_with_attrs,
+        "missing_pairs": missing_pairs,
+        "coverage_percent": coverage_percent,
+        "missing_preview": missing_preview,
+        "only_leaf": bool(only_leaf),
+        "include_disabled": bool(include_disabled),
+    }
+
+
+def sync_missing_category_attributes(
+    conn: sqlite3.Connection,
+    client_id: str | None = None,
+    api_key: str | None = None,
+    language: str = "DEFAULT",
+    only_leaf: bool = True,
+    include_disabled: bool = False,
+    limit: int = 500,
+    import_to_pim: bool = True,
+) -> dict[str, Any]:
+    missing_pairs = _list_missing_category_pairs(
+        conn,
+        only_leaf=only_leaf,
+        include_disabled=include_disabled,
+        limit=max(1, int(limit)),
+    )
+    processed = 0
+    attributes_total = 0
+    imported_to_pim = 0
+    errors: list[str] = []
+    for item in missing_pairs:
+        description_category_id = int(item["description_category_id"])
+        type_id = int(item["type_id"])
+        try:
+            result = sync_category_attributes(
+                conn,
+                description_category_id=description_category_id,
+                type_id=type_id,
+                client_id=client_id,
+                api_key=api_key,
+                language=language,
+            )
+            processed += 1
+            attributes_total += int(result.get("total") or 0)
+            if import_to_pim:
+                imported = import_cached_attributes_to_pim(
+                    conn,
+                    description_category_id=description_category_id,
+                    type_id=type_id,
+                )
+                imported_to_pim += int(imported.get("imported") or 0)
+        except Exception as e:
+            errors.append(f"cat={description_category_id}, type={type_id}: {e}")
+
+    return {
+        "missing_pairs_requested": len(missing_pairs),
+        "pairs_processed": processed,
+        "attributes_total": attributes_total,
+        "imported_to_pim": imported_to_pim,
+        "errors": errors[:500],
+    }
+
+
 def sync_all_categories_and_attributes(
     conn: sqlite3.Connection,
     client_id: str | None = None,
@@ -263,9 +463,11 @@ def sync_all_categories_and_attributes(
     language: str = "DEFAULT",
     max_pairs: int | None = None,
     import_to_pim: bool = True,
+    only_leaf: bool = True,
+    include_disabled: bool = False,
 ) -> dict[str, Any]:
     tree_result = sync_category_tree(conn, client_id=client_id, api_key=api_key, language=language)
-    pairs = _list_category_pairs_for_sync(conn)
+    pairs = _list_category_pairs_for_sync(conn, only_leaf=only_leaf, include_disabled=include_disabled)
     if max_pairs is not None and int(max_pairs) > 0:
         pairs = pairs[: int(max_pairs)]
 

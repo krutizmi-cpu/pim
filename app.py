@@ -72,7 +72,7 @@ from services.template_matching import auto_match_template_columns, apply_saved_
 from services.template_profiles import save_template_profile, list_template_profiles, get_template_profile_columns
 from services.readiness_service import analyze_template_readiness
 from services.supplier_profiles import list_supplier_profiles, upsert_supplier_profile
-from services.ozon_api_service import is_configured, sync_category_tree, list_cached_categories, list_cached_category_pairs, get_ozon_cache_stats, sync_category_attributes, list_cached_attributes, sync_attribute_dictionary_values, sync_all_category_dictionary_values, list_cached_attribute_values, import_cached_attributes_to_pim, import_all_cached_attributes_to_pim, suggest_mappings_for_cached_attributes, save_suggested_mappings, analyze_product_ozon_coverage, ensure_ozon_master_attributes, build_product_ozon_payload, materialize_product_ozon_attributes, preview_product_ozon_dictionary_gaps, build_product_ozon_api_attributes, build_bulk_ozon_api_payloads, build_ozon_attributes_update_request, submit_ozon_attributes_update, list_ozon_update_jobs, get_ozon_update_job, retry_ozon_update_job, list_ozon_update_job_items, save_dictionary_override, list_dictionary_overrides, delete_dictionary_override, sync_all_categories_and_attributes
+from services.ozon_api_service import is_configured, sync_category_tree, list_cached_categories, list_cached_category_pairs, get_ozon_cache_stats, get_ozon_sync_coverage, sync_missing_category_attributes, sync_category_attributes, list_cached_attributes, sync_attribute_dictionary_values, sync_all_category_dictionary_values, list_cached_attribute_values, import_cached_attributes_to_pim, import_all_cached_attributes_to_pim, suggest_mappings_for_cached_attributes, save_suggested_mappings, analyze_product_ozon_coverage, ensure_ozon_master_attributes, build_product_ozon_payload, materialize_product_ozon_attributes, preview_product_ozon_dictionary_gaps, build_product_ozon_api_attributes, build_bulk_ozon_api_payloads, build_ozon_attributes_update_request, submit_ozon_attributes_update, list_ozon_update_jobs, get_ozon_update_job, retry_ozon_update_job, list_ozon_update_job_items, save_dictionary_override, list_dictionary_overrides, delete_dictionary_override, sync_all_categories_and_attributes
 from services.ozon_category_match import bulk_assign_ozon_categories
 from services.dimension_fallback import infer_category_fields, infer_dimensions_from_catalog, is_dimension_payload_suspicious
 
@@ -149,6 +149,8 @@ def _ozon_bg_worker(db_path: str, client_id: str, api_key: str) -> None:
             api_key=api_key or None,
             max_pairs=None,
             import_to_pim=True,
+            only_leaf=True,
+            include_disabled=False,
         )
         _set_ozon_bg_state(
             running=False,
@@ -2749,6 +2751,70 @@ def show_ozon_tab():
     s4.metric("Обязательных", int(stats.get("attributes_required") or 0))
     s5.metric("Атрибутов в master", int(stats.get("attribute_defs_ozon") or 0))
     s6.metric("Ozon requirements", int(stats.get("ozon_requirements") or 0))
+
+    qc1, qc2, qc3, qc4 = st.columns([1, 1, 1, 2])
+    with qc1:
+        coverage_only_leaf = st.checkbox(
+            "Проверять только листовые категории",
+            value=True,
+            key="ozon_coverage_only_leaf",
+        )
+    with qc2:
+        coverage_include_disabled = st.checkbox(
+            "Включая disabled",
+            value=False,
+            key="ozon_coverage_include_disabled",
+        )
+    with qc3:
+        missing_sync_limit = st.number_input(
+            "Лимит досинхронизации пропусков",
+            min_value=10,
+            max_value=5000,
+            value=500,
+            step=10,
+            key="ozon_missing_sync_limit",
+        )
+    with qc4:
+        if st.button("Досинхронизировать пропущенные категории", disabled=not configured):
+            miss_result = sync_missing_category_attributes(
+                conn,
+                client_id=client_id or None,
+                api_key=api_key or None,
+                only_leaf=bool(coverage_only_leaf),
+                include_disabled=bool(coverage_include_disabled),
+                limit=int(missing_sync_limit),
+                import_to_pim=True,
+            )
+            st.success(
+                "Досинхронизация завершена: "
+                f"обработано пар {int(miss_result.get('pairs_processed') or 0)} из {int(miss_result.get('missing_pairs_requested') or 0)}, "
+                f"атрибутов загружено {int(miss_result.get('attributes_total') or 0)}."
+            )
+            if miss_result.get("errors"):
+                st.warning(f"Ошибок при досинхронизации: {len(miss_result['errors'])}.")
+            st.rerun()
+
+    coverage = get_ozon_sync_coverage(
+        conn,
+        only_leaf=bool(coverage_only_leaf),
+        include_disabled=bool(coverage_include_disabled),
+        missing_preview_limit=200,
+    )
+    cv1, cv2, cv3, cv4 = st.columns(4)
+    cv1.metric("Пары для проверки", int(coverage.get("total_pairs") or 0))
+    cv2.metric("Пары с атрибутами", int(coverage.get("pairs_with_attrs") or 0))
+    cv3.metric("Пропущено пар", int(coverage.get("missing_pairs") or 0))
+    cv4.metric("Покрытие sync, %", float(coverage.get("coverage_percent") or 0.0))
+    if int(coverage.get("missing_pairs") or 0) > 0:
+        st.warning(
+            f"Ozon sync покрыт не полностью: {int(coverage.get('pairs_with_attrs') or 0)} из {int(coverage.get('total_pairs') or 0)} пар. "
+            "Ниже показан список первых пропусков."
+        )
+        missing_preview = coverage.get("missing_preview") or []
+        if missing_preview:
+            st.dataframe(pd.DataFrame(missing_preview), use_container_width=True, hide_index=True)
+    else:
+        st.success("Покрытие Ozon-sync полное для выбранных условий проверки.")
 
     category_search = st.text_input(
         "Фильтр категорий Ozon",
