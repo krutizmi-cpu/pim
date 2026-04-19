@@ -145,6 +145,9 @@ PARSER_SETTINGS_DEFAULTS: dict[str, object] = {
     "timeout_seconds": 8.0,
     "max_hops": 1,
     "fallback_max_results": 4,
+    "require_article_match": True,
+    "min_name_overlap": 2,
+    "min_fallback_score": 3.0,
     "enable_web_fallback": True,
     "enable_ozon_fallback": True,
     "enable_yandex_fallback": True,
@@ -205,10 +208,15 @@ def load_parser_settings(conn) -> dict[str, object]:
     timeout_raw = _get_system_setting(conn, "parser.timeout_seconds", PARSER_SETTINGS_DEFAULTS["timeout_seconds"])
     max_hops_raw = _get_system_setting(conn, "parser.max_hops", PARSER_SETTINGS_DEFAULTS["max_hops"])
     max_results_raw = _get_system_setting(conn, "parser.fallback_max_results", PARSER_SETTINGS_DEFAULTS["fallback_max_results"])
+    min_name_overlap_raw = _get_system_setting(conn, "parser.min_name_overlap", PARSER_SETTINGS_DEFAULTS["min_name_overlap"])
+    min_fallback_score_raw = _get_system_setting(conn, "parser.min_fallback_score", PARSER_SETTINGS_DEFAULTS["min_fallback_score"])
     settings = {
         "timeout_seconds": float(timeout_raw) if str(timeout_raw).strip() not in {"", "None"} else float(PARSER_SETTINGS_DEFAULTS["timeout_seconds"]),
         "max_hops": int(float(max_hops_raw)) if str(max_hops_raw).strip() not in {"", "None"} else int(PARSER_SETTINGS_DEFAULTS["max_hops"]),
         "fallback_max_results": int(float(max_results_raw)) if str(max_results_raw).strip() not in {"", "None"} else int(PARSER_SETTINGS_DEFAULTS["fallback_max_results"]),
+        "require_article_match": _to_bool_setting(_get_system_setting(conn, "parser.require_article_match", PARSER_SETTINGS_DEFAULTS["require_article_match"]), bool(PARSER_SETTINGS_DEFAULTS["require_article_match"])),
+        "min_name_overlap": int(float(min_name_overlap_raw)) if str(min_name_overlap_raw).strip() not in {"", "None"} else int(PARSER_SETTINGS_DEFAULTS["min_name_overlap"]),
+        "min_fallback_score": float(min_fallback_score_raw) if str(min_fallback_score_raw).strip() not in {"", "None"} else float(PARSER_SETTINGS_DEFAULTS["min_fallback_score"]),
         "enable_web_fallback": _to_bool_setting(_get_system_setting(conn, "parser.enable_web_fallback", PARSER_SETTINGS_DEFAULTS["enable_web_fallback"]), bool(PARSER_SETTINGS_DEFAULTS["enable_web_fallback"])),
         "enable_ozon_fallback": _to_bool_setting(_get_system_setting(conn, "parser.enable_ozon_fallback", PARSER_SETTINGS_DEFAULTS["enable_ozon_fallback"]), bool(PARSER_SETTINGS_DEFAULTS["enable_ozon_fallback"])),
         "enable_yandex_fallback": _to_bool_setting(_get_system_setting(conn, "parser.enable_yandex_fallback", PARSER_SETTINGS_DEFAULTS["enable_yandex_fallback"]), bool(PARSER_SETTINGS_DEFAULTS["enable_yandex_fallback"])),
@@ -218,6 +226,8 @@ def load_parser_settings(conn) -> dict[str, object]:
     settings["timeout_seconds"] = max(2.0, min(30.0, float(settings["timeout_seconds"])))
     settings["max_hops"] = max(1, min(3, int(settings["max_hops"])))
     settings["fallback_max_results"] = max(1, min(12, int(settings["fallback_max_results"])))
+    settings["min_name_overlap"] = max(1, min(5, int(settings["min_name_overlap"])))
+    settings["min_fallback_score"] = max(0.0, min(10.0, float(settings["min_fallback_score"])))
     return settings
 
 
@@ -225,6 +235,9 @@ def save_parser_settings(conn, settings: dict[str, object]) -> None:
     _set_system_setting(conn, "parser.timeout_seconds", float(settings.get("timeout_seconds", PARSER_SETTINGS_DEFAULTS["timeout_seconds"])))
     _set_system_setting(conn, "parser.max_hops", int(settings.get("max_hops", PARSER_SETTINGS_DEFAULTS["max_hops"])))
     _set_system_setting(conn, "parser.fallback_max_results", int(settings.get("fallback_max_results", PARSER_SETTINGS_DEFAULTS["fallback_max_results"])))
+    _set_system_setting(conn, "parser.require_article_match", 1 if bool(settings.get("require_article_match", True)) else 0)
+    _set_system_setting(conn, "parser.min_name_overlap", int(settings.get("min_name_overlap", PARSER_SETTINGS_DEFAULTS["min_name_overlap"])))
+    _set_system_setting(conn, "parser.min_fallback_score", float(settings.get("min_fallback_score", PARSER_SETTINGS_DEFAULTS["min_fallback_score"])))
     _set_system_setting(conn, "parser.enable_web_fallback", 1 if bool(settings.get("enable_web_fallback", True)) else 0)
     _set_system_setting(conn, "parser.enable_ozon_fallback", 1 if bool(settings.get("enable_ozon_fallback", True)) else 0)
     _set_system_setting(conn, "parser.enable_yandex_fallback", 1 if bool(settings.get("enable_yandex_fallback", True)) else 0)
@@ -527,6 +540,93 @@ def format_source_name_ui(
     if attr_name_map and value in attr_name_map and str(attr_name_map[value]).strip():
         return str(attr_name_map[value]).strip()
     return humanize_attribute_code(value)
+
+
+_MATCH_STOPWORDS = {
+    "велосипед", "bike", "товар", "product", "new", "новый", "новинка", "для", "and", "the", "with",
+    "комплект", "set", "шт", "pcs", "item", "model", "модель",
+}
+
+
+def _compact_for_match(value: object) -> str:
+    return "".join(ch for ch in str(value or "").lower() if ch.isalnum())
+
+
+def _name_tokens_for_match(value: object) -> set[str]:
+    tokens = set(re.findall(r"[a-zа-я0-9]{3,}", str(value or "").lower()))
+    return {t for t in tokens if t not in _MATCH_STOPWORDS}
+
+
+def _collect_target_codes(product_row: dict) -> list[str]:
+    out: list[str] = []
+    for key in ("supplier_article", "article", "internal_article", "barcode"):
+        raw = str(product_row.get(key) or "").strip()
+        compact = _compact_for_match(raw)
+        if len(compact) >= 4 and compact not in out:
+            out.append(compact)
+    return out
+
+
+def _extract_parsed_article_candidates(parsed: dict) -> list[str]:
+    values: list[str] = []
+    attrs = parsed.get("attributes") or {}
+    for k, v in attrs.items():
+        key_l = str(k or "").lower()
+        if any(x in key_l for x in ["артикул", "sku", "article", "код"]):
+            values.append(str(v or ""))
+    values.append(str(parsed.get("name") or ""))
+    values.append(str(parsed.get("title") or ""))
+    out: list[str] = []
+    for val in values:
+        compact = _compact_for_match(val)
+        if len(compact) >= 4 and compact not in out:
+            out.append(compact)
+    return out
+
+
+def _is_parsed_result_relevant(product_row: dict, parsed: dict, source_url: str, settings: dict[str, object]) -> tuple[bool, str]:
+    target_codes = _collect_target_codes(product_row)
+    parsed_codes = _extract_parsed_article_candidates(parsed)
+    combined_text = " ".join(
+        [
+            str(source_url or ""),
+            str(parsed.get("resolved_url") or ""),
+            str(parsed.get("title") or ""),
+            str(parsed.get("name") or ""),
+            str(parsed.get("description") or "")[:500],
+        ]
+    )
+    combined_compact = _compact_for_match(combined_text)
+
+    code_match = False
+    for code in target_codes:
+        if code in combined_compact:
+            code_match = True
+            break
+        if any(code in parsed_code or parsed_code in code for parsed_code in parsed_codes):
+            code_match = True
+            break
+
+    product_brand = str(product_row.get("brand") or "").strip().lower()
+    parsed_brand = str(parsed.get("brand") or "").strip().lower()
+    brand_match = bool(product_brand and (product_brand in parsed_brand or parsed_brand in product_brand))
+
+    source_tokens = _name_tokens_for_match(product_row.get("name"))
+    parsed_tokens = _name_tokens_for_match(parsed.get("name"))
+    overlap = len(source_tokens.intersection(parsed_tokens))
+
+    fallback_score = float(parsed.get("fallback_score") or 0.0)
+    min_overlap = int(settings.get("min_name_overlap", 2))
+    min_fallback_score = float(settings.get("min_fallback_score", 3.0))
+    require_article_match = bool(settings.get("require_article_match", True))
+
+    if target_codes and code_match:
+        return True, "article_or_code_match"
+    if overlap >= min_overlap and (brand_match or fallback_score >= min_fallback_score):
+        return True, f"name_overlap={overlap}"
+    if (not require_article_match) and fallback_score >= (min_fallback_score + 1.0):
+        return True, f"score={fallback_score:.2f}"
+    return False, f"rejected: code_match={code_match}, overlap={overlap}, brand_match={brand_match}, score={fallback_score:.2f}"
 
 
 def _build_ozon_scope_labels(conn) -> dict[str, str]:
@@ -1904,6 +2004,14 @@ def show_catalog_tab():
                 step=1,
                 key="parser_cfg_max_results",
             )
+            ps_min_score = st.number_input(
+                "Мин. score fallback",
+                min_value=0.0,
+                max_value=10.0,
+                value=float(parser_settings.get("min_fallback_score", 3.0)),
+                step=0.1,
+                key="parser_cfg_min_fallback_score",
+            )
         with p2:
             ps_web = st.checkbox(
                 "Включить web fallback",
@@ -1919,6 +2027,12 @@ def show_catalog_tab():
                 "Пробовать Яндекс Маркет",
                 value=bool(parser_settings.get("enable_yandex_fallback", True)),
                 key="parser_cfg_enable_yandex_fallback",
+            )
+            ps_require_article_match = st.checkbox(
+                "Требовать совпадение артикула/кода",
+                value=bool(parser_settings.get("require_article_match", True)),
+                key="parser_cfg_require_article_match",
+                help="Защищает от подстановки данных не того товара при fallback-поиске.",
             )
         with p3:
             ps_stats = st.checkbox(
@@ -1937,11 +2051,23 @@ def show_catalog_tab():
                 key="catalog_enrich_include_without_url",
                 help="Если включено, товары без URL поставщика тоже пойдут в fallback-поиск.",
             )
+            ps_min_overlap = st.number_input(
+                "Мин. пересечение токенов названия",
+                min_value=1,
+                max_value=5,
+                value=int(parser_settings.get("min_name_overlap", 2)),
+                step=1,
+                key="parser_cfg_min_name_overlap",
+                help="Минимум общих токенов в названии товара и найденной страницы.",
+            )
         if st.button("Сохранить настройки парсинга", key="parser_cfg_save_button", type="primary"):
             new_settings = {
                 "timeout_seconds": float(ps_timeout),
                 "max_hops": int(ps_max_hops),
                 "fallback_max_results": int(ps_max_results),
+                "require_article_match": bool(ps_require_article_match),
+                "min_name_overlap": int(ps_min_overlap),
+                "min_fallback_score": float(ps_min_score),
                 "enable_web_fallback": bool(ps_web),
                 "enable_ozon_fallback": bool(ps_ozon),
                 "enable_yandex_fallback": bool(ps_yandex),
@@ -2129,7 +2255,7 @@ def show_catalog_tab():
                 )
                 if result.get("ok"):
                     success += 1
-                    if str(result.get("source_type") or "") == "web_search_fallback":
+                    if "fallback" in str(result.get("source_type") or ""):
                         used_fallback += 1
                     if str(result.get("source_url") or "").strip() and str(result.get("source_url") or "").strip() != current_supplier_url:
                         resolved_from_listing += 1
@@ -2344,6 +2470,7 @@ def enrich_product_from_supplier(
         source_url = supplier_url
         source_type = "supplier_page"
         used_fallback = False
+        fallback_rejected_reason = ""
         used_stats_fallback = False
         used_category_defaults = False
         field_source_types: dict[str, str] = {}
@@ -2431,6 +2558,16 @@ def enrich_product_from_supplier(
                 )
                 if fallback:
                     fallback_stage = "web_search_fallback"
+            if fallback and has_meaningful_supplier_data(fallback):
+                is_relevant, relevance_reason = _is_parsed_result_relevant(
+                    product_row=product_row,
+                    parsed=fallback,
+                    source_url=str(fallback.get("fallback_url") or source_url or ""),
+                    settings=settings,
+                )
+                if not is_relevant:
+                    fallback = {}
+                    fallback_rejected_reason = relevance_reason
             if fallback and has_meaningful_supplier_data(fallback):
                 for key in [
                     "name", "brand", "category", "description", "image_url", "weight", "gross_weight",
@@ -2648,6 +2785,8 @@ def enrich_product_from_supplier(
             parse_comment += "; listing->product resolved"
         if used_fallback:
             parse_comment += "; web_fallback=1"
+        if fallback_rejected_reason:
+            parse_comment += f"; fallback_rejected={fallback_rejected_reason[:180]}"
         if used_stats_fallback:
             parse_comment += "; category_stats_fallback=1"
         if used_category_defaults:
@@ -2840,6 +2979,9 @@ def show_product_tab():
                 "timeout_seconds": parser_settings.get("timeout_seconds"),
                 "max_hops": parser_settings.get("max_hops"),
                 "fallback_max_results": parser_settings.get("fallback_max_results"),
+                "require_article_match": parser_settings.get("require_article_match"),
+                "min_name_overlap": parser_settings.get("min_name_overlap"),
+                "min_fallback_score": parser_settings.get("min_fallback_score"),
                 "enable_web_fallback": parser_settings.get("enable_web_fallback"),
                 "enable_ozon_fallback": parser_settings.get("enable_ozon_fallback"),
                 "enable_yandex_fallback": parser_settings.get("enable_yandex_fallback"),
@@ -4173,7 +4315,12 @@ def show_template_tab():
                         a1, a2 = st.columns(2)
                         with a1:
                             if st.button("Обогатить товар из supplier", key="gap_supplier_enrich"):
-                                result = enrich_product_from_supplier(conn, int(action_product_id), force=False)
+                                result = enrich_product_from_supplier(
+                                    conn,
+                                    int(action_product_id),
+                                    force=False,
+                                    parser_settings=load_parser_settings(conn),
+                                )
                                 if result["ok"]:
                                     st.success(result["message"])
                                     st.rerun()
