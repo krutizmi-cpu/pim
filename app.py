@@ -267,7 +267,8 @@ def list_catalog_categories(conn) -> list[str]:
 
     preferred = sorted([v for v in ozon_values if v], key=lambda x: x.lower())
     legacy_only = sorted([v for v in legacy_values if v and v not in ozon_values], key=lambda x: x.lower())
-    return preferred + legacy_only
+    # Ozon — эталон категорий. Legacy используем только если Ozon-категорий пока нет.
+    return preferred if preferred else legacy_only
 
 
 def _split_ozon_path_parts(path: str | None) -> list[str]:
@@ -464,6 +465,53 @@ def _build_ozon_scope_labels(conn) -> dict[str, str]:
             else:
                 labels[code] = f"Ozon категория {desc_id} | тип {type_id}"
     return labels
+
+
+def _build_ozon_template_category_options(
+    conn,
+    channel_code: str | None = None,
+    limit: int = 5000,
+) -> tuple[list[str], dict[str, str]]:
+    options: list[str] = [""]
+    labels: dict[str, str] = {"": "-- без категории --"}
+    seen: set[str] = {""}
+
+    try:
+        pairs = list_cached_category_pairs(conn, limit=max(200, int(limit)))
+    except Exception:
+        pairs = []
+
+    for row in pairs:
+        desc_id = row.get("description_category_id")
+        type_id = row.get("type_id")
+        if desc_id is None or type_id is None:
+            continue
+        code = f"ozon:{int(desc_id)}:{int(type_id)}"
+        if code in seen:
+            continue
+        full_path = str(row.get("full_path") or row.get("category_name") or "").strip()
+        type_name = str(row.get("type_name") or "").strip()
+        labels[code] = f"{full_path or '-'} | {type_name or '-'} | {code}"
+        options.append(code)
+        seen.add(code)
+
+    # Добавляем legacy-категории из сохранённых профилей канала, чтобы не потерять совместимость.
+    profile_categories: set[str] = set()
+    if channel_code:
+        for profile in list_template_profiles(conn, channel_code=channel_code):
+            raw = str(profile.get("category_code") or "").strip()
+            if raw:
+                profile_categories.add(raw)
+    if profile_categories:
+        scope_labels = _build_ozon_scope_labels(conn)
+        for code in sorted(profile_categories):
+            if code in seen:
+                continue
+            labels[code] = scope_labels.get(code, code)
+            options.append(code)
+            seen.add(code)
+
+    return options, labels
 
 
 def _is_blank_value(value: object) -> bool:
@@ -3314,12 +3362,14 @@ def show_template_tab():
     t1, t2 = st.columns([1, 1])
     with t1:
         channel_code = st.text_input("Код клиента / канала", value="onlinetrade", key="template_channel_code")
+    existing_profiles = list_template_profiles(conn, channel_code=channel_code or None)
+    category_options, category_labels = _build_ozon_template_category_options(conn, channel_code=channel_code, limit=5000)
     with t2:
-        known_categories = [""] + list_catalog_categories(conn)
         category_code = st.selectbox(
-            "Категория шаблона/профиля (приоритет Ozon)",
-            options=known_categories,
+            "Категория шаблона/профиля (Ozon-каталог)",
+            options=category_options,
             index=0,
+            format_func=lambda x: category_labels.get(str(x), str(x)),
             key="template_category_select",
         )
 
@@ -3327,7 +3377,6 @@ def show_template_tab():
     with p1:
         profile_name = st.text_input("Имя профиля шаблона", value=f"{channel_code}_default")
     with p2:
-        existing_profiles = list_template_profiles(conn, channel_code=channel_code or None)
         profile_options = [None] + [p["id"] for p in existing_profiles]
         selected_profile_id = st.selectbox(
             "Загрузить сохранённый профиль",
@@ -3335,7 +3384,11 @@ def show_template_tab():
             format_func=lambda x: "-- нет --" if x is None else next((f"{p['profile_name']} (#{p['id']})" for p in existing_profiles if p['id'] == x), str(x)),
         )
 
+    st.caption("Категория профиля берётся из Ozon-эталона (`ozon:description_category_id:type_id`).")
+
     uploaded = st.file_uploader("Загрузить Excel-шаблон клиента", type=["xlsx", "xls"], key="client_template")
+    if uploaded is None:
+        st.info("После загрузки файла станет доступна кнопка `Сохранить профиль шаблона (текущая схема)` — система запомнит тип шаблона клиента.")
 
     if uploaded is not None:
         uploaded_bytes = uploaded.getvalue()
@@ -3393,7 +3446,8 @@ def show_template_tab():
         source_options = [("column", c) for c in [
             "article", "internal_article", "supplier_article", "name", "barcode", "brand", "description",
             "weight", "length", "width", "height", "package_length", "package_width", "package_height",
-            "gross_weight", "image_url", "category", "base_category", "supplier_name", "supplier_url",
+            "gross_weight", "image_url", "ozon_category_path", "ozon_description_category_id", "ozon_type_id",
+            "category", "base_category", "supplier_name", "supplier_url",
             "uom", "tnved_code", "media_gallery"
         ]] + [("attribute", d["code"]) for d in defs]
         matches = auto_match_template_columns(conn, list(template_df.columns))
@@ -3428,6 +3482,33 @@ def show_template_tab():
             st.success("По матчингу всё хорошо, можно переходить к товарам и preview.")
         else:
             st.warning("Есть несматченные колонки. Лучше сначала добить их, чтобы потом не ловить пустоты в выгрузке.")
+
+        save_ready_rows = [
+            {
+                "template_column": m.get("template_column"),
+                "status": m.get("status"),
+                "source_type": m.get("source_type"),
+                "source_name": m.get("source_name"),
+                "matched_by": m.get("matched_by"),
+                "transform_rule": m.get("transform_rule"),
+            }
+            for m in matches
+            if str(m.get("template_column") or "").strip()
+        ]
+        save_col1, save_col2 = st.columns([1, 3])
+        with save_col1:
+            if st.button("Сохранить профиль шаблона (текущая схема)", key="template_save_profile_top", type="primary"):
+                profile_id = save_template_profile(
+                    conn=conn,
+                    profile_name=profile_name,
+                    channel_code=channel_code,
+                    category_code=category_code or None,
+                    file_name=getattr(uploaded, "name", None),
+                    columns=save_ready_rows,
+                )
+                st.success(f"Профиль шаблона сохранён: #{profile_id}")
+        with save_col2:
+            st.caption("Эта кнопка сохраняет тип шаблона клиента для повторного использования без повторной ручной настройки.")
 
         tab_match, tab_fill, tab_gap = st.tabs(["1. Матчинг", "2. Заполнение и preview", "3. Gap и действия"])
 
