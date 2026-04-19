@@ -276,8 +276,9 @@ def build_product_value_map(conn, product_id: int) -> dict[str, object]:
             media_values.append(row["value_json"])
         elif row["value_text"]:
             media_values.append(row["value_text"])
-    if product.get("image_url"):
-        media_values.insert(0, product.get("image_url"))
+    image_url = value_map.get("image_url")
+    if image_url:
+        media_values.insert(0, image_url)
     value_map["media_gallery"] = media_values
 
     return value_map
