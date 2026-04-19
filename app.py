@@ -3467,6 +3467,25 @@ def show_template_tab():
                 for m in matches
             ]
 
+        # Применяем отложенные overrides до отрисовки tmpl_* виджетов,
+        # чтобы не ловить StreamlitAPIException при записи в ключ уже созданного виджета.
+        pending_manual_overrides = st.session_state.pop("template_manual_overrides", None)
+        if isinstance(pending_manual_overrides, dict):
+            for raw_idx, payload in pending_manual_overrides.items():
+                try:
+                    idx = int(raw_idx)
+                except Exception:
+                    continue
+                if idx < 0 or idx >= len(matches):
+                    continue
+                source_type = str(payload.get("source_type") or "attribute")
+                source_name = str(payload.get("source_name") or "")
+                transform_rule = str(payload.get("transform_rule") or "")
+                st.session_state[f"tmpl_type_{idx}"] = source_type
+                st.session_state[f"tmpl_name_{idx}"] = source_name
+                if transform_rule:
+                    st.session_state[f"tmpl_transform_{idx}"] = transform_rule
+
         match_df = pd.DataFrame(matches)
         matched_count = int((match_df["status"] == "matched").sum()) if not match_df.empty else 0
         unmatched_count = int((match_df["status"] != "matched").sum()) if not match_df.empty else 0
@@ -3590,6 +3609,7 @@ def show_template_tab():
             with s3:
                 if st.button("Добавить несматченные в master-атрибуты"):
                     created = 0
+                    overrides: dict[str, dict[str, str]] = {}
                     for idx, row in manual_df.iterrows():
                         if row["status"] == "matched":
                             continue
@@ -3606,9 +3626,13 @@ def show_template_tab():
                             unit=None,
                             description=f"Автосоздано из клиентского шаблона: {col_name}",
                         )
-                        st.session_state[f"tmpl_type_{idx}"] = "attribute"
-                        st.session_state[f"tmpl_name_{idx}"] = code
+                        overrides[str(int(idx))] = {
+                            "source_type": "attribute",
+                            "source_name": code,
+                        }
                         created += 1
+                    if overrides:
+                        st.session_state["template_manual_overrides"] = overrides
                     st.success(f"Создано/обновлено master-атрибутов: {created}. Маппинг предзаполнен автоматически.")
                     st.rerun()
 
