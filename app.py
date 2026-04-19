@@ -1910,14 +1910,15 @@ def render_template_readiness(filled_df: pd.DataFrame, manual_rows: list[dict]) 
 
 def show_import_tab():
     st.subheader("Импорт каталога")
-    st.caption("Загрузи Excel поставщика или общий каталог, система создаст или обновит мастер-товары и покажет последнюю партию отдельно.")
+    st.caption("Логика этапа Импорт: 1) загрузка прайса 2) автопривязка к эталонным Ozon категориям 3) переход в Каталог для enrichment.")
     with st.expander("Инструкция по кнопкам раздела Импорт", expanded=False):
         st.markdown(
             """
-- `Скачать шаблон импорта поставщика (Excel)`: эталонный формат для поставщиков.
-- `Сохранить профиль`: записывает профиль поставщика (имя, сайт, URL template) в БД.
-- `Импортировать`: запускает импорт файла в мастер-каталог.
-- `После импорта автоматически привязывать товары к Ozon категориям`: применяет Ozon-эталон сразу после загрузки.
+1. `Скачать шаблон импорта поставщика (Excel)`: эталонный формат для поставщиков.
+2. `Сохранить профиль`: записывает профиль поставщика (имя, сайт, URL template) в БД.
+3. `Импортировать`: запускает импорт файла в мастер-каталог.
+4. `После импорта автоматически привязывать товары к Ozon категориям`: сразу фиксирует эталонную категорию/подкатегорию Ozon.
+5. Далее переходи в `Каталог` и запускай supplier enrichment уже по Ozon-структуре.
             """
         )
     st.download_button(
@@ -2138,22 +2139,22 @@ def show_catalog_tab():
     conn = get_db()
     parser_settings = load_parser_settings(conn)
     st.subheader("Каталог")
-    st.caption("Здесь быстрый контроль по каталогу: поиск, последняя загрузка, статус supplier enrichment и переход в карточку товара.")
+    st.caption("Рекомендуемый поток: 1) Ozon автопривязка категорий (эталон) -> 2) supplier enrichment -> 3) ручная доводка в Карточке.")
     st.info("Фильтр `Категория` учитывает Ozon-эталон в приоритете (ozon_category_path), затем категории из каталога.")
     with st.expander("Инструкция по кнопкам раздела Каталог", expanded=False):
         st.markdown(
             """
 - `◀ Назад` / `Вперед ▶`: постраничный переход по каталогу.
 - `Скачать текущую страницу Excel`: выгружает только отображаемую страницу.
-- `Обновить дубли по текущей выборке`: пересчет дублей по текущей странице.
-- `Обогатить поставщика по текущей странице`: парсинг supplier_url батчами с лимитом и таймаутом.
-- `Обогатить поставщика по всей выборке фильтра`: запуск enrichment не только по странице, а по всей текущей фильтрации.
-- `Автопривязать Ozon категории`: автоподбор Ozon категории.
+- `Автопривязать Ozon категории (текущая страница)`: сначала назначает эталонные Ozon категории/подкатегории.
 - `Перепривязать Ozon категории (force)`: автоподбор с перезаписью.
+- `Обогатить поставщика по текущей странице`: после Ozon-привязки тянет данные с supplier_url и fallback-источников.
+- `Обогатить поставщика по всей выборке фильтра`: тот же этап, но на всей фильтрации.
+- `Обновить дубли по текущей выборке`: пересчет дублей по текущей странице.
             """
         )
     with st.expander("Настройки парсинга и автообогащения", expanded=False):
-        st.caption("Пайплайн: supplier_url карточка -> Ozon fallback -> Яндекс.Маркет fallback -> web fallback -> category stats/defaults.")
+        st.caption("Пайплайн: Ozon эталон категории -> supplier_url карточка -> Ozon fallback -> Яндекс.Маркет fallback -> web fallback -> category stats/defaults.")
         # Защита от mixed numeric types на старых сессиях Streamlit:
         # если в session_state остался int/str от прошлой версии виджета, приводим типы заранее.
         def _coerce_state_number(key: str, default_value: object, caster):
@@ -2241,6 +2242,12 @@ def show_catalog_tab():
                 value=bool(st.session_state.get("catalog_enrich_include_without_url", True)),
                 key="catalog_enrich_include_without_url",
                 help="Если включено, товары без URL поставщика тоже пойдут в fallback-поиск.",
+            )
+            pre_ozon_before_enrich = st.checkbox(
+                "Перед обогащением сначала делать Ozon автопривязку",
+                value=bool(st.session_state.get("catalog_pre_ozon_before_enrich", True)),
+                key="catalog_pre_ozon_before_enrich",
+                help="Рекомендуется держать включенным: сначала Ozon категория (эталон), потом парсинг и fallback.",
             )
             ps_min_overlap = st.number_input(
                 "Мин. пересечение токенов названия",
@@ -2419,7 +2426,8 @@ def show_catalog_tab():
     st.caption(
         f"Кандидатов: страница {len(supplier_candidate_ids)}, вся выборка {len(filtered_supplier_candidate_ids)}. "
         f"включая без supplier_url: {len(all_filtered_candidate_ids)}. "
-        f"Лимиты: страница {int(max_bulk_enrich_page)}, выборка {int(max_bulk_enrich_filtered)}."
+        f"Лимиты: страница {int(max_bulk_enrich_page)}, выборка {int(max_bulk_enrich_filtered)}. "
+        f"Ozon перед обогащением: {'вкл' if bool(pre_ozon_before_enrich) else 'выкл'}."
     )
 
     def run_supplier_enrichment_batch(candidate_ids: list[int], run_limit: int, run_label: str) -> None:
@@ -2427,6 +2435,17 @@ def show_catalog_tab():
             st.info(f"Для режима `{run_label}` нет товаров для обогащения.")
             return
         target_ids = candidate_ids[: int(run_limit)]
+        ozon_processed = 0
+        ozon_assigned = 0
+        if bool(pre_ozon_before_enrich) and target_ids:
+            pre_res = bulk_assign_ozon_categories(
+                conn,
+                [int(x) for x in target_ids],
+                min_score=OZON_CATEGORY_MIN_SCORE,
+                force=False,
+            )
+            ozon_processed = int(pre_res.get("processed") or 0)
+            ozon_assigned = int(pre_res.get("assigned") or 0)
         progress = st.progress(0)
         processed = 0
         success = 0
@@ -2459,36 +2478,14 @@ def show_catalog_tab():
         skipped_by_limit = max(0, len(candidate_ids) - len(target_ids))
         st.success(
             f"[{run_label}] Обогащение завершено: обработано {processed}, успешно {success}, ошибок {failed}, "
-            f"fallback {used_fallback}, listing->product {resolved_from_listing}, отложено по лимиту {skipped_by_limit}."
+            f"fallback {used_fallback}, listing->product {resolved_from_listing}, "
+            f"Ozon автопривязка до парсинга: обработано {ozon_processed}, назначено {ozon_assigned}, "
+            f"отложено по лимиту {skipped_by_limit}."
         )
 
-    b1, b2, b3 = st.columns(3)
-    with b1:
-        if st.button("Обновить дубли по текущей выборке", help="Пересчитать кандидатов дублей только для товаров на текущей странице"):
-            total = 0
-            progress = st.progress(0)
-            for i, pid in enumerate(ids, start=1):
-                refresh_duplicates_for_product(conn, int(pid))
-                total += 1
-                progress.progress(i / len(ids))
-            st.success(f"Проверка дублей завершена: {total} товаров")
-    with b2:
-        if st.button("Обогатить поставщика по текущей странице", help="Запустить supplier parsing для товаров текущей страницы, где заполнен supplier_url"):
-            run_supplier_enrichment_batch(
-                candidate_ids=supplier_candidate_ids,
-                run_limit=int(max_bulk_enrich_page),
-                run_label="Текущая страница",
-            )
-    with b3:
-        if st.button("Обогатить поставщика по всей выборке фильтра", help="Запустить supplier parsing для всей выборки фильтров. При включенной опции обработаются и товары без supplier_url через fallback-поиск."):
-            run_supplier_enrichment_batch(
-                candidate_ids=effective_filtered_candidate_ids,
-                run_limit=int(max_bulk_enrich_filtered),
-                run_label="Вся выборка фильтра",
-            )
     cextra1, cextra2 = st.columns(2)
     with cextra1:
-        if st.button("Автопривязать Ozon категории (текущая страница)", help="Автоподбор эталонной Ozon категории для товаров этой страницы"):
+        if st.button("Автопривязать Ozon категории (текущая страница)", help="Сначала назначить эталонную Ozon категорию для товаров этой страницы"):
             res = bulk_assign_ozon_categories(conn, [int(x) for x in ids], min_score=OZON_CATEGORY_MIN_SCORE, force=False)
             if res.get("message"):
                 st.info(str(res["message"]))
@@ -2503,6 +2500,31 @@ def show_catalog_tab():
             else:
                 st.success(f"Ozon force-привязка: обработано {res['processed']}, привязано {res['assigned']}, пропущено {res['skipped']}")
             st.rerun()
+
+    b1, b2, b3 = st.columns(3)
+    with b1:
+        if st.button("Обогатить поставщика по текущей странице", help="Запустить supplier parsing для товаров текущей страницы с предварительной Ozon-автопривязкой (если включено)"):
+            run_supplier_enrichment_batch(
+                candidate_ids=supplier_candidate_ids,
+                run_limit=int(max_bulk_enrich_page),
+                run_label="Текущая страница",
+            )
+    with b2:
+        if st.button("Обогатить поставщика по всей выборке фильтра", help="Запустить supplier parsing для всей выборки фильтров с предварительной Ozon-автопривязкой (если включено). При включенной опции обработаются и товары без supplier_url через fallback-поиск."):
+            run_supplier_enrichment_batch(
+                candidate_ids=effective_filtered_candidate_ids,
+                run_limit=int(max_bulk_enrich_filtered),
+                run_label="Вся выборка фильтра",
+            )
+    with b3:
+        if st.button("Обновить дубли по текущей выборке", help="Пересчитать кандидатов дублей только для товаров на текущей странице"):
+            total = 0
+            progress = st.progress(0)
+            for i, pid in enumerate(ids, start=1):
+                refresh_duplicates_for_product(conn, int(pid))
+                total += 1
+                progress.progress(i / len(ids))
+            st.success(f"Проверка дублей завершена: {total} товаров")
 
     st.dataframe(with_ru_columns(df), use_container_width=True, hide_index=True)
 
@@ -2636,6 +2658,18 @@ def enrich_product_from_supplier(
     product = get_product(conn, product_id)
     if not product:
         return {"ok": False, "message": "Товар не найден"}
+    existing_ozon_desc = int(product["ozon_description_category_id"] or 0) if "ozon_description_category_id" in product.keys() else 0
+    existing_ozon_type = int(product["ozon_type_id"] or 0) if "ozon_type_id" in product.keys() else 0
+    if not (existing_ozon_desc > 0 and existing_ozon_type > 0):
+        # Эталонный порядок: сначала пытаемся привязать Ozon категорию, потом парсинг/обогащение.
+        try:
+            bulk_assign_ozon_categories(conn, [int(product_id)], min_score=OZON_CATEGORY_MIN_SCORE, force=False)
+            refreshed = get_product(conn, product_id)
+            if refreshed:
+                product = refreshed
+        except Exception:
+            # Не блокируем enrichment, если Ozon-кэш временно недоступен.
+            pass
     product_row = dict(product)
     settings = dict(parser_settings or load_parser_settings(conn))
     effective_timeout = float(timeout_seconds if timeout_seconds is not None else settings.get("timeout_seconds", 8.0))
@@ -2656,6 +2690,10 @@ def enrich_product_from_supplier(
             str(product["supplier_article"] or ""),
             str(product["name"] or ""),
             str(product["brand"] or ""),
+            str(product["category"] or ""),
+            str(product["subcategory"] or ""),
+            str(product["base_category"] or ""),
+            str(product["ozon_category_path"] or "") if "ozon_category_path" in product.keys() else "",
         ]
         parsed: dict = {}
         source_url = supplier_url
@@ -2712,6 +2750,8 @@ def enrich_product_from_supplier(
                 str(product["article"] or "").strip(),
                 str(product["supplier_article"] or "").strip(),
                 str(product["brand"] or "").strip(),
+                str(product["subcategory"] or "").strip(),
+                str(product["category"] or "").strip(),
                 "габариты",
             ]
             fallback_query = " ".join([p for p in fallback_query_parts if p])
