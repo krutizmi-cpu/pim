@@ -2683,6 +2683,49 @@ def show_ozon_tab():
     conn = get_db()
     st.subheader("Ozon")
     st.caption("Ozon для нас, это эталон структуры и атрибутов. Здесь синхронизируем дерево категорий и характеристики категорий в локальный кэш PIM.")
+    with st.expander("Инструкция по разделу Ozon и расшифровка кнопок", expanded=False):
+        st.markdown(
+            """
+**Порядок работы (рекомендуемый)**
+1. `Синхронизировать дерево категорий Ozon`
+2. `Запустить полный sync Ozon в фоне`
+3. Проверить блок покрытия sync (`Пары для проверки`, `Пары с атрибутами`, `Пропущено пар`, `%`)
+4. Если есть пропуски: `Досинхронизировать пропущенные категории`
+5. При необходимости импортировать в мастер: `Импортировать все атрибуты Ozon из кэша в PIM`
+
+**Кнопки верхнего блока**
+- `Синхронизировать дерево категорий Ozon`: обновляет локальный кэш дерева категорий Ozon.
+- `Запустить полный sync Ozon в фоне`: фоном проходит по категориям и подтягивает атрибуты, не блокируя UI.
+- `Импортировать все атрибуты Ozon из кэша в PIM`: переносит уже загруженные атрибуты из кэша в master-слой PIM.
+- `Досинхронизировать пропущенные категории`: подтягивает только те пары `cat/type`, где в кэше ещё нет атрибутов.
+
+**Кнопки по выбранной Ozon-категории**
+- `Синхронизировать атрибуты выбранной категории`: точечный sync атрибутов одной пары `cat/type`.
+- `Импортировать атрибуты Ozon в PIM`: перенос атрибутов выбранной пары в `attribute_definitions` и requirements.
+- `Создать стартовые mapping rules для Ozon`: создаёт стартовые правила маппинга для выбранной категории.
+- `Синхронизировать все справочники категории`: подтягивает dictionary-значения по всем dictionary-атрибутам категории.
+- `Синхронизировать значения справочника`: подтягивает dictionary-значения только для выбранного атрибута.
+
+**Кнопки массовой работы по товарам**
+- `Загрузить список из Excel`: выбирает товары из Excel для массовых действий.
+- `Проверить покрытие товара под Ozon`: отчёт по одному товару (готовность required-атрибутов).
+- `Заполнить Ozon-атрибуты из мастер-карточки`: автозаполнение Ozon-атрибутов по одному товару.
+- `Массовая проверка готовности по выбранным товарам`: отчёт готовности по группе товаров.
+- `Массово заполнить Ozon-атрибуты для выбранных`: автозаполнение по группе товаров.
+- `Сформировать dictionary gaps по выбранным (Excel)`: выгрузка проблем словарного сопоставления.
+- `Отправить batch в Ozon (/v1/product/attributes/update)`: отправка подготовленного batch в Ozon API.
+
+**Кнопки dictionary overrides**
+- `Сохранить dictionary override`: сохранить ручное правило raw -> dictionary value.
+- `Импортировать overrides из Excel`: массовая загрузка overrides из файла.
+- `Удалить выбранный override`: удалить сохранённый override.
+
+**Кнопки по jobs (журнал отправок)**
+- `Массово повторить jobs из Excel`: повторная отправка job_id из Excel.
+- `Повторить все jobs из фильтра`: повтор всех jobs текущего фильтра статуса.
+- `Повторить отправку job`: повтор одного выбранного job.
+            """
+        )
 
     c1, c2 = st.columns(2)
     with c1:
@@ -2698,12 +2741,12 @@ def show_ozon_tab():
 
     top1, top2, top3, top4 = st.columns(4)
     with top1:
-        if st.button("Синхронизировать дерево категорий Ozon", type="primary", disabled=not configured):
+        if st.button("Синхронизировать дерево категорий Ozon", type="primary", disabled=not configured, help="Обновить локальный кэш дерева категорий Ozon"):
             result = sync_category_tree(conn, client_id=client_id or None, api_key=api_key or None)
             st.success(f"Дерево категорий обновлено, записей: {result['total']}")
             st.rerun()
     with top2:
-        if st.button("Запустить полный sync Ozon в фоне", disabled=not configured):
+        if st.button("Запустить полный sync Ozon в фоне", disabled=not configured, help="Фоновая загрузка атрибутов по категориям Ozon"):
             ok, message = _start_ozon_bg_sync(client_id=client_id or "", api_key=api_key or "")
             if ok:
                 st.success(message)
@@ -2712,7 +2755,7 @@ def show_ozon_tab():
     with top3:
         category_limit = st.number_input("Сколько категорий показать", min_value=100, max_value=10000, value=2000, step=100)
     with top4:
-        if st.button("Импортировать все атрибуты Ozon из кэша в PIM"):
+        if st.button("Импортировать все атрибуты Ozon из кэша в PIM", help="Перенести атрибуты из ozon_attribute_cache в master-атрибуты PIM"):
             result = import_all_cached_attributes_to_pim(conn)
             st.success(
                 "Массовый импорт завершён: "
@@ -2775,7 +2818,7 @@ def show_ozon_tab():
             key="ozon_missing_sync_limit",
         )
     with qc4:
-        if st.button("Досинхронизировать пропущенные категории", disabled=not configured):
+        if st.button("Досинхронизировать пропущенные категории", disabled=not configured, help="Обработать только пары cat/type без атрибутов в кэше"):
             miss_result = sync_missing_category_attributes(
                 conn,
                 client_id=client_id or None,
