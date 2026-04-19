@@ -71,10 +71,10 @@ def fallback_search_product_data(query: str, timeout: float = 8.0, max_results: 
 from services.template_matching import auto_match_template_columns, apply_saved_mapping_rules, fill_template_dataframe, apply_client_validated_values, fill_template_workbook_bytes, dataframe_to_excel_bytes, detect_template_data_start_row, sanitize_template_xlsx_bytes
 from services.template_profiles import save_template_profile, list_template_profiles, get_template_profile_columns
 from services.readiness_service import analyze_template_readiness
-from services.supplier_profiles import list_supplier_profiles, upsert_supplier_profile
+from services.supplier_profiles import list_supplier_profiles, upsert_supplier_profile, ensure_default_supplier_profiles
 from services.ozon_api_service import is_configured, sync_category_tree, list_cached_categories, list_cached_category_pairs, get_ozon_cache_stats, get_ozon_sync_coverage, sync_missing_category_attributes, sync_category_attributes, list_cached_attributes, sync_attribute_dictionary_values, sync_all_category_dictionary_values, list_cached_attribute_values, import_cached_attributes_to_pim, import_all_cached_attributes_to_pim, suggest_mappings_for_cached_attributes, save_suggested_mappings, analyze_product_ozon_coverage, ensure_ozon_master_attributes, build_product_ozon_payload, materialize_product_ozon_attributes, preview_product_ozon_dictionary_gaps, build_product_ozon_api_attributes, build_bulk_ozon_api_payloads, build_ozon_attributes_update_request, submit_ozon_attributes_update, list_ozon_update_jobs, get_ozon_update_job, retry_ozon_update_job, list_ozon_update_job_items, save_dictionary_override, list_dictionary_overrides, delete_dictionary_override, sync_all_categories_and_attributes
 from services.ozon_category_match import bulk_assign_ozon_categories
-from services.dimension_fallback import infer_category_fields, infer_dimensions_from_catalog, is_dimension_payload_suspicious
+from services.dimension_fallback import infer_category_fields, infer_dimensions_from_catalog, infer_dimensions_from_category_defaults, is_dimension_payload_suspicious
 
 st.set_page_config(page_title="PIM", page_icon="📦", layout="wide")
 OZON_OFFER_ID_OPTIONS = ["article", "internal_article", "supplier_article"]
@@ -119,6 +119,7 @@ _OZON_SYNC_BG_STATE: dict[str, object] = {
 def get_db():
     conn = get_connection()
     init_db(conn)
+    ensure_default_supplier_profiles(conn)
     return conn
 
 
@@ -230,6 +231,139 @@ def list_catalog_categories(conn) -> list[str]:
         """
     ).fetchall()
     return [str(r["value"]) for r in rows if r["value"]]
+
+
+RU_COLUMN_MAP: dict[str, str] = {
+    "id": "ID",
+    "product_id": "ID товара",
+    "article": "Артикул",
+    "internal_article": "Внутренний артикул",
+    "supplier_article": "Артикул поставщика",
+    "name": "Название",
+    "brand": "Бренд",
+    "barcode": "Штрихкод",
+    "category": "Категория",
+    "base_category": "Базовая категория",
+    "subcategory": "Подкатегория",
+    "supplier_name": "Поставщик",
+    "supplier_url": "Ссылка поставщика",
+    "description": "Описание",
+    "image_url": "Фото",
+    "weight": "Вес, кг",
+    "gross_weight": "Вес брутто, кг",
+    "length": "Длина, см",
+    "width": "Ширина, см",
+    "height": "Высота, см",
+    "package_length": "Длина упаковки, см",
+    "package_width": "Ширина упаковки, см",
+    "package_height": "Высота упаковки, см",
+    "uom": "Ед. изм.",
+    "tnved_code": "ТН ВЭД",
+    "wheel_diameter_inch": "Диаметр колеса, inch",
+    "updated_at": "Обновлено",
+    "created_at": "Создано",
+    "import_batch_id": "Партия импорта",
+    "supplier_parse_status": "Статус парсинга",
+    "supplier_parse_comment": "Комментарий парсинга",
+    "ozon_description_category_id": "Ozon category_id",
+    "ozon_type_id": "Ozon type_id",
+    "ozon_category_path": "Ozon категория",
+    "ozon_category_confidence": "Уверенность Ozon",
+    "description_category_id": "Ozon category_id",
+    "type_id": "Ozon type_id",
+    "type_name": "Тип категории Ozon",
+    "category_name": "Название категории Ozon",
+    "full_path": "Путь категории Ozon",
+    "children_count": "Дочерних категорий",
+    "disabled": "Отключена",
+    "fetched_at": "Загружено",
+    "nodes": "Узлов",
+    "attribute_id": "ID атрибута",
+    "attribute_code": "Код атрибута",
+    "code": "Код атрибута",
+    "data_type": "Тип данных",
+    "scope": "Область",
+    "entity_type": "Сущность",
+    "is_required": "Обязательный",
+    "is_required_for_category": "Обязательный для категории",
+    "is_collection": "Множественный",
+    "is_multi_value": "Множественный",
+    "dictionary_id": "ID справочника",
+    "group_name": "Группа",
+    "max_value_count": "Макс. значений",
+    "value": "Значение",
+    "value_id": "ID значения",
+    "info": "Инфо",
+    "picture": "Картинка",
+    "field_name": "Поле",
+    "source_type": "Источник",
+    "source_url": "URL источника",
+    "source_value_raw": "Сырое значение",
+    "confidence": "Уверенность",
+    "source_name": "Источник значения",
+    "transform_rule": "Правило трансформации",
+    "matched_by": "Метод сопоставления",
+    "status": "Статус",
+}
+
+
+def with_ru_columns(df: pd.DataFrame, extra_map: dict[str, str] | None = None) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+    mapping = dict(RU_COLUMN_MAP)
+    if extra_map:
+        mapping.update(extra_map)
+    return df.rename(columns={c: mapping.get(c, c) for c in df.columns})
+
+
+def humanize_attribute_code(code: str | None) -> str:
+    text = str(code or "").strip()
+    if not text:
+        return ""
+    if text.startswith("ozon_attr_"):
+        attr_id = text.replace("ozon_attr_", "", 1)
+        return f"Ozon атрибут ID {attr_id}"
+    return " ".join(text.replace("_", " ").split()).capitalize()
+
+
+def _build_ozon_scope_labels(conn) -> dict[str, str]:
+    rows = conn.execute(
+        """
+        SELECT DISTINCT category_code
+        FROM channel_attribute_requirements
+        WHERE channel_code = 'ozon'
+          AND category_code IS NOT NULL
+          AND TRIM(category_code) <> ''
+        ORDER BY category_code
+        """
+    ).fetchall()
+    labels: dict[str, str] = {}
+    for row in rows:
+        code = str(row["category_code"])
+        labels[code] = code
+        if not code.startswith("ozon:"):
+            continue
+        parts = code.split(":")
+        if len(parts) != 3:
+            continue
+        try:
+            desc_id = int(parts[1])
+            type_id = int(parts[2])
+        except Exception:
+            continue
+        cat = conn.execute(
+            """
+            SELECT MAX(full_path) AS full_path, MAX(type_name) AS type_name
+            FROM ozon_category_cache
+            WHERE description_category_id = ? AND type_id = ?
+            """,
+            (desc_id, type_id),
+        ).fetchone()
+        full_path = str(cat["full_path"] or "").strip() if cat else ""
+        type_name = str(cat["type_name"] or "").strip() if cat else ""
+        if full_path or type_name:
+            labels[code] = f"{full_path or '-'} | {type_name or '-'} | cat={desc_id}, type={type_id}"
+    return labels
 
 
 def _is_blank_value(value: object) -> bool:
@@ -1257,12 +1391,12 @@ def show_import_tab():
 
             st.markdown("### Последняя загруженная партия")
             if not batch_df.empty:
-                st.dataframe(batch_df, use_container_width=True, hide_index=True)
+                st.dataframe(with_ru_columns(batch_df), use_container_width=True, hide_index=True)
             else:
                 st.info("В текущей партии нет отображаемых записей. Попробуй ручной выбор листа и строки заголовка.")
 
             if result.duplicates:
-                st.dataframe(pd.DataFrame(result.duplicates), use_container_width=True)
+                st.dataframe(with_ru_columns(pd.DataFrame(result.duplicates)), use_container_width=True)
 
 
 def show_catalog_tab():
@@ -1500,7 +1634,7 @@ def show_catalog_tab():
                 st.success(f"Ozon force-привязка: обработано {res['processed']}, привязано {res['assigned']}, пропущено {res['skipped']}")
             st.rerun()
 
-    st.dataframe(df, use_container_width=True, hide_index=True)
+    st.dataframe(with_ru_columns(df), use_container_width=True, hide_index=True)
 
     if selected_id:
         st.session_state["selected_product_id"] = int(selected_id)
@@ -1634,8 +1768,6 @@ def enrich_product_from_supplier(
     product_row = dict(product)
 
     supplier_url = (product["supplier_url"] or "").strip() if product["supplier_url"] else ""
-    if not supplier_url:
-        return {"ok": False, "message": "У товара нет supplier_url"}
 
     try:
         parse_hints = [
@@ -1644,17 +1776,35 @@ def enrich_product_from_supplier(
             str(product["name"] or ""),
             str(product["brand"] or ""),
         ]
-        parsed = parse_supplier_product_page(
-            supplier_url,
-            hints=parse_hints,
-            timeout=float(timeout_seconds),
-            max_hops=1,
-        )
-        source_url = parsed.get("resolved_url") or supplier_url
+        parsed: dict = {}
+        source_url = supplier_url
         source_type = "supplier_page"
         used_fallback = False
         used_stats_fallback = False
+        used_category_defaults = False
         field_source_types: dict[str, str] = {}
+
+        if supplier_url:
+            # Support supplier search pages like https://velocitygroup.ru/catalog/?q=
+            effective_supplier_url = supplier_url
+            low_url = effective_supplier_url.lower()
+            if ("?q=" in low_url) and low_url.rstrip().endswith("?q="):
+                query_candidate = str(product.get("supplier_article") or product.get("article") or product.get("name") or "").strip()
+                if query_candidate:
+                    effective_supplier_url = f"{effective_supplier_url}{quote(query_candidate, safe='')}"
+            try:
+                parsed = parse_supplier_product_page(
+                    effective_supplier_url,
+                    hints=parse_hints,
+                    timeout=float(timeout_seconds),
+                    max_hops=1,
+                )
+                source_url = parsed.get("resolved_url") or effective_supplier_url
+            except Exception as parse_error:
+                parsed = {}
+                source_type = "web_search_fallback"
+                source_url = effective_supplier_url
+                # Keep flow alive: fallback to internet search below.
 
         dim_fields = [
             "weight",
@@ -1667,7 +1817,7 @@ def enrich_product_from_supplier(
             "package_height",
         ]
         has_dims = any(parsed.get(k) not in (None, "", 0, 0.0) for k in dim_fields)
-        need_fallback = (not has_meaningful_supplier_data(parsed)) or bool(parsed.get("listing_only")) or (not has_dims) or is_dimension_payload_suspicious(parsed)
+        need_fallback = (not has_meaningful_supplier_data(parsed)) or bool(parsed.get("listing_only")) or (not has_dims) or is_dimension_payload_suspicious(parsed) or (not supplier_url)
 
         if need_fallback:
             fallback_query_parts = [
@@ -1713,6 +1863,9 @@ def enrich_product_from_supplier(
                 ]:
                     if fallback.get(key) not in (None, "", 0, 0.0):
                         field_source_types[key] = "web_search_fallback"
+            elif not supplier_url:
+                source_type = "web_search_fallback"
+                source_url = source_url or ""
 
         category_inferred = infer_category_fields(
             {
@@ -1751,9 +1904,26 @@ def enrich_product_from_supplier(
                         parsed[key] = value
                         field_source_types[key] = "category_stats_fallback"
                 used_stats_fallback = True
+            else:
+                defaults_fallback = infer_dimensions_from_category_defaults(
+                    conn,
+                    {
+                        "category": parsed.get("category") or product_row.get("category"),
+                        "base_category": parsed.get("base_category") or product_row.get("base_category"),
+                        "subcategory": parsed.get("subcategory") or product_row.get("subcategory"),
+                        "wheel_diameter_inch": parsed.get("wheel_diameter_inch") or product_row.get("wheel_diameter_inch"),
+                    },
+                )
+                if defaults_fallback.get("found"):
+                    for key, value in (defaults_fallback.get("values") or {}).items():
+                        if parsed.get(key) in (None, "", 0, 0.0):
+                            parsed[key] = value
+                            field_source_types[key] = "category_defaults_fallback"
+                    used_category_defaults = True
 
         if not has_meaningful_supplier_data(parsed):
-            if not used_stats_fallback:
+            has_any_dims_after_fallback = any(parsed.get(k) not in (None, "", 0, 0.0) for k in dim_fields)
+            if not (used_stats_fallback or used_category_defaults or has_any_dims_after_fallback):
                 conn.execute(
                     """
                     UPDATE products
@@ -1873,6 +2043,8 @@ def enrich_product_from_supplier(
             parse_comment += "; web_fallback=1"
         if used_stats_fallback:
             parse_comment += "; category_stats_fallback=1"
+        if used_category_defaults:
+            parse_comment += "; category_defaults_fallback=1"
 
         if updates:
             set_clause = ", ".join([f"{k} = ?" for k in updates.keys()])
@@ -1905,6 +2077,8 @@ def enrich_product_from_supplier(
                         if row_source_type == "web_search_fallback"
                         else 0.38
                         if row_source_type == "category_stats_fallback"
+                        else 0.33
+                        if row_source_type == "category_defaults_fallback"
                         else 0.65
                         if row_source_type == "name_category_inference"
                         else 0.45
@@ -1930,9 +2104,10 @@ def enrich_product_from_supplier(
         ozon_msg = f", Ozon category match: {ozon_match.get('assigned', 0)}" if ozon_match.get("processed") else ""
         fallback_msg = ", использован web fallback" if used_fallback else ""
         stats_msg = ", использован category-stats fallback" if used_stats_fallback else ""
+        defaults_msg = ", использованы category defaults" if used_category_defaults else ""
         return {
             "ok": True,
-            "message": f"Обогащение завершено, обновлено полей: {len(updates)}, атрибутов сохранено: {attributes_saved}{fallback_msg}{stats_msg}{skipped_msg}{skipped_attr_msg}{ozon_msg}",
+            "message": f"Обогащение завершено, обновлено полей: {len(updates)}, атрибутов сохранено: {attributes_saved}{fallback_msg}{stats_msg}{defaults_msg}{skipped_msg}{skipped_attr_msg}{ozon_msg}",
             "updates": updates,
             "attributes": parsed.get("attributes", {}),
             "image_urls": parsed.get("image_urls", []),
@@ -1985,6 +2160,64 @@ def show_product_tab():
         )
     supplier_values = list_distinct_values(conn, "supplier_name")
     category_values = list_catalog_categories(conn)
+    supplier_profiles = list_supplier_profiles(conn, only_active=True)
+    supplier_profile_map = {str(p["supplier_name"]): p for p in supplier_profiles}
+
+    with st.expander("Источник данных поставщика (URL template / профиль)", expanded=False):
+        sp1, sp2, sp3 = st.columns([2, 3, 1])
+        with sp1:
+            profile_name = st.selectbox(
+                "Профиль поставщика",
+                options=[""] + sorted(supplier_profile_map.keys()),
+                index=(sorted(supplier_profile_map.keys()).index(str(product["supplier_name"])) + 1) if (product["supplier_name"] and str(product["supplier_name"]) in supplier_profile_map) else 0,
+                key=f"product_supplier_profile_{int(product_id)}",
+            )
+        with sp2:
+            selected_profile_template = (
+                supplier_profile_map.get(profile_name, {}).get("url_template")
+                if profile_name
+                else ""
+            )
+            supplier_url_template = st.text_input(
+                "URL template для товара",
+                value=selected_profile_template or "",
+                placeholder="https://site.ru/catalog/?q={supplier_article_q}",
+                key=f"product_supplier_url_template_{int(product_id)}",
+                help="Поддерживаются плейсхолдеры: {article}, {supplier_article}, {name}, {code} и *_q.",
+            )
+        with sp3:
+            if st.button("Подставить URL", key=f"product_apply_supplier_url_{int(product_id)}"):
+                render_payload = {
+                    "article": product["article"],
+                    "supplier_article": product["supplier_article"],
+                    "name": product["name"],
+                    "category": product["category"],
+                    "code": product["supplier_article"] or product["article"],
+                }
+                generated_url = render_supplier_url(supplier_url_template, render_payload) if supplier_url_template else None
+                if generated_url:
+                    save_product(
+                        conn,
+                        int(product_id),
+                        {
+                            "supplier_name": profile_name or product["supplier_name"] or None,
+                            "supplier_url": generated_url,
+                        },
+                    )
+                    save_field_source(
+                        conn=conn,
+                        product_id=int(product_id),
+                        field_name="supplier_url",
+                        source_type="manual",
+                        source_value_raw=generated_url,
+                        source_url=None,
+                        confidence=1.0,
+                        is_manual=True,
+                    )
+                    st.success("URL поставщика подставлен из шаблона профиля.")
+                    st.rerun()
+                else:
+                    st.warning("Не удалось собрать URL. Проверь шаблон и поля товара.")
 
     top1, top2, top3, top4 = st.columns(4)
     top1.metric("Артикул", product["article"] or "-")
@@ -2042,6 +2275,83 @@ def show_product_tab():
         st.info(f"Парсинг поставщика запускался. Последний запуск: {parsed_at}")
     if parse_comment:
         st.caption(f"Комментарий: {parse_comment}")
+
+    ozon_desc_id = int(product["ozon_description_category_id"] or 0)
+    ozon_type_id = int(product["ozon_type_id"] or 0)
+    if ozon_desc_id > 0 and ozon_type_id > 0:
+        st.markdown("### Ozon-атрибуты выбранной категории")
+        oz1, oz2 = st.columns([1, 1])
+        with oz1:
+            if st.button("Подтянуть Ozon-атрибуты категории в справочник", key=f"product_import_ozon_attrs_{int(product_id)}"):
+                import_result = import_cached_attributes_to_pim(
+                    conn,
+                    description_category_id=ozon_desc_id,
+                    type_id=ozon_type_id,
+                )
+                st.success(
+                    f"Импорт в справочник выполнен: {int(import_result.get('imported') or 0)} атрибутов, "
+                    f"required: {int(import_result.get('required') or 0)}."
+                )
+                st.rerun()
+        with oz2:
+            if st.button("Синхронизировать атрибуты категории из Ozon API", key=f"product_sync_ozon_attrs_{int(product_id)}"):
+                st.info("Для синхронизации по API используй вкладку Ozon (там задаются Ozon Client ID / API Key для сессии).")
+
+        category_code = f"ozon:{ozon_desc_id}:{ozon_type_id}"
+        ozon_req_rows = conn.execute(
+            """
+            SELECT
+                car.attribute_code,
+                car.is_required,
+                ad.name AS attribute_name,
+                ad.data_type,
+                ad.unit,
+                COALESCE(pav.value_text, CAST(pav.value_number AS TEXT), CAST(pav.value_boolean AS TEXT), pav.value_json) AS current_value
+            FROM channel_attribute_requirements car
+            JOIN attribute_definitions ad
+              ON ad.code = car.attribute_code
+            LEFT JOIN product_attribute_values pav
+              ON pav.product_id = ?
+             AND pav.attribute_code = car.attribute_code
+             AND IFNULL(pav.channel_code, '') = ''
+            WHERE car.channel_code = 'ozon'
+              AND car.category_code = ?
+            ORDER BY car.is_required DESC, ad.name
+            """,
+            (int(product_id), category_code),
+        ).fetchall()
+        if ozon_req_rows:
+            req_df = pd.DataFrame([dict(r) for r in ozon_req_rows])
+            req_df["attribute_code_ru"] = req_df["attribute_code"].map(humanize_attribute_code)
+            req_df["filled"] = req_df["current_value"].map(lambda x: 0 if x in (None, "", "None") else 1)
+            r1, r2, r3 = st.columns(3)
+            r1.metric("Всего атрибутов категории", int(len(req_df)))
+            r2.metric("Required", int(req_df["is_required"].fillna(0).astype(int).sum()))
+            r3.metric("Заполнено значениями", int(req_df["filled"].sum()))
+            st.dataframe(
+                with_ru_columns(
+                    req_df[
+                        [
+                            "attribute_code",
+                            "attribute_code_ru",
+                            "attribute_name",
+                            "data_type",
+                            "unit",
+                            "is_required",
+                            "current_value",
+                        ]
+                    ],
+                    extra_map={
+                        "attribute_code_ru": "Код атрибута (рус.)",
+                        "attribute_name": "Название атрибута",
+                        "current_value": "Текущее значение",
+                    },
+                ),
+                use_container_width=True,
+                hide_index=True,
+            )
+        else:
+            st.info("Для этой Ozon-категории в PIM пока нет импортированных attribute requirements.")
 
     with st.form("product_form"):
         c1, c2, c3 = st.columns(3)
@@ -2168,12 +2478,22 @@ def show_product_tab():
             "confidence": src.get("confidence") if src else None,
             "created_at": src.get("created_at") if src else None,
         })
-    st.dataframe(pd.DataFrame(source_summary), use_container_width=True, hide_index=True)
+    st.dataframe(with_ru_columns(pd.DataFrame(source_summary)), use_container_width=True, hide_index=True)
 
     st.markdown("### Все источники данных")
     sources = get_field_sources(conn, int(product_id))
     if sources:
-        st.dataframe(pd.DataFrame(sources), use_container_width=True, hide_index=True)
+        src_df = pd.DataFrame(sources)
+        if not src_df.empty and "field_name" in src_df.columns:
+            src_df["field_name_ru"] = src_df["field_name"].map(humanize_attribute_code)
+        st.dataframe(
+            with_ru_columns(
+                src_df,
+                extra_map={"field_name_ru": "Поле (рус.)"},
+            ),
+            use_container_width=True,
+            hide_index=True,
+        )
     else:
         st.caption("Источники данных пока не записаны")
 
@@ -2185,17 +2505,8 @@ def show_attributes_tab():
     product_id = st.session_state.get("selected_product_id")
     st.caption("Справочник атрибутов можно фильтровать по категории Ozon, чтобы работать с большим количеством полей без шума.")
 
-    category_rows = conn.execute(
-        """
-        SELECT DISTINCT category_code
-        FROM channel_attribute_requirements
-        WHERE channel_code = 'ozon'
-          AND category_code IS NOT NULL
-          AND TRIM(category_code) <> ''
-        ORDER BY category_code
-        """
-    ).fetchall()
-    category_scope_options = ["Все"] + [str(r["category_code"]) for r in category_rows]
+    scope_labels = _build_ozon_scope_labels(conn)
+    category_scope_options = ["Все"] + sorted(scope_labels.keys())
 
     f1, f2, f3 = st.columns([2, 2, 2])
     with f1:
@@ -2203,7 +2514,13 @@ def show_attributes_tab():
     with f2:
         attr_source_filter = st.selectbox("Источник атрибута", options=["Все", "Ozon", "Кастомные"], index=0, key="attrs_source_filter")
     with f3:
-        category_scope = st.selectbox("Категория (scope)", options=category_scope_options, index=0, key="attrs_category_scope")
+        category_scope = st.selectbox(
+            "Категория (scope)",
+            options=category_scope_options,
+            index=0,
+            key="attrs_category_scope",
+            format_func=lambda x: "Все" if x == "Все" else scope_labels.get(x, x),
+        )
 
     required_map: dict[str, int] = {}
     if category_scope != "Все":
@@ -2249,7 +2566,18 @@ def show_attributes_tab():
             m2.metric("Ozon", int(defs_df["code"].astype(str).str.startswith("ozon_attr_").sum()))
             required_count = int(defs_df["is_required_for_category"].fillna(0).astype(int).sum()) if "is_required_for_category" in defs_df.columns else 0
             m3.metric("Required (scope)", required_count)
-            st.dataframe(defs_df, use_container_width=True, hide_index=True)
+            defs_df = defs_df.copy()
+            defs_df["code_ru"] = defs_df["code"].map(humanize_attribute_code)
+            st.dataframe(
+                with_ru_columns(
+                    defs_df,
+                    extra_map={
+                        "code_ru": "Код атрибута (рус.)",
+                    },
+                ),
+                use_container_width=True,
+                hide_index=True,
+            )
         else:
             st.info("Справочник атрибутов пока пуст.")
 
@@ -2286,7 +2614,19 @@ def show_attributes_tab():
             if not values_df.empty and category_scope != "Все":
                 values_df = values_df[values_df["attribute_code"].astype(str).isin(set(required_map.keys()))]
             if not values_df.empty:
-                st.dataframe(values_df, use_container_width=True, hide_index=True)
+                values_df = values_df.copy()
+                values_df["attribute_code_ru"] = values_df["attribute_code"].map(humanize_attribute_code)
+                st.dataframe(
+                    with_ru_columns(
+                        values_df,
+                        extra_map={
+                            "attribute_code_ru": "Код атрибута (рус.)",
+                            "value": "Значение",
+                        },
+                    ),
+                    use_container_width=True,
+                    hide_index=True,
+                )
             else:
                 st.caption("По текущему фильтру значения атрибутов не найдены.")
 
@@ -2295,9 +2635,14 @@ def show_attributes_tab():
                 allowed_codes = set(required_map.keys())
                 defs = [d for d in defs if str(d.get("code")) in allowed_codes]
             def_codes = [d["code"] for d in defs] if defs else []
+            def_labels = {code: humanize_attribute_code(code) for code in def_codes}
 
             with st.form("set_product_attr"):
-                attribute_code = st.selectbox("Атрибут", def_codes) if def_codes else st.text_input("Атрибут")
+                attribute_code = (
+                    st.selectbox("Атрибут", def_codes, format_func=lambda x: f"{def_labels.get(x, x)} ({x})")
+                    if def_codes
+                    else st.text_input("Атрибут")
+                )
                 value = st.text_input("Значение")
                 locale = st.text_input("Locale", value="")
                 channel_code = st.text_input("Channel code", value="")
@@ -2855,7 +3200,7 @@ def show_ozon_tab():
         )
         missing_preview = coverage.get("missing_preview") or []
         if missing_preview:
-            st.dataframe(pd.DataFrame(missing_preview), use_container_width=True, hide_index=True)
+            st.dataframe(with_ru_columns(pd.DataFrame(missing_preview)), use_container_width=True, hide_index=True)
     else:
         st.success("Покрытие Ozon-sync полное для выбранных условий проверки.")
 
@@ -2872,13 +3217,13 @@ def show_ozon_tab():
     if categories:
         cat_df = pd.DataFrame(categories)
         st.markdown("### Кэш категорий Ozon")
-        st.dataframe(cat_df[[c for c in ["description_category_id", "category_name", "full_path", "type_id", "type_name", "disabled", "fetched_at"] if c in cat_df.columns]], use_container_width=True, hide_index=True)
+        st.dataframe(with_ru_columns(cat_df[[c for c in ["description_category_id", "category_name", "full_path", "type_id", "type_name", "disabled", "fetched_at"] if c in cat_df.columns]]), use_container_width=True, hide_index=True)
 
         if category_pairs:
             pairs_df = pd.DataFrame(category_pairs)
             st.markdown("### Уникальные пары категорий Ozon (cat/type)")
             st.dataframe(
-                pairs_df[[c for c in ["description_category_id", "type_id", "full_path", "type_name", "disabled", "nodes", "fetched_at"] if c in pairs_df.columns]],
+                with_ru_columns(pairs_df[[c for c in ["description_category_id", "type_id", "full_path", "type_name", "disabled", "nodes", "fetched_at"] if c in pairs_df.columns]]),
                 use_container_width=True,
                 hide_index=True,
             )
@@ -2952,10 +3297,21 @@ def show_ozon_tab():
                     mm3.metric("Required без маппинга", int(((mapping_df["is_required"] == 1) & (mapping_df["status"] != "matched")).sum()))
 
                     st.markdown("### Предлагаемые Ozon mapping rules")
-                    st.dataframe(mapping_df[[c for c in ["attribute_id", "name", "group_name", "is_required", "source_type", "source_name", "transform_rule", "matched_by", "status"] if c in mapping_df.columns]], use_container_width=True, hide_index=True)
+                    st.dataframe(
+                        with_ru_columns(mapping_df[[c for c in ["attribute_id", "name", "group_name", "is_required", "source_type", "source_name", "transform_rule", "matched_by", "status"] if c in mapping_df.columns]]),
+                        use_container_width=True,
+                        hide_index=True,
+                    )
 
                 st.markdown("### Атрибуты выбранной категории")
-                st.dataframe(attr_df[[c for c in ["attribute_id", "name", "group_name", "type", "dictionary_id", "is_required", "is_collection", "max_value_count", "fetched_at"] if c in attr_df.columns]], use_container_width=True, hide_index=True)
+                attr_show = attr_df[[c for c in ["attribute_id", "name", "group_name", "type", "dictionary_id", "is_required", "is_collection", "max_value_count", "fetched_at"] if c in attr_df.columns]].copy()
+                if "attribute_id" in attr_show.columns:
+                    attr_show["attribute_code_ru"] = attr_show["attribute_id"].map(lambda x: f"Ozon атрибут ID {int(x)}" if pd.notna(x) else "")
+                st.dataframe(
+                    with_ru_columns(attr_show, extra_map={"attribute_code_ru": "Код атрибута (рус.)", "type": "Тип"}),
+                    use_container_width=True,
+                    hide_index=True,
+                )
 
                 dictionary_attrs = [row for row in attributes if int(row.get("dictionary_id") or 0) > 0]
                 if dictionary_attrs:
@@ -3011,7 +3367,7 @@ def show_ozon_tab():
                     )
                     if dict_values:
                         dict_df = pd.DataFrame(dict_values)
-                        st.dataframe(dict_df[[c for c in ["value_id", "value", "info", "picture", "fetched_at"] if c in dict_df.columns]], use_container_width=True, hide_index=True)
+                        st.dataframe(with_ru_columns(dict_df[[c for c in ["value_id", "value", "info", "picture", "fetched_at"] if c in dict_df.columns]]), use_container_width=True, hide_index=True)
                     else:
                         st.caption("Значения этого справочника ещё не загружены в кэш.")
 

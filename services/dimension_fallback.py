@@ -313,3 +313,75 @@ def infer_dimensions_from_catalog(
             }
 
     return {"found": False, "scope": None, "sample_rows": 0, "samples_by_field": {}, "values": {}}
+
+
+def infer_dimensions_from_category_defaults(conn: sqlite3.Connection, product: dict[str, Any]) -> dict[str, Any]:
+    base_category = str(product.get("base_category") or product.get("category") or "").strip()
+    subcategory = str(product.get("subcategory") or "").strip()
+    wheel_diameter_inch = product.get("wheel_diameter_inch")
+
+    candidates = [
+        (
+            "base+sub+wheel",
+            """
+            SELECT *
+            FROM category_defaults
+            WHERE LOWER(TRIM(base_category)) = LOWER(TRIM(?))
+              AND LOWER(TRIM(IFNULL(subcategory, ''))) = LOWER(TRIM(?))
+              AND wheel_diameter_inch = ?
+            ORDER BY priority ASC, id ASC
+            LIMIT 1
+            """,
+            [base_category, subcategory, float(wheel_diameter_inch) if wheel_diameter_inch is not None else None],
+        ),
+        (
+            "base+sub",
+            """
+            SELECT *
+            FROM category_defaults
+            WHERE LOWER(TRIM(base_category)) = LOWER(TRIM(?))
+              AND LOWER(TRIM(IFNULL(subcategory, ''))) = LOWER(TRIM(?))
+            ORDER BY priority ASC, id ASC
+            LIMIT 1
+            """,
+            [base_category, subcategory],
+        ),
+        (
+            "base_only",
+            """
+            SELECT *
+            FROM category_defaults
+            WHERE LOWER(TRIM(base_category)) = LOWER(TRIM(?))
+            ORDER BY priority ASC, id ASC
+            LIMIT 1
+            """,
+            [base_category],
+        ),
+    ]
+
+    for scope_name, sql, params in candidates:
+        if not base_category:
+            continue
+        if scope_name in {"base+sub+wheel", "base+sub"} and not subcategory:
+            continue
+        row = conn.execute(sql, params).fetchone()
+        if not row:
+            continue
+        values = {
+            "length": row["length_cm"],
+            "width": row["width_cm"],
+            "height": row["height_cm"],
+            "weight": row["weight_kg"],
+            "package_length": row["package_length_cm"],
+            "package_width": row["package_width_cm"],
+            "package_height": row["package_height_cm"],
+            "gross_weight": row["package_weight_kg"],
+        }
+        clean_values = {k: float(v) for k, v in values.items() if _good_num(v)}
+        if clean_values:
+            return {
+                "found": True,
+                "scope": scope_name,
+                "values": clean_values,
+            }
+    return {"found": False, "scope": None, "values": {}}
