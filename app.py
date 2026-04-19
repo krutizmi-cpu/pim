@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from io import BytesIO
 import math
 from pathlib import Path
@@ -575,13 +576,16 @@ def render_section_help() -> None:
 - `Автопривязать Ozon категории`: назначить эталонную Ozon-категорию.
 
 **Карточка**
+- `Поиск товара / Категория / Подкатегория / Поставщик`: выбрать нужный товар прямо в разделе Карточка.
 - `Спарсить поставщика`: мягкое обогащение (не перетирает сильные значения).
 - `Перезаполнить из поставщика`: жесткое обогащение с перезаписью.
 - `Подобрать Ozon категорию`: автоподбор эталонной Ozon-категории.
 - `Перепривязать Ozon категорию (force)`: повторный подбор с перезаписью.
+- `Атрибуты для заполнения`: редактирование Ozon и клиентских атрибутов по выбранному каналу/категории.
 - `Сохранить карточку`: сохранить ручные изменения в мастер-карточке.
 
 **Клиентский шаблон**
+- `Авторегистрация шаблона`: колонки автоматически добавляются в атрибуты и требования канала/категории.
 - `Сохранить mapping rules`: сохранить правила соответствия колонок.
 - `Сохранить профиль шаблона`: сохранить тип шаблона клиента для повторной выгрузки.
 - `Добавить несматченные в master-атрибуты`: расширить мастер-карточку новыми полями.
@@ -719,6 +723,174 @@ def load_products(
 
 def get_product(conn, product_id: int):
     return conn.execute("SELECT * FROM products WHERE id = ?", (product_id,)).fetchone()
+
+
+def find_products_for_card(
+    conn,
+    search: str = "",
+    category: str = "",
+    subcategory: str = "",
+    supplier: str = "",
+    limit: int = 5000,
+) -> list[dict]:
+    where: list[str] = []
+    params: list[object] = []
+    if search:
+        where.append("(name LIKE ? OR article LIKE ? OR internal_article LIKE ? OR supplier_article LIKE ?)")
+        s = f"%{search.strip()}%"
+        params.extend([s, s, s, s])
+    if category and category != "Все":
+        where.append("(LOWER(TRIM(category)) = LOWER(TRIM(?)) OR LOWER(TRIM(base_category)) = LOWER(TRIM(?)))")
+        params.extend([category, category])
+    if subcategory and subcategory != "Все":
+        where.append("LOWER(TRIM(subcategory)) = LOWER(TRIM(?))")
+        params.append(subcategory)
+    if supplier and supplier != "Все":
+        where.append("LOWER(TRIM(supplier_name)) = LOWER(TRIM(?))")
+        params.append(supplier)
+
+    sql = """
+        SELECT
+            id, article, internal_article, supplier_article, name,
+            category, base_category, subcategory, supplier_name
+        FROM products
+    """
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY id DESC LIMIT ?"
+    params.append(int(limit))
+    rows = conn.execute(sql, params).fetchall()
+    return [dict(r) for r in rows]
+
+
+def list_channel_codes(conn) -> list[str]:
+    rows = conn.execute(
+        """
+        SELECT DISTINCT channel_code
+        FROM (
+            SELECT channel_code FROM channel_profiles
+            UNION ALL
+            SELECT channel_code FROM channel_attribute_requirements
+            UNION ALL
+            SELECT channel_code FROM channel_mapping_rules
+        )
+        WHERE channel_code IS NOT NULL
+          AND TRIM(channel_code) <> ''
+        ORDER BY channel_code
+        """
+    ).fetchall()
+    return [str(r["channel_code"]) for r in rows if r["channel_code"]]
+
+
+def list_channel_category_codes(conn, channel_code: str) -> list[str]:
+    rows = conn.execute(
+        """
+        SELECT DISTINCT category_code
+        FROM (
+            SELECT category_code
+            FROM channel_attribute_requirements
+            WHERE channel_code = ?
+            UNION ALL
+            SELECT category_code
+            FROM channel_mapping_rules
+            WHERE channel_code = ?
+        )
+        WHERE category_code IS NOT NULL
+          AND TRIM(category_code) <> ''
+        ORDER BY category_code
+        """,
+        (channel_code, channel_code),
+    ).fetchall()
+    return [str(r["category_code"]) for r in rows if r["category_code"]]
+
+
+def ensure_template_columns_registered(
+    conn,
+    channel_code: str,
+    category_code: str | None,
+    template_columns: list[object],
+) -> dict[str, int]:
+    if not channel_code:
+        return {"attributes": 0, "requirements": 0, "rules": 0}
+
+    created_attributes = 0
+    created_requirements = 0
+    created_rules = 0
+
+    for idx, col in enumerate(template_columns):
+        col_name = str(col or "").strip()
+        if not col_name:
+            continue
+        code = to_attribute_code(col_name)
+        if not code:
+            continue
+
+        existed_attr = conn.execute(
+            "SELECT 1 FROM attribute_definitions WHERE code = ?",
+            (code,),
+        ).fetchone()
+        upsert_attribute_definition(
+            conn=conn,
+            code=code,
+            name=col_name,
+            data_type="text",
+            scope="master",
+            unit=None,
+            description=f"Автосоздано из клиентского шаблона: {col_name}",
+        )
+        if not existed_attr:
+            created_attributes += 1
+
+        existed_req = conn.execute(
+            """
+            SELECT 1
+            FROM channel_attribute_requirements
+            WHERE channel_code = ?
+              AND IFNULL(category_code, '') = IFNULL(?, '')
+              AND attribute_code = ?
+            """,
+            (channel_code, category_code, code),
+        ).fetchone()
+        upsert_channel_attribute_requirement(
+            conn=conn,
+            channel_code=channel_code,
+            category_code=category_code or None,
+            attribute_code=code,
+            is_required=0,
+            sort_order=1000 + int(idx),
+            notes="Автодобавлено из клиентского шаблона",
+        )
+        if not existed_req:
+            created_requirements += 1
+
+        existed_rule = conn.execute(
+            """
+            SELECT 1
+            FROM channel_mapping_rules
+            WHERE channel_code = ?
+              AND IFNULL(category_code, '') = IFNULL(?, '')
+              AND target_field = ?
+            """,
+            (channel_code, category_code, col_name),
+        ).fetchone()
+        if not existed_rule:
+            upsert_channel_mapping_rule(
+                conn=conn,
+                channel_code=channel_code,
+                category_code=category_code or None,
+                target_field=col_name,
+                source_type="attribute",
+                source_name=code,
+                transform_rule=None,
+                is_required=0,
+            )
+            created_rules += 1
+
+    return {
+        "attributes": created_attributes,
+        "requirements": created_requirements,
+        "rules": created_rules,
+    }
 
 
 def save_product(conn, product_id: int, payload: dict):
@@ -2164,24 +2336,89 @@ def enrich_product_from_supplier(
 
 
 def show_product_tab():
-    product_id = st.session_state.get("selected_product_id")
-    if not product_id:
-        st.info("Сначала выбери товар во вкладке Каталог")
+    conn = get_db()
+    st.subheader("Карточка товара")
+    st.caption("Мастер-карточка должна быть единым источником правды. Здесь можно вручную поправить данные или обогатить их с сайта поставщика.")
+    st.markdown("### Выбор товара для редактирования")
+    fs1, fs2, fs3, fs4 = st.columns([3, 2, 2, 2])
+    with fs1:
+        card_search = st.text_input(
+            "Поиск товара",
+            value=st.session_state.get("card_product_search", ""),
+            placeholder="Название / артикул / внутренний артикул / артикул поставщика",
+            key="card_product_search",
+        )
+    category_values = list_distinct_values(conn, "category")
+    subcategory_values = list_distinct_values(conn, "subcategory")
+    supplier_values = list_distinct_values(conn, "supplier_name")
+    with fs2:
+        card_category = st.selectbox(
+            "Категория",
+            options=["Все"] + category_values,
+            index=0,
+            key="card_product_category_filter",
+        )
+    with fs3:
+        card_subcategory = st.selectbox(
+            "Подкатегория",
+            options=["Все"] + subcategory_values,
+            index=0,
+            key="card_product_subcategory_filter",
+        )
+    with fs4:
+        card_supplier = st.selectbox(
+            "Поставщик",
+            options=["Все"] + supplier_values,
+            index=0,
+            key="card_product_supplier_filter",
+        )
+
+    filtered_products = find_products_for_card(
+        conn,
+        search=card_search or "",
+        category=card_category or "",
+        subcategory=card_subcategory or "",
+        supplier=card_supplier or "",
+        limit=5000,
+    )
+    if not filtered_products:
+        st.warning("По фильтрам не найдено товаров. Измени фильтр или очисти поиск.")
+        conn.close()
         return
 
-    conn = get_db()
-    product = get_product(conn, int(product_id))
+    product_options = [int(r["id"]) for r in filtered_products]
+    current_product_id = int(st.session_state.get("selected_product_id") or 0)
+    default_product_id = current_product_id if current_product_id in product_options else int(product_options[0])
+    selected_product_id = st.selectbox(
+        "Товар",
+        options=product_options,
+        index=product_options.index(default_product_id),
+        format_func=lambda x: next(
+            (
+                f"ID {int(row['id'])} | {str(row.get('article') or row.get('supplier_article') or '-')} | "
+                f"{str(row.get('name') or '-')} | {str(row.get('category') or row.get('base_category') or '-')} / "
+                f"{str(row.get('subcategory') or '-')} | {str(row.get('supplier_name') or '-')}"
+                for row in filtered_products
+                if int(row["id"]) == int(x)
+            ),
+            f"ID {x}",
+        ),
+        key="card_selected_product_id",
+    )
+    st.session_state["selected_product_id"] = int(selected_product_id)
+    product_id = int(selected_product_id)
+    product = get_product(conn, product_id)
 
     if not product:
         st.warning("Товар не найден")
         conn.close()
         return
 
-    st.subheader(f"Карточка товара #{product['id']}")
-    st.caption("Мастер-карточка должна быть единым источником правды. Здесь можно вручную поправить данные или обогатить их с сайта поставщика.")
+    st.subheader(f"Редактирование: товар #{product['id']}")
     with st.expander("Инструкция по кнопкам раздела Карточка", expanded=False):
         st.markdown(
             """
+- `Поиск товара / Категория / Подкатегория / Поставщик`: фильтр выбора товара для редактирования.
 - `Спарсить поставщика`: аккуратное обогащение карточки с сайта поставщика.
 - `Перезаполнить из поставщика`: force-перезапись полей из supplier page.
 - `Подобрать Ozon категорию`: автоподбор эталонной категории Ozon.
@@ -2189,7 +2426,6 @@ def show_product_tab():
 - `Сохранить карточку`: сохранение ручных изменений.
             """
         )
-    supplier_values = list_distinct_values(conn, "supplier_name")
     category_values = list_catalog_categories(conn)
     supplier_profiles = list_supplier_profiles(conn, only_active=True)
     supplier_profile_map = {str(p["supplier_name"]): p for p in supplier_profiles}
@@ -2383,6 +2619,182 @@ def show_product_tab():
             )
         else:
             st.info("Для этой Ozon-категории в PIM пока нет импортированных attribute requirements.")
+
+    st.markdown("### Атрибуты для заполнения (Ozon и клиентские шаблоны)")
+    channel_codes = list_channel_codes(conn)
+    if channel_codes:
+        product_ozon_scope = f"ozon:{ozon_desc_id}:{ozon_type_id}" if ozon_desc_id > 0 and ozon_type_id > 0 else ""
+        default_channel = str(st.session_state.get("card_attr_channel") or "")
+        if default_channel not in channel_codes:
+            if "onlinetrade" in channel_codes:
+                default_channel = "onlinetrade"
+            elif product_ozon_scope and "ozon" in channel_codes:
+                default_channel = "ozon"
+            else:
+                default_channel = str(channel_codes[0])
+        ch1, ch2, ch3 = st.columns([2, 2, 1])
+        with ch1:
+            selected_channel = st.selectbox(
+                "Канал атрибутов",
+                options=channel_codes,
+                index=channel_codes.index(default_channel),
+                key=f"card_attr_channel_{int(product_id)}",
+            )
+        st.session_state["card_attr_channel"] = selected_channel
+
+        category_scopes = list_channel_category_codes(conn, selected_channel)
+        if selected_channel == "ozon" and product_ozon_scope and product_ozon_scope not in category_scopes:
+            category_scopes = [product_ozon_scope] + category_scopes
+        category_scopes = list(dict.fromkeys(category_scopes))
+        scope_options = [""] + category_scopes
+        scope_labels = _build_ozon_scope_labels(conn)
+        if selected_channel != "ozon":
+            for code in category_scopes:
+                scope_labels.setdefault(code, str(code))
+
+        default_scope = str(st.session_state.get("card_attr_category_scope") or "")
+        if default_scope not in scope_options:
+            default_scope = ""
+        if selected_channel == "ozon" and product_ozon_scope:
+            default_scope = product_ozon_scope
+        elif not default_scope:
+            product_scope_candidates = [
+                str(product["subcategory"] or "").strip(),
+                str(product["category"] or "").strip(),
+                str(product["base_category"] or "").strip(),
+            ]
+            options_lc = {str(opt).strip().lower(): opt for opt in scope_options if str(opt).strip()}
+            for cand in product_scope_candidates:
+                if cand and cand.lower() in options_lc:
+                    default_scope = str(options_lc[cand.lower()])
+                    break
+        with ch2:
+            selected_scope = st.selectbox(
+                "Категория атрибутов",
+                options=scope_options,
+                index=(scope_options.index(default_scope) if default_scope in scope_options else 0),
+                format_func=lambda x: "Все категории канала" if x == "" else scope_labels.get(x, str(x)),
+                key=f"card_attr_scope_{int(product_id)}_{selected_channel}",
+            )
+        st.session_state["card_attr_category_scope"] = selected_scope
+        with ch3:
+            save_as_channel = st.checkbox(
+                "Сохранять как канал",
+                value=False,
+                key=f"card_attr_save_as_channel_{int(product_id)}_{selected_channel}_{selected_scope or 'all'}",
+                help="Если выключено, значения сохраняются в мастер-карточку.",
+            )
+
+        req_rows = list_channel_requirements(
+            conn,
+            channel_code=selected_channel,
+            category_code=selected_scope or None,
+        )
+        rule_rows = list_channel_mapping_rules(
+            conn,
+            channel_code=selected_channel,
+            category_code=selected_scope or None,
+        )
+        required_map = {str(r["attribute_code"]): int(r.get("is_required") or 0) for r in req_rows}
+        attribute_codes = set(required_map.keys())
+        for rule in rule_rows:
+            if str(rule.get("source_type") or "") == "attribute" and rule.get("source_name"):
+                attribute_codes.add(str(rule["source_name"]))
+
+        defs = list_attribute_definitions(conn)
+        defs_map = {str(d["code"]): d for d in defs}
+        type_map_ru = {"text": "Текст", "number": "Число", "boolean": "Да/Нет", "json": "JSON"}
+
+        attr_values = get_product_attribute_values(conn, int(product_id), channel_code=selected_channel)
+        value_by_code: dict[str, dict] = {}
+        for row in attr_values:
+            code = str(row.get("attribute_code") or "")
+            if not code:
+                continue
+            priority = 2 if str(row.get("channel_code") or "").strip() == str(selected_channel).strip() else 1
+            existing = value_by_code.get(code)
+            if (not existing) or priority > int(existing.get("_priority") or 0):
+                value_by_code[code] = {"value": row.get("value"), "_priority": priority}
+
+        editor_rows = []
+        for code in sorted(attribute_codes, key=lambda x: (0 if required_map.get(x, 0) else 1, humanize_attribute_code(x).lower())):
+            attr_def = defs_map.get(code, {})
+            current_value = value_by_code.get(code, {}).get("value")
+            current_text = ""
+            if current_value is not None:
+                if isinstance(current_value, (dict, list)):
+                    current_text = json.dumps(current_value, ensure_ascii=False)
+                else:
+                    current_text = str(current_value)
+            editor_rows.append(
+                {
+                    "attribute_code": code,
+                    "attribute_code_ru": humanize_attribute_code(code),
+                    "name": str(attr_def.get("name") or humanize_attribute_code(code)),
+                    "data_type": type_map_ru.get(str(attr_def.get("data_type") or "text"), str(attr_def.get("data_type") or "text")),
+                    "is_required": int(required_map.get(code, 0)),
+                    "current_value": current_text,
+                    "new_value": current_text,
+                }
+            )
+
+        if editor_rows:
+            ed_df = pd.DataFrame(editor_rows)
+            st.caption("Здесь собраны атрибуты категории канала и атрибуты из mapping rules (source_type=attribute).")
+            edited_df = st.data_editor(
+                ed_df,
+                use_container_width=True,
+                hide_index=True,
+                key=f"card_attr_editor_{int(product_id)}_{selected_channel}_{selected_scope or 'all'}",
+                disabled=["attribute_code", "attribute_code_ru", "name", "data_type", "is_required", "current_value"],
+                column_config={
+                    "attribute_code_ru": st.column_config.TextColumn("Код атрибута (рус.)"),
+                    "attribute_code": st.column_config.TextColumn("Технический код"),
+                    "name": st.column_config.TextColumn("Название"),
+                    "data_type": st.column_config.TextColumn("Тип данных"),
+                    "is_required": st.column_config.NumberColumn("Обязательный", format="%d"),
+                    "current_value": st.column_config.TextColumn("Текущее значение"),
+                    "new_value": st.column_config.TextColumn("Новое значение"),
+                },
+            )
+            if st.button("Сохранить атрибуты этого блока", type="primary", key=f"card_attr_save_btn_{int(product_id)}_{selected_channel}_{selected_scope or 'all'}"):
+                updated_count = 0
+                for _, row in edited_df.iterrows():
+                    code = str(row.get("attribute_code") or "").strip()
+                    if not code:
+                        continue
+                    old_text = str(row.get("current_value") or "").strip()
+                    new_text = str(row.get("new_value") or "").strip()
+                    if old_text == new_text:
+                        continue
+                    value_to_save = new_text if new_text else None
+                    try:
+                        set_product_attribute_value(
+                            conn=conn,
+                            product_id=int(product_id),
+                            attribute_code=code,
+                            value=value_to_save,
+                            channel_code=(selected_channel if save_as_channel else None),
+                        )
+                        save_field_source(
+                            conn=conn,
+                            product_id=int(product_id),
+                            field_name=code,
+                            source_type="manual",
+                            source_value_raw=value_to_save,
+                            source_url=None,
+                            confidence=1.0,
+                            is_manual=True,
+                        )
+                        updated_count += 1
+                    except Exception as e:
+                        st.error(f"Не удалось сохранить атрибут `{code}`: {e}")
+                st.success(f"Сохранено атрибутов: {updated_count}")
+                st.rerun()
+        else:
+            st.info("Для выбранного канала и категории пока нет атрибутов. Загрузите клиентский шаблон и сохраните mapping rules.")
+    else:
+        st.info("Каналы пока не настроены. Добавь канал во вкладке Каналы, затем загрузи клиентский шаблон.")
 
     with st.form("product_form"):
         c1, c2, c3 = st.columns(3)
@@ -2816,13 +3228,6 @@ def show_template_tab():
         )
 
     uploaded = st.file_uploader("Загрузить Excel-шаблон клиента", type=["xlsx", "xls"], key="client_template")
-    defs = list_attribute_definitions(conn)
-    source_options = [("column", c) for c in [
-        "article", "internal_article", "supplier_article", "name", "barcode", "brand", "description",
-        "weight", "length", "width", "height", "package_length", "package_width", "package_height",
-        "gross_weight", "image_url", "category", "base_category", "supplier_name", "supplier_url",
-        "uom", "tnved_code", "media_gallery"
-    ]] + [("attribute", d["code"]) for d in defs]
 
     if uploaded is not None:
         uploaded_bytes = uploaded.getvalue()
@@ -2858,6 +3263,31 @@ def show_template_tab():
             )
 
         template_df = pd.read_excel(BytesIO(safe_uploaded_bytes), sheet_name=template_sheet_name)
+        template_signature = hashlib.md5(safe_uploaded_bytes).hexdigest()
+        autoreg_key = f"{channel_code}|{category_code}|{template_sheet_name}|{template_signature}"
+        if st.session_state.get("template_autoreg_key") != autoreg_key:
+            reg = ensure_template_columns_registered(
+                conn=conn,
+                channel_code=channel_code,
+                category_code=category_code or None,
+                template_columns=list(template_df.columns),
+            )
+            st.session_state["template_autoreg_key"] = autoreg_key
+            if (reg["attributes"] + reg["requirements"] + reg["rules"]) > 0:
+                st.success(
+                    f"Шаблон зарегистрирован: атрибутов {reg['attributes']}, "
+                    f"требований {reg['requirements']}, правил {reg['rules']}."
+                )
+            else:
+                st.caption("Атрибуты и требования этого шаблона уже были зарегистрированы ранее.")
+
+        defs = list_attribute_definitions(conn)
+        source_options = [("column", c) for c in [
+            "article", "internal_article", "supplier_article", "name", "barcode", "brand", "description",
+            "weight", "length", "width", "height", "package_length", "package_width", "package_height",
+            "gross_weight", "image_url", "category", "base_category", "supplier_name", "supplier_url",
+            "uom", "tnved_code", "media_gallery"
+        ]] + [("attribute", d["code"]) for d in defs]
         matches = auto_match_template_columns(conn, list(template_df.columns))
         matches = apply_saved_mapping_rules(conn, matches, channel_code=channel_code, category_code=category_code or None)
         if selected_profile_id:
