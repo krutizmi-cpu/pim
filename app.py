@@ -683,6 +683,57 @@ def _build_ozon_scope_labels(conn) -> dict[str, str]:
     return labels
 
 
+def ensure_ozon_requirements_for_product_category(
+    conn,
+    description_category_id: int,
+    type_id: int,
+) -> dict[str, int | bool]:
+    desc_id = int(description_category_id or 0)
+    typ_id = int(type_id or 0)
+    if desc_id <= 0 or typ_id <= 0:
+        return {"ok": False, "imported": 0, "required": 0, "existing": 0, "cached": 0}
+
+    category_code = f"ozon:{desc_id}:{typ_id}"
+    existing = int(
+        conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM channel_attribute_requirements
+            WHERE channel_code = 'ozon'
+              AND category_code = ?
+            """,
+            (category_code,),
+        ).fetchone()[0]
+        or 0
+    )
+    if existing > 0:
+        return {"ok": True, "imported": 0, "required": 0, "existing": existing, "cached": 0}
+
+    cached = int(
+        conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM ozon_attribute_cache
+            WHERE description_category_id = ?
+              AND type_id = ?
+            """,
+            (desc_id, typ_id),
+        ).fetchone()[0]
+        or 0
+    )
+    if cached <= 0:
+        return {"ok": False, "imported": 0, "required": 0, "existing": existing, "cached": cached}
+
+    result = import_cached_attributes_to_pim(conn, description_category_id=desc_id, type_id=typ_id)
+    return {
+        "ok": True,
+        "imported": int(result.get("imported") or 0),
+        "required": int(result.get("required") or 0),
+        "existing": existing,
+        "cached": cached,
+    }
+
+
 def _build_ozon_template_category_options(
     conn,
     channel_code: str | None = None,
@@ -3224,6 +3275,7 @@ def show_product_tab():
         st.markdown(
             """
 - `Поиск товара (артикул/наименование) / Категория Ozon / Подкатегория Ozon / Поставщик`: фильтр выбора товара для редактирования.
+- Если у товара уже определена Ozon-категория, её атрибуты автоматически подтягиваются в блок редактирования ниже.
 - `Спарсить поставщика`: аккуратное обогащение карточки с сайта поставщика.
 - `Перезаполнить из поставщика`: force-перезапись полей из supplier page.
 - `Подобрать Ozon категорию`: автоподбор эталонной категории Ozon.
@@ -3351,6 +3403,12 @@ def show_product_tab():
     ozon_desc_id = int(product["ozon_description_category_id"] or 0)
     ozon_type_id = int(product["ozon_type_id"] or 0)
     if ozon_desc_id > 0 and ozon_type_id > 0:
+        auto_req = ensure_ozon_requirements_for_product_category(conn, ozon_desc_id, ozon_type_id)
+        if int(auto_req.get("imported") or 0) > 0:
+            st.success(
+                "Ozon-атрибуты этой категории автоматически добавлены в карточку: "
+                f"{int(auto_req.get('imported') or 0)} (обязательных: {int(auto_req.get('required') or 0)})."
+            )
         st.markdown("### Ozon-атрибуты выбранной категории")
         oz1, oz2 = st.columns([1, 1])
         with oz1:
@@ -3425,12 +3483,17 @@ def show_product_tab():
     channel_codes = list_channel_codes(conn)
     if channel_codes:
         product_ozon_scope = f"ozon:{ozon_desc_id}:{ozon_type_id}" if ozon_desc_id > 0 and ozon_type_id > 0 else ""
-        default_channel = str(st.session_state.get("card_attr_channel") or "")
+        channel_widget_key = f"card_attr_channel_{int(product_id)}"
+        if product_ozon_scope and "ozon" in channel_codes and channel_widget_key not in st.session_state:
+            st.session_state[channel_widget_key] = "ozon"
+        default_channel = str(st.session_state.get(channel_widget_key) or st.session_state.get("card_attr_channel") or "")
+        if product_ozon_scope and "ozon" in channel_codes:
+            default_channel = "ozon"
         if default_channel not in channel_codes:
-            if "onlinetrade" in channel_codes:
-                default_channel = "onlinetrade"
-            elif product_ozon_scope and "ozon" in channel_codes:
+            if product_ozon_scope and "ozon" in channel_codes:
                 default_channel = "ozon"
+            elif "onlinetrade" in channel_codes:
+                default_channel = "onlinetrade"
             else:
                 default_channel = str(channel_codes[0])
         ch1, ch2, ch3 = st.columns([2, 2, 1])
@@ -3439,7 +3502,7 @@ def show_product_tab():
                 "Канал атрибутов",
                 options=channel_codes,
                 index=channel_codes.index(default_channel),
-                key=f"card_attr_channel_{int(product_id)}",
+                key=channel_widget_key,
             )
         st.session_state["card_attr_channel"] = selected_channel
 
@@ -3469,13 +3532,16 @@ def show_product_tab():
                 if cand and cand.lower() in options_lc:
                     default_scope = str(options_lc[cand.lower()])
                     break
+        scope_widget_key = f"card_attr_scope_{int(product_id)}_{selected_channel}"
+        if selected_channel == "ozon" and product_ozon_scope and scope_widget_key not in st.session_state:
+            st.session_state[scope_widget_key] = product_ozon_scope
         with ch2:
             selected_scope = st.selectbox(
                 "Категория атрибутов",
                 options=scope_options,
                 index=(scope_options.index(default_scope) if default_scope in scope_options else 0),
                 format_func=lambda x: "Все категории канала" if x == "" else scope_labels.get(x, str(x)),
-                key=f"card_attr_scope_{int(product_id)}_{selected_channel}",
+                key=scope_widget_key,
             )
         st.session_state["card_attr_category_scope"] = selected_scope
         with ch3:
@@ -3491,6 +3557,17 @@ def show_product_tab():
             channel_code=selected_channel,
             category_code=selected_scope or None,
         )
+        if selected_channel == "ozon" and selected_scope and selected_scope.startswith("ozon:") and not req_rows:
+            try:
+                _, raw_desc, raw_type = selected_scope.split(":", 2)
+                ensure_ozon_requirements_for_product_category(conn, int(raw_desc), int(raw_type))
+                req_rows = list_channel_requirements(
+                    conn,
+                    channel_code=selected_channel,
+                    category_code=selected_scope or None,
+                )
+            except Exception:
+                pass
         rule_rows = list_channel_mapping_rules(
             conn,
             channel_code=selected_channel,
@@ -3541,7 +3618,7 @@ def show_product_tab():
 
         if editor_rows:
             ed_df = pd.DataFrame(editor_rows)
-            st.caption("Здесь собраны атрибуты категории канала и атрибуты из mapping rules (source_type=attribute).")
+            st.caption("Здесь собраны атрибуты категории канала и атрибуты из mapping rules (source_type=attribute). Для карточки с Ozon-категорией по умолчанию открыт Ozon scope.")
             edited_df = st.data_editor(
                 ed_df,
                 use_container_width=True,
