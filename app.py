@@ -6208,6 +6208,8 @@ def main():
     low_db = str(active_db).lower()
     if "\\temp\\pim\\catalog.db" in low_db or "/tmp/pim/catalog.db" in low_db:
         st.warning("Сейчас используется временная БД. Чтобы каталог не пропадал, задай постоянный путь через переменную окружения `PIM_DB_PATH`.")
+    if "/mount/src/" in low_db and low_db.endswith("/data/catalog.db"):
+        st.warning("Используется БД внутри папки приложения. На Streamlit Cloud она может сбрасываться при redeploy. Рекомендуется `PIM_DB_PATH=/home/adminuser/.pim/catalog.db`.")
 
     with st.expander("Как здесь работать", expanded=False):
         st.markdown(

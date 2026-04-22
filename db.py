@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import sqlite3
 import tempfile
+import shutil
 from pathlib import Path
 
 DB_PATH = Path("data/catalog.db")
@@ -59,8 +60,9 @@ def _candidate_db_paths(db_path: Path) -> list[Path]:
     candidates: list[Path] = []
     if env_path:
         candidates.append(Path(env_path).expanduser())
-    candidates.append(Path(db_path).expanduser())
+    # Prefer user-home persistent path over repo-local data path.
     candidates.append(Path.home() / ".pim" / "catalog.db")
+    candidates.append(Path(db_path).expanduser())
     candidates.append(Path.cwd() / "data" / "catalog.db")
     candidates.append(Path(tempfile.gettempdir()) / "pim" / "catalog.db")
     unique: list[Path] = []
@@ -74,6 +76,57 @@ def _candidate_db_paths(db_path: Path) -> list[Path]:
     return unique
 
 
+def _db_is_readable_with_products(path: Path) -> bool:
+    if not path.exists() or not path.is_file():
+        return False
+    conn: sqlite3.Connection | None = None
+    try:
+        conn = sqlite3.connect(path)
+        row = conn.execute(
+            """
+            SELECT name
+            FROM sqlite_master
+            WHERE type='table' AND name='products'
+            LIMIT 1
+            """
+        ).fetchone()
+        if not row:
+            return False
+        cnt = conn.execute("SELECT COUNT(*) FROM products").fetchone()
+        return bool(cnt and int(cnt[0] or 0) > 0)
+    except Exception:
+        return False
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def _seed_preferred_db_if_needed(preferred: Path, fallbacks: list[Path]) -> None:
+    """
+    If preferred DB is absent/empty, try to copy the richest existing DB from fallback paths.
+    This protects catalog data when app path changes (e.g., Streamlit Cloud redeploy).
+    """
+    if preferred.exists() and preferred.is_file():
+        return
+
+    source: Path | None = None
+    for candidate in fallbacks:
+        if candidate.resolve() == preferred.resolve():
+            continue
+        if _db_is_readable_with_products(candidate):
+            source = candidate
+            break
+    if source is None:
+        return
+
+    try:
+        preferred.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, preferred)
+    except Exception:
+        # Best effort only; normal candidate probing continues.
+        return
+
+
 def get_connection(db_path: Path = DB_PATH) -> sqlite3.Connection:
     global _ACTIVE_DB_PATH
 
@@ -83,8 +136,12 @@ def get_connection(db_path: Path = DB_PATH) -> sqlite3.Connection:
         conn_local.row_factory = sqlite3.Row
         return conn_local
 
+    candidates = _candidate_db_paths(Path(db_path))
+    if candidates:
+        _seed_preferred_db_if_needed(candidates[0], candidates[1:])
+
     last_error: Exception | None = None
-    for candidate in _candidate_db_paths(Path(db_path)):
+    for candidate in candidates:
         conn = _connect(candidate)
         try:
             # Fast writeability probe for read-only mount cases.
