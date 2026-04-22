@@ -935,6 +935,163 @@ def _fill_ozon_attrs_from_parsed(
     return {"saved": int(saved), "skipped": int(skipped)}
 
 
+def _infer_dimension_heuristics(product_row: dict) -> dict[str, Any]:
+    name = str(product_row.get("name") or "").lower()
+    category_text = " ".join(
+        [
+            str(product_row.get("category") or ""),
+            str(product_row.get("base_category") or ""),
+            str(product_row.get("subcategory") or ""),
+            str(product_row.get("ozon_category_path") or ""),
+        ]
+    ).lower()
+    wheel = product_row.get("wheel_diameter_inch")
+    if wheel in (None, "", 0, 0.0):
+        try:
+            inferred = infer_category_fields({"name": product_row.get("name")})
+            wheel = inferred.get("wheel_diameter_inch")
+        except Exception:
+            wheel = None
+    try:
+        wheel_val = float(wheel) if wheel not in (None, "", 0, 0.0) else None
+    except Exception:
+        wheel_val = None
+
+    is_bike = any(token in f"{name} {category_text}" for token in ["велосипед", "bike", "bicycle"])
+    if is_bike:
+        # Практические ориентиры для закрытия пустых логистических данных по велосипедам.
+        if wheel_val is None:
+            wheel_val = 27.5
+        if wheel_val >= 29:
+            length, width, height, weight = 138.0, 82.0, 22.0, 15.5
+        elif wheel_val >= 27.5:
+            length, width, height, weight = 130.0, 80.0, 20.0, 14.0
+        elif wheel_val >= 26:
+            length, width, height, weight = 126.0, 78.0, 20.0, 13.8
+        elif wheel_val >= 24:
+            length, width, height, weight = 118.0, 70.0, 18.0, 12.3
+        elif wheel_val >= 20:
+            length, width, height, weight = 108.0, 64.0, 18.0, 10.9
+        else:
+            length, width, height, weight = 92.0, 56.0, 16.0, 8.3
+        return {
+            "found": True,
+            "scope": "bike_heuristics",
+            "values": {
+                "length": length,
+                "width": width,
+                "height": height,
+                "weight": weight,
+                "package_length": round(length + 4.0, 2),
+                "package_width": round(width + 4.0, 2),
+                "package_height": round(height + 3.0, 2),
+                "gross_weight": round(weight + 1.8, 2),
+            },
+        }
+
+    return {"found": False, "scope": None, "values": {}}
+
+
+def estimate_dimensions_for_product(
+    conn,
+    product_id: int,
+    force: bool = False,
+    min_samples: int = 4,
+) -> dict[str, Any]:
+    row = get_product(conn, int(product_id))
+    if not row:
+        return {"ok": False, "message": "Товар не найден", "updated_fields": 0}
+    product_row = dict(row)
+
+    stats_res = infer_dimensions_from_catalog(conn, product_row, min_samples=max(1, int(min_samples)))
+    defaults_res = infer_dimensions_from_category_defaults(conn, product_row)
+    heuristic_res = _infer_dimension_heuristics(product_row)
+
+    sources: list[tuple[str, dict[str, Any], str]] = [
+        ("category_stats_fallback", stats_res, str(stats_res.get("scope") or "catalog_stats")),
+        ("category_defaults_fallback", defaults_res, str(defaults_res.get("scope") or "category_defaults")),
+        ("type_heuristic_estimate", heuristic_res, str(heuristic_res.get("scope") or "heuristic")),
+    ]
+
+    target_fields = [
+        "weight",
+        "gross_weight",
+        "length",
+        "width",
+        "height",
+        "package_length",
+        "package_width",
+        "package_height",
+    ]
+    updates: dict[str, Any] = {}
+    source_by_field: dict[str, str] = {}
+    detail_by_field: dict[str, str] = {}
+
+    for source_type, result, detail in sources:
+        if not bool(result.get("found")):
+            continue
+        values = dict(result.get("values") or {})
+        for field in target_fields:
+            if field in updates:
+                continue
+            value = values.get(field)
+            if value in (None, "", 0, 0.0):
+                continue
+            current = product_row.get(field)
+            if (current not in (None, "", 0, 0.0)) and not force:
+                continue
+            if not can_overwrite_field(conn, int(product_id), field, source_type, force=bool(force)):
+                continue
+            updates[field] = float(value)
+            source_by_field[field] = source_type
+            detail_by_field[field] = detail
+
+    if not updates:
+        return {
+            "ok": True,
+            "message": "Нет пустых полей для расчёта габаритов/веса",
+            "updated_fields": 0,
+            "updates": {},
+            "used_sources": [],
+        }
+
+    set_clause = ", ".join([f"{k} = ?" for k in updates.keys()])
+    params = [updates[k] for k in updates.keys()] + [int(product_id)]
+    conn.execute(
+        f"""
+        UPDATE products
+        SET {set_clause},
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+        """,
+        params,
+    )
+
+    for field_name, value in updates.items():
+        src_type = source_by_field.get(field_name) or "category_stats_fallback"
+        src_detail = detail_by_field.get(field_name) or ""
+        save_field_source(
+            conn=conn,
+            product_id=int(product_id),
+            field_name=field_name,
+            source_type=src_type,
+            source_value_raw=value,
+            source_url=f"dimension_estimation:{src_detail}",
+            confidence=0.42 if src_type == "category_stats_fallback" else 0.36 if src_type == "category_defaults_fallback" else 0.31,
+            is_manual=False,
+        )
+
+    conn.commit()
+    used_sources = sorted(set(source_by_field.values()))
+    return {
+        "ok": True,
+        "message": f"Рассчитано полей: {len(updates)}",
+        "updated_fields": int(len(updates)),
+        "updates": updates,
+        "used_sources": used_sources,
+    }
+
+
 def _build_ozon_scope_labels(conn) -> dict[str, str]:
     rows = conn.execute(
         """
@@ -2584,6 +2741,8 @@ def show_catalog_tab():
 - `Подтянуть Ozon-атрибуты (вся выборка фильтра)`: то же действие для всей выборки по фильтрам.
 - `Обогатить поставщика по текущей странице`: после Ozon-привязки тянет данные с supplier_url и fallback-источников.
 - `Обогатить поставщика по всей выборке фильтра`: тот же этап, но на всей фильтрации.
+- `Рассчитать габариты/вес (текущая страница)`: заполнить пустые логистические поля статистикой по похожим товарам.
+- `Рассчитать габариты/вес (вся выборка фильтра)`: тот же расчёт массово по всей выборке.
 - `Обновить дубли по текущей выборке`: пересчет дублей по текущей странице.
             """
         )
@@ -2890,6 +3049,24 @@ def show_catalog_tab():
         f"Лимиты: страница {int(max_bulk_enrich_page)}, выборка {int(max_bulk_enrich_filtered)}. "
         f"Ozon перед обогащением: {'вкл' if bool(pre_ozon_before_enrich) else 'выкл'}."
     )
+    dcfg1, dcfg2 = st.columns([1, 2])
+    with dcfg1:
+        dim_min_samples = st.number_input(
+            "Мин. выборка для статистики",
+            min_value=1,
+            max_value=50,
+            value=4,
+            step=1,
+            key="catalog_dim_min_samples",
+            help="Сколько похожих товаров нужно минимум, чтобы использовать статистический расчет.",
+        )
+    with dcfg2:
+        dim_force = st.checkbox(
+            "Перезаписывать существующие габариты/вес",
+            value=False,
+            key="catalog_dim_force",
+            help="Если выключено, расчет заполняет только пустые логистические поля.",
+        )
 
     def run_supplier_enrichment_batch(candidate_ids: list[int], run_limit: int, run_label: str) -> None:
         if not candidate_ids:
@@ -2946,6 +3123,41 @@ def show_catalog_tab():
             f"Ozon автопривязка до парсинга: обработано {ozon_processed}, назначено {ozon_assigned}, "
             f"подтянуто Ozon-атрибутов {ozon_attr_imported}, "
             f"отложено по лимиту {skipped_by_limit}."
+        )
+
+    def run_dimension_estimation_batch(candidate_ids: list[int], run_limit: int, run_label: str) -> None:
+        if not candidate_ids:
+            st.info(f"Для режима `{run_label}` нет товаров для расчета.")
+            return
+        target_ids = [int(x) for x in candidate_ids[: int(run_limit)]]
+        progress = st.progress(0)
+        processed = 0
+        updated_products = 0
+        updated_fields_total = 0
+        source_counter: dict[str, int] = {}
+        for i, pid in enumerate(target_ids, start=1):
+            try:
+                result = estimate_dimensions_for_product(
+                    conn=conn,
+                    product_id=int(pid),
+                    force=bool(dim_force),
+                    min_samples=int(dim_min_samples),
+                )
+                if bool(result.get("ok")) and int(result.get("updated_fields") or 0) > 0:
+                    updated_products += 1
+                    updated_fields_total += int(result.get("updated_fields") or 0)
+                    for src in (result.get("used_sources") or []):
+                        source_counter[str(src)] = int(source_counter.get(str(src), 0)) + 1
+            except Exception:
+                pass
+            processed += 1
+            progress.progress(i / len(target_ids))
+        skipped_by_limit = max(0, len(candidate_ids) - len(target_ids))
+        source_text = ", ".join([f"{k}:{v}" for k, v in sorted(source_counter.items())]) if source_counter else "-"
+        st.success(
+            f"[{run_label}] Расчёт завершён: обработано {processed}, "
+            f"обновлено товаров {updated_products}, полей {updated_fields_total}, "
+            f"источники {source_text}, отложено по лимиту {skipped_by_limit}."
         )
 
     cextra1, cextra2 = st.columns(2)
@@ -3010,6 +3222,22 @@ def show_catalog_tab():
                 total += 1
                 progress.progress(i / len(ids))
             st.success(f"Проверка дублей завершена: {total} товаров")
+
+    d1, d2 = st.columns(2)
+    with d1:
+        if st.button("Рассчитать габариты/вес (текущая страница)", help="Заполнить пустые логистические поля товара статистикой похожих товаров и типовыми значениями."):
+            run_dimension_estimation_batch(
+                candidate_ids=[int(x) for x in ids],
+                run_limit=int(max_bulk_enrich_page),
+                run_label="Текущая страница",
+            )
+    with d2:
+        if st.button("Рассчитать габариты/вес (вся выборка фильтра)", help="Массово заполнить пустые логистические поля по всей текущей фильтрации."):
+            run_dimension_estimation_batch(
+                candidate_ids=[int(x) for x in all_filtered_candidate_ids],
+                run_limit=int(max_bulk_enrich_filtered),
+                run_label="Вся выборка фильтра",
+            )
 
     st.dataframe(with_ru_columns(df), use_container_width=True, hide_index=True)
 
@@ -3749,6 +3977,7 @@ def show_product_tab():
 - `Спарсить поставщика`: аккуратное обогащение карточки с сайта поставщика.
 - `Перезаполнить из поставщика`: force-перезапись полей из supplier page.
 - `Стратегия парсинга для этого товара`: вручную выбрать, где искать данные (только поставщик, Ozon, Яндекс, web, домены).
+- `Рассчитать габариты/вес (статистика)`: заполнить пустые логистические поля по статистике похожих товаров и типовым значениям.
 - `Подобрать Ozon категорию`: автоподбор эталонной категории Ozon.
 - `Перепривязать Ozon категорию (force)`: повторный подбор Ozon категории с перезаписью.
 - `Сохранить карточку`: сохранение ручных изменений.
@@ -3896,6 +4125,41 @@ def show_product_tab():
             else:
                 st.success(f"Ozon force-привязка: обработано {res['processed']}, привязано {res['assigned']}, пропущено {res['skipped']}")
             st.rerun()
+
+    ctop5, ctop6, ctop7 = st.columns([1, 1, 2])
+    with ctop5:
+        card_dim_min_samples = st.number_input(
+            "Мин. выборка (карточка)",
+            min_value=1,
+            max_value=50,
+            value=4,
+            step=1,
+            key=f"card_dim_min_samples_{int(product_id)}",
+        )
+    with ctop6:
+        card_dim_force = st.checkbox(
+            "Перезаписать существующие",
+            value=False,
+            key=f"card_dim_force_{int(product_id)}",
+        )
+    with ctop7:
+        st.markdown("<br>", unsafe_allow_html=True)
+        if st.button("Рассчитать габариты/вес (статистика)", key=f"card_estimate_dims_{int(product_id)}"):
+            dim_result = estimate_dimensions_for_product(
+                conn=conn,
+                product_id=int(product_id),
+                force=bool(card_dim_force),
+                min_samples=int(card_dim_min_samples),
+            )
+            if dim_result.get("ok"):
+                st.success(
+                    f"{dim_result.get('message')}. Источники: {', '.join(dim_result.get('used_sources') or []) or '-'}"
+                )
+                if dim_result.get("updates"):
+                    st.json(dim_result.get("updates"))
+                st.rerun()
+            else:
+                st.error(str(dim_result.get("message") or "Не удалось рассчитать габариты/вес"))
 
     parse_status = product["supplier_parse_status"] if "supplier_parse_status" in product.keys() else None
     parse_comment = product["supplier_parse_comment"] if "supplier_parse_comment" in product.keys() else None

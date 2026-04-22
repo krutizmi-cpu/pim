@@ -16,6 +16,7 @@ SOURCE_PRIORITY = {
     "ai": 50,
     "name_category_inference": 40,
     "category_stats_fallback": 35,
+    "type_heuristic_estimate": 32,
     "category_defaults_fallback": 30,
     "default": 10,
 }
