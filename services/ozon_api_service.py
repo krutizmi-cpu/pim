@@ -870,6 +870,7 @@ def import_cached_attributes_to_pim(
     conn: sqlite3.Connection,
     description_category_id: int,
     type_id: int,
+    auto_mapping_rules: bool = True,
 ) -> dict[str, Any]:
     attributes = list_cached_attributes(
         conn,
@@ -938,11 +939,27 @@ def import_cached_attributes_to_pim(
         if item.get("is_required"):
             required += 1
 
+    mapping_saved = 0
+    if bool(auto_mapping_rules):
+        try:
+            mapping_result = save_suggested_mappings(
+                conn,
+                description_category_id=int(description_category_id),
+                type_id=int(type_id),
+            )
+            mapping_saved = int(mapping_result.get("saved") or 0)
+        except Exception:
+            mapping_saved = 0
+
     conn.commit()
-    return {"imported": imported, "required": required, "category_code": category_code}
+    return {"imported": imported, "required": required, "category_code": category_code, "mapping_saved": mapping_saved}
 
 
-def import_all_cached_attributes_to_pim(conn: sqlite3.Connection, max_pairs: int | None = None) -> dict[str, Any]:
+def import_all_cached_attributes_to_pim(
+    conn: sqlite3.Connection,
+    max_pairs: int | None = None,
+    auto_mapping_rules: bool = True,
+) -> dict[str, Any]:
     pairs = _list_category_pairs_for_sync(conn)
     if max_pairs is not None and int(max_pairs) > 0:
         pairs = pairs[: int(max_pairs)]
@@ -950,6 +967,7 @@ def import_all_cached_attributes_to_pim(conn: sqlite3.Connection, max_pairs: int
     processed = 0
     imported_total = 0
     required_total = 0
+    mapping_saved_total = 0
     errors: list[str] = []
     for description_category_id, type_id in pairs:
         try:
@@ -957,10 +975,12 @@ def import_all_cached_attributes_to_pim(conn: sqlite3.Connection, max_pairs: int
                 conn,
                 description_category_id=int(description_category_id),
                 type_id=int(type_id),
+                auto_mapping_rules=bool(auto_mapping_rules),
             )
             processed += 1
             imported_total += int(result.get("imported") or 0)
             required_total += int(result.get("required") or 0)
+            mapping_saved_total += int(result.get("mapping_saved") or 0)
         except Exception as e:
             errors.append(f"cat={description_category_id}, type={type_id}: {e}")
     return {
@@ -968,6 +988,7 @@ def import_all_cached_attributes_to_pim(conn: sqlite3.Connection, max_pairs: int
         "pairs_processed": processed,
         "imported_total": imported_total,
         "required_total": required_total,
+        "mapping_saved_total": mapping_saved_total,
         "errors": errors[:200],
     }
 

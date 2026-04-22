@@ -633,6 +633,30 @@ def _ensure_ozon_tables(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_ozon_job_items_offer ON ozon_update_job_items(offer_id)")
 
 
+def _ensure_ozon_catalog_mapping_memory_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS ozon_catalog_mapping_memory (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            mapping_key TEXT NOT NULL UNIQUE,
+            supplier_name TEXT,
+            category TEXT,
+            base_category TEXT,
+            subcategory TEXT,
+            description_category_id INTEGER NOT NULL,
+            type_id INTEGER NOT NULL,
+            ozon_category_path TEXT,
+            confidence REAL DEFAULT 0.0,
+            hit_count INTEGER DEFAULT 1,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_ocmm_desc_type ON ozon_catalog_mapping_memory(description_category_id, type_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_ocmm_supplier ON ozon_catalog_mapping_memory(supplier_name)")
+
+
 
 def _ensure_channel_tables(conn: sqlite3.Connection) -> None:
     conn.execute(
@@ -838,6 +862,7 @@ def init_db(conn: sqlite3.Connection) -> None:
     _ensure_template_profile_tables(conn)
     _ensure_supplier_profiles_table(conn)
     _ensure_ozon_tables(conn)
+    _ensure_ozon_catalog_mapping_memory_table(conn)
     _ensure_channel_tables(conn)
 
     _seed_category_defaults(conn)

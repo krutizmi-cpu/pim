@@ -37,6 +37,92 @@ def _derive_catalog_categories_from_ozon_path(path: str | None) -> dict[str, str
     }
 
 
+def _normalize_mapping_key_part(value: str | None) -> str:
+    return " ".join(str(value or "").strip().lower().replace("ё", "е").split())
+
+
+def _build_catalog_mapping_key(product_row: dict[str, Any]) -> str:
+    supplier = _normalize_mapping_key_part(product_row.get("supplier_name"))
+    base = _normalize_mapping_key_part(product_row.get("base_category"))
+    sub = _normalize_mapping_key_part(product_row.get("subcategory"))
+    cat = _normalize_mapping_key_part(product_row.get("category"))
+    if not any([supplier, base, sub, cat]):
+        return ""
+    return f"{supplier}|{base}|{sub}|{cat}"
+
+
+def _get_saved_catalog_mapping(conn: sqlite3.Connection, product_row: dict[str, Any]) -> dict[str, Any] | None:
+    mapping_key = _build_catalog_mapping_key(product_row)
+    if not mapping_key:
+        return None
+    row = conn.execute(
+        """
+        SELECT
+            mapping_key,
+            description_category_id,
+            type_id,
+            ozon_category_path,
+            confidence
+        FROM ozon_catalog_mapping_memory
+        WHERE mapping_key = ?
+        LIMIT 1
+        """,
+        (mapping_key,),
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def _save_catalog_mapping(conn: sqlite3.Connection, product_row: dict[str, Any], match: dict[str, Any]) -> None:
+    mapping_key = _build_catalog_mapping_key(product_row)
+    if not mapping_key:
+        return
+    conn.execute(
+        """
+        INSERT INTO ozon_catalog_mapping_memory (
+            mapping_key,
+            supplier_name,
+            category,
+            base_category,
+            subcategory,
+            description_category_id,
+            type_id,
+            ozon_category_path,
+            confidence,
+            hit_count,
+            created_at,
+            updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+        ON CONFLICT(mapping_key) DO UPDATE SET
+            supplier_name = excluded.supplier_name,
+            category = excluded.category,
+            base_category = excluded.base_category,
+            subcategory = excluded.subcategory,
+            description_category_id = excluded.description_category_id,
+            type_id = excluded.type_id,
+            ozon_category_path = excluded.ozon_category_path,
+            confidence = CASE
+                WHEN excluded.confidence > IFNULL(ozon_catalog_mapping_memory.confidence, 0)
+                THEN excluded.confidence
+                ELSE ozon_catalog_mapping_memory.confidence
+            END,
+            hit_count = IFNULL(ozon_catalog_mapping_memory.hit_count, 0) + 1,
+            updated_at = CURRENT_TIMESTAMP
+        """,
+        (
+            mapping_key,
+            str(product_row.get("supplier_name") or ""),
+            str(product_row.get("category") or ""),
+            str(product_row.get("base_category") or ""),
+            str(product_row.get("subcategory") or ""),
+            int(match.get("description_category_id") or 0),
+            int(match.get("type_id") or 0),
+            str(match.get("full_path") or ""),
+            float(match.get("score") or 0.0),
+        ),
+    )
+
+
 def _normalize(text: str | None) -> str:
     return " ".join(str(text or "").strip().lower().replace("ё", "е").split())
 
@@ -178,7 +264,7 @@ def bulk_assign_ozon_categories(
     for product_id in product_ids:
         row = conn.execute(
             """
-            SELECT id, name, category, base_category, subcategory,
+            SELECT id, name, supplier_name, category, base_category, subcategory,
                    ozon_description_category_id, ozon_type_id, ozon_category_path, ozon_category_confidence
             FROM products
             WHERE id = ?
@@ -234,7 +320,18 @@ def bulk_assign_ozon_categories(
             skipped += 1
             continue
 
-        match = _best_match_for_product(product, categories)
+        saved_match = _get_saved_catalog_mapping(conn, product)
+        if saved_match:
+            match = {
+                "description_category_id": int(saved_match["description_category_id"]),
+                "type_id": int(saved_match["type_id"]),
+                "full_path": str(saved_match.get("ozon_category_path") or ""),
+                "score": max(0.65, float(saved_match.get("confidence") or 0.0)),
+                "matched_by": "saved_catalog_mapping",
+                "matched_source": "mapping_memory",
+            }
+        else:
+            match = _best_match_for_product(product, categories)
         if not match:
             skipped += 1
             continue
@@ -333,6 +430,7 @@ def bulk_assign_ozon_categories(
                 confidence=float(match["score"]),
                 is_manual=False,
             )
+        _save_catalog_mapping(conn, product, match)
         assigned += 1
 
     conn.commit()

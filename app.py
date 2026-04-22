@@ -4481,6 +4481,65 @@ def show_template_tab():
         with save_col2:
             st.caption("Эта кнопка сохраняет тип шаблона клиента для повторного использования без повторной ручной настройки.")
 
+        def _persist_template_mapping_rules(rows: list[dict]) -> int:
+            saved = 0
+            for row in rows:
+                row_status = str(row.get("status") or "matched")
+                if row_status != "matched":
+                    continue
+                target_field = str(row.get("template_column") or "").strip()
+                source_type = str(row.get("source_type") or "").strip()
+                source_name = str(row.get("source_name") or "").strip()
+                if not target_field or not source_name or source_type not in {"attribute", "column"}:
+                    continue
+                upsert_channel_mapping_rule(
+                    conn=conn,
+                    channel_code=channel_code,
+                    category_code=category_code or None,
+                    target_field=target_field,
+                    source_type=source_type,
+                    source_name=source_name,
+                    transform_rule=row.get("transform_rule"),
+                    is_required=0,
+                )
+                saved += 1
+            return saved
+
+        def _autosave_template_mapping_rules(rows: list[dict]) -> int:
+            normalized_rows = []
+            for row in rows:
+                if str(row.get("status") or "") != "matched":
+                    continue
+                source_type = str(row.get("source_type") or "").strip()
+                source_name = str(row.get("source_name") or "").strip()
+                template_column = str(row.get("template_column") or "").strip()
+                if source_type not in {"attribute", "column"} or not source_name or not template_column:
+                    continue
+                normalized_rows.append(
+                    {
+                        "template_column": template_column,
+                        "source_type": source_type,
+                        "source_name": source_name,
+                        "transform_rule": str(row.get("transform_rule") or ""),
+                    }
+                )
+            signature_payload = {
+                "channel_code": str(channel_code or "").strip(),
+                "category_code": str(category_code or "").strip(),
+                "rows": sorted(normalized_rows, key=lambda x: x["template_column"]),
+            }
+            signature = hashlib.md5(
+                json.dumps(signature_payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+            ).hexdigest()
+            signature_key = (
+                f"template_mapping_signature::{str(channel_code or '').strip()}::{str(category_code or '').strip()}"
+            )
+            if st.session_state.get(signature_key) == signature:
+                return 0
+            saved = _persist_template_mapping_rules(normalized_rows)
+            st.session_state[signature_key] = signature
+            return saved
+
         tab_match, tab_fill, tab_gap = st.tabs(["1. Матчинг", "2. Заполнение и preview", "3. Gap и действия"])
 
         with tab_match:
@@ -4541,21 +4600,7 @@ def show_template_tab():
             s1, s2, s3 = st.columns(3)
             with s1:
                 if st.button("Сохранить mapping rules", type="primary"):
-                    saved = 0
-                    for row in manual_rows:
-                        if row["status"] != "matched":
-                            continue
-                        upsert_channel_mapping_rule(
-                            conn=conn,
-                            channel_code=channel_code,
-                            category_code=category_code or None,
-                            target_field=row["template_column"],
-                            source_type=row["source_type"],
-                            source_name=row["source_name"],
-                            transform_rule=row.get("transform_rule"),
-                            is_required=0,
-                        )
-                        saved += 1
+                    saved = _persist_template_mapping_rules(manual_rows)
                     st.success(f"Сохранено mapping rules: {saved}")
             with s2:
                 if st.button("Сохранить профиль шаблона"):
@@ -4639,9 +4684,14 @@ def show_template_tab():
                     a1, a2 = st.columns(2)
                     with a1:
                         if st.button("Подтвердить значения как client_validated"):
+                            autosaved = _autosave_template_mapping_rules(manual_rows)
                             result = apply_client_validated_values(conn, selected_ids, manual_rows, channel_code=channel_code or None)
-                            st.success(f"Применено: {result['applied']}, пропущено по приоритету: {result['skipped']}")
+                            st.success(
+                                f"Применено: {result['applied']}, пропущено по приоритету: {result['skipped']}. "
+                                f"Автосохранено mapping rules: {autosaved}."
+                            )
                     with a2:
+                        _autosave_template_mapping_rules(manual_rows)
                         export_bytes = fill_template_workbook_bytes(
                             conn,
                             safe_uploaded_bytes,
