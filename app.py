@@ -734,6 +734,66 @@ def ensure_ozon_requirements_for_product_category(
     }
 
 
+def ensure_ozon_requirements_for_products(
+    conn,
+    product_ids: list[int],
+) -> dict[str, int]:
+    ids = [int(x) for x in product_ids if str(x).strip()]
+    if not ids:
+        return {
+            "products_total": 0,
+            "products_with_ozon_category": 0,
+            "category_pairs": 0,
+            "category_pairs_missing_cache": 0,
+            "imported_attributes": 0,
+            "required_attributes": 0,
+        }
+
+    pair_set: set[tuple[int, int]] = set()
+    products_with_ozon_category = 0
+    chunk_size = 900
+    for start in range(0, len(ids), chunk_size):
+        chunk = ids[start : start + chunk_size]
+        placeholders = ", ".join(["?"] * len(chunk))
+        rows = conn.execute(
+            f"""
+            SELECT id, ozon_description_category_id, ozon_type_id
+            FROM products
+            WHERE id IN ({placeholders})
+            """,
+            tuple(chunk),
+        ).fetchall()
+        for row in rows:
+            desc_id = int(row["ozon_description_category_id"] or 0)
+            type_id = int(row["ozon_type_id"] or 0)
+            if desc_id > 0 and type_id > 0:
+                products_with_ozon_category += 1
+                pair_set.add((desc_id, type_id))
+
+    imported_attributes = 0
+    required_attributes = 0
+    missing_cache = 0
+    for desc_id, type_id in sorted(pair_set):
+        result = ensure_ozon_requirements_for_product_category(
+            conn,
+            description_category_id=int(desc_id),
+            type_id=int(type_id),
+        )
+        imported_attributes += int(result.get("imported") or 0)
+        required_attributes += int(result.get("required") or 0)
+        if int(result.get("cached") or 0) <= 0:
+            missing_cache += 1
+
+    return {
+        "products_total": int(len(ids)),
+        "products_with_ozon_category": int(products_with_ozon_category),
+        "category_pairs": int(len(pair_set)),
+        "category_pairs_missing_cache": int(missing_cache),
+        "imported_attributes": int(imported_attributes),
+        "required_attributes": int(required_attributes),
+    }
+
+
 def _build_ozon_template_category_options(
     conn,
     channel_code: str | None = None,
@@ -1969,7 +2029,8 @@ def show_import_tab():
 2. `Сохранить профиль`: записывает профиль поставщика (имя, сайт, URL template) в БД.
 3. `Импортировать`: запускает импорт файла в мастер-каталог.
 4. `После импорта автоматически привязывать товары к Ozon категориям`: сразу фиксирует эталонную категорию/подкатегорию Ozon.
-5. Далее переходи в `Каталог` и запускай supplier enrichment уже по Ozon-структуре.
+5. `После импорта автоматически подтягивать Ozon-атрибуты категорий`: подготовит атрибуты категории для карточек товаров.
+6. Далее переходи в `Каталог` и запускай supplier enrichment уже по Ozon-структуре.
             """
         )
     st.download_button(
@@ -2047,6 +2108,12 @@ def show_import_tab():
         value=True,
         help="Работает, если кэш категорий Ozon уже синхронизирован во вкладке Ozon.",
         key="import_auto_ozon_match",
+    )
+    auto_seed_ozon_attrs_after_import = st.checkbox(
+        "После импорта автоматически подтягивать Ozon-атрибуты категорий для карточек",
+        value=True,
+        help="После Ozon-автопривязки добавит category requirements, чтобы атрибуты сразу были доступны в карточках.",
+        key="import_auto_seed_ozon_attrs",
     )
 
     if uploaded is not None:
@@ -2141,6 +2208,14 @@ def show_import_tab():
                                 f"Ozon автопривязка: обработано {ozon_match_result['processed']}, "
                                 f"привязано {ozon_match_result['assigned']}, пропущено {ozon_match_result['skipped']}"
                             )
+                        if auto_seed_ozon_attrs_after_import:
+                            seeded = ensure_ozon_requirements_for_products(conn, batch_ids)
+                            st.caption(
+                                "Ozon-атрибуты категорий подтянуты: "
+                                f"товаров с Ozon-категорией {int(seeded.get('products_with_ozon_category') or 0)} из {int(seeded.get('products_total') or 0)}, "
+                                f"пар категорий {int(seeded.get('category_pairs') or 0)}, "
+                                f"импортировано атрибутов {int(seeded.get('imported_attributes') or 0)}."
+                            )
                 batch_df = load_products(conn, limit=1000, import_batch_id=result.batch_id)
                 missing_supplier_count = conn.execute(
                     """
@@ -2199,6 +2274,8 @@ def show_catalog_tab():
 - `Скачать текущую страницу Excel`: выгружает только отображаемую страницу.
 - `Автопривязать Ozon категории (текущая страница)`: сначала назначает эталонные Ozon категории/подкатегории.
 - `Перепривязать Ozon категории (force)`: автоподбор с перезаписью.
+- `Подтянуть Ozon-атрибуты (текущая страница)`: массово подготовить Ozon-атрибуты категорий для карточек товаров страницы.
+- `Подтянуть Ozon-атрибуты (вся выборка фильтра)`: то же действие для всей выборки по фильтрам.
 - `Обогатить поставщика по текущей странице`: после Ozon-привязки тянет данные с supplier_url и fallback-источников.
 - `Обогатить поставщика по всей выборке фильтра`: тот же этап, но на всей фильтрации.
 - `Обновить дубли по текущей выборке`: пересчет дублей по текущей странице.
@@ -2488,6 +2565,7 @@ def show_catalog_tab():
         target_ids = candidate_ids[: int(run_limit)]
         ozon_processed = 0
         ozon_assigned = 0
+        ozon_attr_imported = 0
         if bool(pre_ozon_before_enrich) and target_ids:
             pre_res = bulk_assign_ozon_categories(
                 conn,
@@ -2497,6 +2575,8 @@ def show_catalog_tab():
             )
             ozon_processed = int(pre_res.get("processed") or 0)
             ozon_assigned = int(pre_res.get("assigned") or 0)
+            seeded = ensure_ozon_requirements_for_products(conn, [int(x) for x in target_ids])
+            ozon_attr_imported = int(seeded.get("imported_attributes") or 0)
         progress = st.progress(0)
         processed = 0
         success = 0
@@ -2531,6 +2611,7 @@ def show_catalog_tab():
             f"[{run_label}] Обогащение завершено: обработано {processed}, успешно {success}, ошибок {failed}, "
             f"fallback {used_fallback}, listing->product {resolved_from_listing}, "
             f"Ozon автопривязка до парсинга: обработано {ozon_processed}, назначено {ozon_assigned}, "
+            f"подтянуто Ozon-атрибутов {ozon_attr_imported}, "
             f"отложено по лимиту {skipped_by_limit}."
         )
 
@@ -2551,6 +2632,26 @@ def show_catalog_tab():
             else:
                 st.success(f"Ozon force-привязка: обработано {res['processed']}, привязано {res['assigned']}, пропущено {res['skipped']}")
             st.rerun()
+
+    oextra1, oextra2 = st.columns(2)
+    with oextra1:
+        if st.button("Подтянуть Ozon-атрибуты (текущая страница)", help="Подготовить category requirements Ozon для товаров текущей страницы, чтобы атрибуты появились в карточках"):
+            seeded = ensure_ozon_requirements_for_products(conn, [int(x) for x in ids])
+            st.success(
+                "Готово по текущей странице: "
+                f"товаров с Ozon-категорией {int(seeded.get('products_with_ozon_category') or 0)} из {int(seeded.get('products_total') or 0)}, "
+                f"пар категорий {int(seeded.get('category_pairs') or 0)}, "
+                f"импортировано атрибутов {int(seeded.get('imported_attributes') or 0)}."
+            )
+    with oextra2:
+        if st.button("Подтянуть Ozon-атрибуты (вся выборка фильтра)", help="Подготовить category requirements Ozon для всей текущей выборки"):
+            seeded = ensure_ozon_requirements_for_products(conn, [int(x) for x in all_filtered_candidate_ids])
+            st.success(
+                "Готово по всей выборке: "
+                f"товаров с Ozon-категорией {int(seeded.get('products_with_ozon_category') or 0)} из {int(seeded.get('products_total') or 0)}, "
+                f"пар категорий {int(seeded.get('category_pairs') or 0)}, "
+                f"импортировано атрибутов {int(seeded.get('imported_attributes') or 0)}."
+            )
 
     b1, b2, b3 = st.columns(3)
     with b1:
@@ -2760,7 +2861,7 @@ def enrich_product_from_supplier(
             effective_supplier_url = supplier_url
             low_url = effective_supplier_url.lower()
             if ("?q=" in low_url) and low_url.rstrip().endswith("?q="):
-                query_candidate = str(product.get("supplier_article") or product.get("article") or product.get("name") or "").strip()
+                query_candidate = str(product["supplier_article"] or product["article"] or product["name"] or "").strip()
                 if query_candidate:
                     effective_supplier_url = f"{effective_supplier_url}{quote(query_candidate, safe='')}"
             try:
@@ -2962,7 +3063,10 @@ def enrich_product_from_supplier(
 
         updates = {}
         skipped_manual_fields = []
-        has_ozon_priority = bool(int(product.get("ozon_description_category_id") or 0) > 0 and int(product.get("ozon_type_id") or 0) > 0)
+        has_ozon_priority = bool(
+            int(product["ozon_description_category_id"] or 0) > 0
+            and int(product["ozon_type_id"] or 0) > 0
+        )
         fields = [
             "name",
             "brand",
