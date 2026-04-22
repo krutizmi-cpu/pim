@@ -145,6 +145,8 @@ PARSER_SETTINGS_DEFAULTS: dict[str, object] = {
     "timeout_seconds": 8.0,
     "max_hops": 1,
     "fallback_max_results": 4,
+    "source_strategy": "auto_full",
+    "extra_fallback_domains": "",
     "require_article_match": True,
     "min_name_overlap": 2,
     "min_fallback_score": 3.0,
@@ -214,6 +216,8 @@ def load_parser_settings(conn) -> dict[str, object]:
         "timeout_seconds": float(timeout_raw) if str(timeout_raw).strip() not in {"", "None"} else float(PARSER_SETTINGS_DEFAULTS["timeout_seconds"]),
         "max_hops": int(float(max_hops_raw)) if str(max_hops_raw).strip() not in {"", "None"} else int(PARSER_SETTINGS_DEFAULTS["max_hops"]),
         "fallback_max_results": int(float(max_results_raw)) if str(max_results_raw).strip() not in {"", "None"} else int(PARSER_SETTINGS_DEFAULTS["fallback_max_results"]),
+        "source_strategy": str(_get_system_setting(conn, "parser.source_strategy", PARSER_SETTINGS_DEFAULTS["source_strategy"]) or PARSER_SETTINGS_DEFAULTS["source_strategy"]),
+        "extra_fallback_domains": str(_get_system_setting(conn, "parser.extra_fallback_domains", PARSER_SETTINGS_DEFAULTS["extra_fallback_domains"]) or ""),
         "require_article_match": _to_bool_setting(_get_system_setting(conn, "parser.require_article_match", PARSER_SETTINGS_DEFAULTS["require_article_match"]), bool(PARSER_SETTINGS_DEFAULTS["require_article_match"])),
         "min_name_overlap": int(float(min_name_overlap_raw)) if str(min_name_overlap_raw).strip() not in {"", "None"} else int(PARSER_SETTINGS_DEFAULTS["min_name_overlap"]),
         "min_fallback_score": float(min_fallback_score_raw) if str(min_fallback_score_raw).strip() not in {"", "None"} else float(PARSER_SETTINGS_DEFAULTS["min_fallback_score"]),
@@ -226,6 +230,9 @@ def load_parser_settings(conn) -> dict[str, object]:
     settings["timeout_seconds"] = max(2.0, min(30.0, float(settings["timeout_seconds"])))
     settings["max_hops"] = max(1, min(3, int(settings["max_hops"])))
     settings["fallback_max_results"] = max(1, min(12, int(settings["fallback_max_results"])))
+    valid_strategies = {"auto_full", "supplier_only", "supplier_plus_ozon", "supplier_plus_yandex", "web_only", "custom_domains"}
+    if str(settings.get("source_strategy") or "") not in valid_strategies:
+        settings["source_strategy"] = str(PARSER_SETTINGS_DEFAULTS["source_strategy"])
     settings["min_name_overlap"] = max(1, min(5, int(settings["min_name_overlap"])))
     settings["min_fallback_score"] = max(0.0, min(10.0, float(settings["min_fallback_score"])))
     return settings
@@ -235,6 +242,8 @@ def save_parser_settings(conn, settings: dict[str, object]) -> None:
     _set_system_setting(conn, "parser.timeout_seconds", float(settings.get("timeout_seconds", PARSER_SETTINGS_DEFAULTS["timeout_seconds"])))
     _set_system_setting(conn, "parser.max_hops", int(settings.get("max_hops", PARSER_SETTINGS_DEFAULTS["max_hops"])))
     _set_system_setting(conn, "parser.fallback_max_results", int(settings.get("fallback_max_results", PARSER_SETTINGS_DEFAULTS["fallback_max_results"])))
+    _set_system_setting(conn, "parser.source_strategy", str(settings.get("source_strategy", PARSER_SETTINGS_DEFAULTS["source_strategy"])))
+    _set_system_setting(conn, "parser.extra_fallback_domains", str(settings.get("extra_fallback_domains", "") or ""))
     _set_system_setting(conn, "parser.require_article_match", 1 if bool(settings.get("require_article_match", True)) else 0)
     _set_system_setting(conn, "parser.min_name_overlap", int(settings.get("min_name_overlap", PARSER_SETTINGS_DEFAULTS["min_name_overlap"])))
     _set_system_setting(conn, "parser.min_fallback_score", float(settings.get("min_fallback_score", PARSER_SETTINGS_DEFAULTS["min_fallback_score"])))
@@ -627,6 +636,303 @@ def _is_parsed_result_relevant(product_row: dict, parsed: dict, source_url: str,
     if (not require_article_match) and fallback_score >= (min_fallback_score + 1.0):
         return True, f"score={fallback_score:.2f}"
     return False, f"rejected: code_match={code_match}, overlap={overlap}, brand_match={brand_match}, score={fallback_score:.2f}"
+
+
+_ATTR_MATCH_STOPWORDS = {
+    "ozon",
+    "товар",
+    "товара",
+    "характеристика",
+    "характеристики",
+    "параметр",
+    "параметры",
+    "значение",
+    "для",
+    "и",
+    "в",
+    "на",
+    "с",
+    "the",
+    "with",
+    "for",
+    "item",
+    "product",
+}
+
+
+def _is_empty_like(value: object) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, (list, tuple, dict, set)):
+        return len(value) == 0
+    text = str(value).strip().lower()
+    return text in {"", "none", "null", "nan", "-", "—"}
+
+
+def _normalize_attr_text(value: object) -> str:
+    text = str(value or "").strip().lower().replace("ё", "е")
+    text = re.sub(r"[\(\)\[\],;:]+", " ", text)
+    return " ".join(text.split())
+
+
+def _tokenize_attr_text(value: object) -> set[str]:
+    tokens = set(re.findall(r"[a-zа-я0-9]{2,}", _normalize_attr_text(value)))
+    return {t for t in tokens if t not in _ATTR_MATCH_STOPWORDS}
+
+
+def _extract_number_like(value: object) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip().lower().replace(",", ".")
+    m = re.search(r"(-?\d+(?:\.\d+)?)", text)
+    if not m:
+        return None
+    try:
+        return float(m.group(1))
+    except Exception:
+        return None
+
+
+def _coerce_value_for_attr_type(value: object, data_type: str | None) -> object:
+    kind = str(data_type or "text").strip().lower()
+    if kind == "number":
+        num = _extract_number_like(value)
+        return num if num is not None else value
+    if kind == "boolean":
+        text = str(value or "").strip().lower()
+        if text in {"1", "true", "yes", "да", "есть"}:
+            return True
+        if text in {"0", "false", "no", "нет", "none"}:
+            return False
+    return value
+
+
+def _parse_domain_list(value: object) -> list[str]:
+    text = str(value or "").strip()
+    if not text:
+        return []
+    out: list[str] = []
+    for part in re.split(r"[,\n;]+", text):
+        dom = str(part or "").strip().lower()
+        if not dom:
+            continue
+        dom = re.sub(r"^https?://", "", dom)
+        dom = dom.split("/")[0].strip()
+        dom = dom.replace("www.", "")
+        if not dom or "." not in dom:
+            continue
+        if dom not in out:
+            out.append(dom)
+    return out
+
+
+def _infer_attr_semantic_key(attr_name: str) -> str:
+    key = _normalize_attr_text(attr_name)
+    if any(x in key for x in ("вес брутто", "gross")):
+        return "gross_weight"
+    if "вес" in key:
+        return "weight"
+    if any(x in key for x in ("длина упаков", "длина короб", "package length")):
+        return "package_length"
+    if any(x in key for x in ("ширина упаков", "ширина короб", "package width")):
+        return "package_width"
+    if any(x in key for x in ("высота упаков", "высота короб", "package height")):
+        return "package_height"
+    if "длина" in key:
+        return "length"
+    if "ширина" in key:
+        return "width"
+    if any(x in key for x in ("высота", "глубина", "depth")):
+        return "height"
+    if any(x in key for x in ("бренд", "торговая марка", "manufacturer", "brand", "производитель")):
+        return "brand"
+    if any(x in key for x in ("описан", "description")):
+        return "description"
+    if any(x in key for x in ("артикул", "sku", "vendor code", "код товара", "модель")):
+        return "article"
+    if any(x in key for x in ("фото", "изображ", "image", "картин")):
+        return "image_url"
+    if any(x in key for x in ("цвет", "color")):
+        return "color"
+    if any(x in key for x in ("материал", "material")):
+        return "material"
+    return ""
+
+
+def _build_parsed_candidates(parsed: dict, product_row: dict) -> tuple[list[dict], dict[str, object]]:
+    candidates: list[dict] = []
+    scalar_map: dict[str, object] = {
+        "name": parsed.get("name") or product_row.get("name"),
+        "brand": parsed.get("brand") or product_row.get("brand"),
+        "description": parsed.get("description"),
+        "image_url": parsed.get("image_url"),
+        "weight": parsed.get("weight"),
+        "gross_weight": parsed.get("gross_weight"),
+        "length": parsed.get("length"),
+        "width": parsed.get("width"),
+        "height": parsed.get("height"),
+        "package_length": parsed.get("package_length"),
+        "package_width": parsed.get("package_width"),
+        "package_height": parsed.get("package_height"),
+        "article": product_row.get("supplier_article") or product_row.get("article") or product_row.get("internal_article"),
+        "barcode": product_row.get("barcode"),
+        "category": parsed.get("category") or product_row.get("category"),
+        "color": None,
+        "material": None,
+    }
+    for raw_key, raw_value in (parsed.get("attributes") or {}).items():
+        key = str(raw_key or "").strip()
+        if not key or _is_empty_like(raw_value):
+            continue
+        key_norm = _normalize_attr_text(key)
+        key_tokens = _tokenize_attr_text(key_norm)
+        value = raw_value
+        candidates.append(
+            {
+                "key": key,
+                "key_norm": key_norm,
+                "key_tokens": key_tokens,
+                "value": value,
+            }
+        )
+        key_semantic = _infer_attr_semantic_key(key)
+        if key_semantic and _is_empty_like(scalar_map.get(key_semantic)):
+            scalar_map[key_semantic] = value
+
+    for semantic_key, semantic_value in scalar_map.items():
+        if _is_empty_like(semantic_value):
+            continue
+        candidates.append(
+            {
+                "key": f"scalar:{semantic_key}",
+                "key_norm": _normalize_attr_text(str(semantic_key)),
+                "key_tokens": _tokenize_attr_text(str(semantic_key)),
+                "value": semantic_value,
+            }
+        )
+    return candidates, scalar_map
+
+
+def _resolve_best_value_for_attr(attr_name: str, candidates: list[dict], scalar_map: dict[str, object]) -> tuple[object, str, float] | None:
+    attr_norm = _normalize_attr_text(attr_name)
+    attr_tokens = _tokenize_attr_text(attr_norm)
+    semantic = _infer_attr_semantic_key(attr_name)
+    if semantic and not _is_empty_like(scalar_map.get(semantic)):
+        return scalar_map.get(semantic), f"semantic:{semantic}", 10.0
+
+    best: tuple[object, str, float] | None = None
+    for c in candidates:
+        key_norm = str(c.get("key_norm") or "")
+        key_tokens = set(c.get("key_tokens") or set())
+        value = c.get("value")
+        if _is_empty_like(value):
+            continue
+        score = 0.0
+        if key_norm == attr_norm:
+            score += 7.0
+        elif key_norm and (key_norm in attr_norm or attr_norm in key_norm):
+            score += 4.0
+        if attr_tokens and key_tokens:
+            overlap = len(attr_tokens & key_tokens) / max(len(attr_tokens), 1)
+            score += overlap * 4.0
+        cand_semantic = _infer_attr_semantic_key(key_norm)
+        if semantic and cand_semantic and semantic == cand_semantic:
+            score += 3.0
+        if best is None or score > best[2]:
+            best = (value, str(c.get("key") or ""), float(score))
+    if best and float(best[2]) >= 2.5:
+        return best
+    return None
+
+
+def _fill_ozon_attrs_from_parsed(
+    conn,
+    product_row: dict,
+    parsed: dict,
+    source_type: str,
+    source_url: str,
+    force: bool = False,
+) -> dict[str, int]:
+    product_id = int(product_row.get("id") or 0)
+    desc_id = int(product_row.get("ozon_description_category_id") or 0)
+    type_id = int(product_row.get("ozon_type_id") or 0)
+    if product_id <= 0 or desc_id <= 0 or type_id <= 0:
+        return {"saved": 0, "skipped": 0}
+
+    category_code = f"ozon:{desc_id}:{type_id}"
+    req_rows = conn.execute(
+        """
+        SELECT
+            car.attribute_code,
+            ad.name AS attribute_name,
+            ad.data_type
+        FROM channel_attribute_requirements car
+        JOIN attribute_definitions ad
+          ON ad.code = car.attribute_code
+        WHERE car.channel_code = 'ozon'
+          AND car.category_code = ?
+        ORDER BY car.is_required DESC, ad.name
+        """,
+        (category_code,),
+    ).fetchall()
+    if not req_rows:
+        try:
+            ensure_ozon_requirements_for_product_category(conn, desc_id, type_id)
+        except Exception:
+            pass
+        req_rows = conn.execute(
+            """
+            SELECT
+                car.attribute_code,
+                ad.name AS attribute_name,
+                ad.data_type
+            FROM channel_attribute_requirements car
+            JOIN attribute_definitions ad
+              ON ad.code = car.attribute_code
+            WHERE car.channel_code = 'ozon'
+              AND car.category_code = ?
+            ORDER BY car.is_required DESC, ad.name
+            """,
+            (category_code,),
+        ).fetchall()
+    if not req_rows:
+        return {"saved": 0, "skipped": 0}
+
+    candidates, scalar_map = _build_parsed_candidates(parsed, product_row)
+    saved = 0
+    skipped = 0
+    for row in req_rows:
+        code = str(row["attribute_code"] or "").strip()
+        if not code:
+            continue
+        resolved = _resolve_best_value_for_attr(str(row["attribute_name"] or code), candidates, scalar_map)
+        if not resolved:
+            continue
+        value, matched_by, score = resolved
+        if _is_empty_like(value):
+            continue
+        field_name = f"attr:{code}"
+        if not can_overwrite_field(conn, product_id, field_name, source_type, force=force):
+            skipped += 1
+            continue
+        coerced = _coerce_value_for_attr_type(value, str(row.get("data_type") or "text"))
+        try:
+            set_product_attribute_value(conn, product_id, code, coerced)
+            save_field_source(
+                conn=conn,
+                product_id=product_id,
+                field_name=field_name,
+                source_type=source_type,
+                source_value_raw=coerced,
+                source_url=f"{source_url} | match={matched_by}",
+                confidence=min(0.95, max(0.45, float(score) / 10.0)),
+            )
+            saved += 1
+        except Exception:
+            skipped += 1
+    return {"saved": int(saved), "skipped": int(skipped)}
 
 
 def _build_ozon_scope_labels(conn) -> dict[str, str]:
@@ -2333,6 +2639,25 @@ def show_catalog_tab():
                 key="parser_cfg_min_fallback_score",
             )
         with p2:
+            strategy_options = [
+                ("auto_full", "Авто (поставщик -> Ozon -> Яндекс -> web)"),
+                ("supplier_only", "Только сайт поставщика"),
+                ("supplier_plus_ozon", "Поставщик + Ozon"),
+                ("supplier_plus_yandex", "Поставщик + Яндекс Маркет"),
+                ("web_only", "Только интернет-поиск (без Ozon/Яндекс)"),
+                ("custom_domains", "Только выбранные домены"),
+            ]
+            strategy_values = [x[0] for x in strategy_options]
+            current_strategy = str(parser_settings.get("source_strategy", "auto_full") or "auto_full")
+            if current_strategy not in strategy_values:
+                current_strategy = "auto_full"
+            ps_source_strategy = st.selectbox(
+                "Стратегия источников парсинга",
+                options=strategy_values,
+                index=strategy_values.index(current_strategy),
+                format_func=lambda x: next((label for key, label in strategy_options if key == x), x),
+                key="parser_cfg_source_strategy",
+            )
             ps_web = st.checkbox(
                 "Включить web fallback",
                 value=bool(parser_settings.get("enable_web_fallback", True)),
@@ -2355,6 +2680,12 @@ def show_catalog_tab():
                 help="Защищает от подстановки данных не того товара при fallback-поиске.",
             )
         with p3:
+            ps_extra_domains = st.text_area(
+                "Доп. домены fallback (через запятую)",
+                value=str(parser_settings.get("extra_fallback_domains", "") or ""),
+                key="parser_cfg_extra_fallback_domains",
+                help="Пример: sportmaster.ru, alltricks.com, chainreactioncycles.com. Для стратегии `Только выбранные домены` обязательно заполнить.",
+            )
             ps_stats = st.checkbox(
                 "Fallback габаритов из каталога",
                 value=bool(parser_settings.get("enable_stats_fallback", True)),
@@ -2391,6 +2722,8 @@ def show_catalog_tab():
                 "timeout_seconds": float(ps_timeout),
                 "max_hops": int(ps_max_hops),
                 "fallback_max_results": int(ps_max_results),
+                "source_strategy": str(ps_source_strategy),
+                "extra_fallback_domains": str(ps_extra_domains or "").strip(),
                 "require_article_match": bool(ps_require_article_match),
                 "min_name_overlap": int(ps_min_overlap),
                 "min_fallback_score": float(ps_min_score),
@@ -2828,11 +3161,32 @@ def enrich_product_from_supplier(
     effective_timeout = max(2.0, min(30.0, float(effective_timeout)))
     max_hops = max(1, min(3, int(settings.get("max_hops", 1))))
     fallback_max_results = max(1, min(12, int(settings.get("fallback_max_results", 4))))
+    source_strategy = str(settings.get("source_strategy", "auto_full") or "auto_full")
+    extra_fallback_domains = _parse_domain_list(settings.get("extra_fallback_domains", ""))
     enable_web_fallback = bool(settings.get("enable_web_fallback", True))
     enable_ozon_fallback = bool(settings.get("enable_ozon_fallback", True))
     enable_yandex_fallback = bool(settings.get("enable_yandex_fallback", True))
     enable_stats_fallback = bool(settings.get("enable_stats_fallback", True))
     enable_defaults_fallback = bool(settings.get("enable_defaults_fallback", True))
+
+    if source_strategy == "supplier_only":
+        enable_web_fallback = False
+        enable_ozon_fallback = False
+        enable_yandex_fallback = False
+    elif source_strategy == "supplier_plus_ozon":
+        enable_yandex_fallback = False
+        enable_web_fallback = False
+    elif source_strategy == "supplier_plus_yandex":
+        enable_ozon_fallback = False
+        enable_web_fallback = False
+    elif source_strategy == "web_only":
+        enable_ozon_fallback = False
+        enable_yandex_fallback = False
+        enable_web_fallback = True
+    elif source_strategy == "custom_domains":
+        enable_ozon_fallback = False
+        enable_yandex_fallback = False
+        enable_web_fallback = bool(extra_fallback_domains)
 
     supplier_url = (product["supplier_url"] or "").strip() if product["supplier_url"] else ""
 
@@ -2891,7 +3245,7 @@ def enrich_product_from_supplier(
         has_dims = any(parsed.get(k) not in (None, "", 0, 0.0) for k in dim_fields)
         need_fallback = (not has_meaningful_supplier_data(parsed)) or bool(parsed.get("listing_only")) or (not has_dims) or is_dimension_payload_suspicious(parsed) or (not supplier_url)
 
-        if need_fallback and enable_web_fallback:
+        if need_fallback and (enable_web_fallback or enable_ozon_fallback or enable_yandex_fallback):
             preferred_domain = ""
             try:
                 preferred_domain = (urlparse(str(source_url or supplier_url)).netloc or "").lower().replace("www.", "")
@@ -2909,38 +3263,27 @@ def enrich_product_from_supplier(
             fallback_query = " ".join([p for p in fallback_query_parts if p])
             fallback = {}
             fallback_stage = "generic_web"
+            fallback_targets: list[tuple[str, str | None]] = []
             if enable_ozon_fallback:
-                fallback = fallback_search_product_data(
-                    fallback_query,
-                    timeout=float(effective_timeout),
-                    max_results=int(fallback_max_results),
-                    hints=parse_hints,
-                    preferred_domain="ozon.ru",
-                )
-                if fallback:
-                    fallback_stage = "ozon_search_fallback"
+                fallback_targets.append(("ozon_search_fallback", "ozon.ru"))
+            if enable_yandex_fallback:
+                fallback_targets.append(("yandex_search_fallback", "market.yandex.ru"))
+            for dom in extra_fallback_domains:
+                fallback_targets.append(("domain_search_fallback", dom))
+            if enable_web_fallback:
+                fallback_targets.append(("web_search_fallback", preferred_domain or None))
 
-            if (not fallback) and enable_yandex_fallback:
+            for stage_name, domain in fallback_targets:
                 fallback = fallback_search_product_data(
                     fallback_query,
                     timeout=float(effective_timeout),
                     max_results=int(fallback_max_results),
                     hints=parse_hints,
-                    preferred_domain="market.yandex.ru",
+                    preferred_domain=domain,
                 )
                 if fallback:
-                    fallback_stage = "yandex_search_fallback"
-
-            if not fallback:
-                fallback = fallback_search_product_data(
-                    fallback_query,
-                    timeout=float(effective_timeout),
-                    max_results=int(fallback_max_results),
-                    hints=parse_hints,
-                    preferred_domain=preferred_domain or None,
-                )
-                if fallback:
-                    fallback_stage = "web_search_fallback"
+                    fallback_stage = stage_name
+                    break
             if fallback and has_meaningful_supplier_data(fallback):
                 is_relevant, relevance_reason = _is_parsed_result_relevant(
                     product_row=product_row,
@@ -3108,19 +3451,25 @@ def enrich_product_from_supplier(
 
         attributes_saved = 0
         skipped_attribute_fields = []
+        existing_defs = list_attribute_definitions(conn)
+        defs_by_code = {str(d.get("code")): d for d in existing_defs if str(d.get("code") or "").strip()}
+        defs_by_name_norm = {
+            _normalize_attr_text(str(d.get("name") or "")): str(d.get("code") or "")
+            for d in existing_defs
+            if str(d.get("name") or "").strip() and str(d.get("code") or "").strip()
+        }
         for attr_name, attr_value in (parsed.get("attributes") or {}).items():
             clean_code = str(attr_name).strip().lower()
             clean_code = "_".join("".join(ch if ch.isalnum() else " " for ch in clean_code).split())
             if not clean_code:
                 continue
-            attr_field_name = f"attr:{clean_code}"
+            name_norm = _normalize_attr_text(attr_name)
+            target_code = defs_by_name_norm.get(name_norm) or clean_code
+            attr_field_name = f"attr:{target_code}"
             if not can_overwrite_field(conn, product_id, attr_field_name, source_type, force=force):
-                skipped_attribute_fields.append(clean_code)
+                skipped_attribute_fields.append(target_code)
                 continue
-            existing_def = conn.execute(
-                "SELECT code FROM attribute_definitions WHERE code = ?",
-                (clean_code,),
-            ).fetchone()
+            existing_def = defs_by_code.get(target_code)
             if not existing_def:
                 conn.execute(
                     """
@@ -3128,9 +3477,9 @@ def enrich_product_from_supplier(
                     (code, name, data_type, scope, entity_type, is_required, is_multi_value, unit, description, created_at, updated_at)
                     VALUES (?, ?, 'text', 'master', 'product', 0, 0, NULL, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
                     """,
-                    (clean_code, str(attr_name).strip(), f"Автосоздано из source: {source_url}"),
+                    (target_code, str(attr_name).strip(), f"Автосоздано из source: {source_url}"),
                 )
-            set_product_attribute_value(conn, product_id, clean_code, str(attr_value))
+            set_product_attribute_value(conn, product_id, target_code, str(attr_value))
             save_field_source(
                 conn=conn,
                 product_id=product_id,
@@ -3141,6 +3490,15 @@ def enrich_product_from_supplier(
                 confidence=0.6 if source_type == "supplier_page" else 0.45,
             )
             attributes_saved += 1
+
+        ozon_attr_fill = _fill_ozon_attrs_from_parsed(
+            conn=conn,
+            product_row=product_row,
+            parsed=parsed,
+            source_type=source_type,
+            source_url=source_url,
+            force=force,
+        )
 
         image_urls = [str(x).strip() for x in (parsed.get("image_urls") or []) if str(x).strip()]
         if image_urls:
@@ -3166,7 +3524,7 @@ def enrich_product_from_supplier(
                     confidence=0.7 if source_type == "supplier_page" else 0.45,
                 )
 
-        parse_comment = f"source={source_type}; url={source_url}"
+        parse_comment = f"source={source_type}; strategy={source_strategy}; url={source_url}"
         if parsed.get("resolved_from_listing"):
             parse_comment += "; listing->product resolved"
         if used_fallback:
@@ -3233,18 +3591,24 @@ def enrich_product_from_supplier(
         ozon_match = bulk_assign_ozon_categories(conn, [int(product_id)], min_score=OZON_CATEGORY_MIN_SCORE, force=False)
         skipped_msg = f", пропущено ручных полей: {len(skipped_manual_fields)}" if skipped_manual_fields else ""
         skipped_attr_msg = f", пропущено атрибутов по приоритету: {len(skipped_attribute_fields)}" if skipped_attribute_fields else ""
+        ozon_attr_msg = (
+            f", Ozon-атрибутов заполнено: {int(ozon_attr_fill.get('saved') or 0)}"
+            if int(ozon_attr_fill.get("saved") or 0) > 0
+            else ""
+        )
         ozon_msg = f", Ozon category match: {ozon_match.get('assigned', 0)}" if ozon_match.get("processed") else ""
-        fallback_msg = ", использован web fallback" if used_fallback else ""
+        fallback_msg = f", использован fallback: {source_type}" if used_fallback else ""
         stats_msg = ", использован category-stats fallback" if used_stats_fallback else ""
         defaults_msg = ", использованы category defaults" if used_category_defaults else ""
         return {
             "ok": True,
-            "message": f"Обогащение завершено, обновлено полей: {len(updates)}, атрибутов сохранено: {attributes_saved}{fallback_msg}{stats_msg}{defaults_msg}{skipped_msg}{skipped_attr_msg}{ozon_msg}",
+            "message": f"Обогащение завершено, обновлено полей: {len(updates)}, атрибутов сохранено: {attributes_saved}{ozon_attr_msg}{fallback_msg}{stats_msg}{defaults_msg}{skipped_msg}{skipped_attr_msg}{ozon_msg}",
             "updates": updates,
             "attributes": parsed.get("attributes", {}),
             "image_urls": parsed.get("image_urls", []),
             "skipped_manual_fields": skipped_manual_fields,
             "skipped_attribute_fields": skipped_attribute_fields,
+            "ozon_attrs_filled": int(ozon_attr_fill.get("saved") or 0),
             "source_url": source_url,
             "source_type": source_type,
         }
@@ -3365,6 +3729,8 @@ def show_product_tab():
                 "timeout_seconds": parser_settings.get("timeout_seconds"),
                 "max_hops": parser_settings.get("max_hops"),
                 "fallback_max_results": parser_settings.get("fallback_max_results"),
+                "source_strategy": parser_settings.get("source_strategy"),
+                "extra_fallback_domains": parser_settings.get("extra_fallback_domains"),
                 "require_article_match": parser_settings.get("require_article_match"),
                 "min_name_overlap": parser_settings.get("min_name_overlap"),
                 "min_fallback_score": parser_settings.get("min_fallback_score"),
@@ -3382,6 +3748,7 @@ def show_product_tab():
 - Если у товара уже определена Ozon-категория, её атрибуты автоматически подтягиваются в блок редактирования ниже.
 - `Спарсить поставщика`: аккуратное обогащение карточки с сайта поставщика.
 - `Перезаполнить из поставщика`: force-перезапись полей из supplier page.
+- `Стратегия парсинга для этого товара`: вручную выбрать, где искать данные (только поставщик, Ozon, Яндекс, web, домены).
 - `Подобрать Ozon категорию`: автоподбор эталонной категории Ozon.
 - `Перепривязать Ozon категорию (force)`: повторный подбор Ozon категории с перезаписью.
 - `Сохранить карточку`: сохранение ручных изменений.
@@ -3447,6 +3814,44 @@ def show_product_tab():
                 else:
                     st.warning("Не удалось собрать URL. Проверь шаблон и поля товара.")
 
+        sp4, sp5 = st.columns([2, 3])
+        strategy_options = [
+            ("auto_full", "Авто (поставщик -> Ozon -> Яндекс -> web)"),
+            ("supplier_only", "Только сайт поставщика"),
+            ("supplier_plus_ozon", "Поставщик + Ozon"),
+            ("supplier_plus_yandex", "Поставщик + Яндекс Маркет"),
+            ("web_only", "Только интернет-поиск"),
+            ("custom_domains", "Только выбранные домены"),
+        ]
+        strategy_values = [x[0] for x in strategy_options]
+        default_strategy = str(parser_settings.get("source_strategy", "auto_full") or "auto_full")
+        if default_strategy not in strategy_values:
+            default_strategy = "auto_full"
+        with sp4:
+            product_source_strategy = st.selectbox(
+                "Стратегия парсинга для этого товара",
+                options=strategy_values,
+                index=strategy_values.index(default_strategy),
+                format_func=lambda x: next((label for key, label in strategy_options if key == x), x),
+                key=f"product_source_strategy_{int(product_id)}",
+            )
+        with sp5:
+            product_extra_domains = st.text_input(
+                "Доп. домены (override для товара)",
+                value=str(parser_settings.get("extra_fallback_domains", "") or ""),
+                key=f"product_extra_domains_{int(product_id)}",
+                help="Через запятую: домены, где искать карточку товара для fallback.",
+            )
+
+        st.caption(
+            "Если на сайте поставщика неполные данные, используй стратегию fallback и дополнительные домены. "
+            "Это помогает подтянуть атрибуты для Ozon и клиентских шаблонов."
+        )
+
+    runtime_parser_settings = dict(parser_settings)
+    runtime_parser_settings["source_strategy"] = str(locals().get("product_source_strategy") or parser_settings.get("source_strategy", "auto_full"))
+    runtime_parser_settings["extra_fallback_domains"] = str(locals().get("product_extra_domains") or parser_settings.get("extra_fallback_domains", ""))
+
     top1, top2, top3, top4 = st.columns(4)
     top1.metric("Артикул", product["article"] or "-")
     top2.metric("Бренд", product["brand"] or "-")
@@ -3456,7 +3861,7 @@ def show_product_tab():
     ctop1, ctop2 = st.columns([1, 1])
     with ctop1:
         if st.button("Спарсить поставщика", type="primary", help="Обогатить карточку с сайта поставщика без жесткой перезаписи ручных значений"):
-            result = enrich_product_from_supplier(conn, int(product_id), force=False, parser_settings=parser_settings)
+            result = enrich_product_from_supplier(conn, int(product_id), force=False, parser_settings=runtime_parser_settings)
             if result["ok"]:
                 st.success(result["message"])
                 if result.get("updates"):
@@ -3466,7 +3871,7 @@ def show_product_tab():
                 st.error(result["message"])
     with ctop2:
         if st.button("Перезаполнить из поставщика", help="Жесткая перезапись значений из supplier page (force-режим)"):
-            result = enrich_product_from_supplier(conn, int(product_id), force=True, parser_settings=parser_settings)
+            result = enrich_product_from_supplier(conn, int(product_id), force=True, parser_settings=runtime_parser_settings)
             if result["ok"]:
                 st.success(result["message"])
                 if result.get("updates"):

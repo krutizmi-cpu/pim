@@ -11,6 +11,7 @@ SOURCE_PRIORITY = {
     "supplier_page": 70,
     "ozon_search_fallback": 62,
     "yandex_search_fallback": 60,
+    "domain_search_fallback": 59,
     "web_search_fallback": 58,
     "ai": 50,
     "name_category_inference": 40,

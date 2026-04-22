@@ -345,27 +345,78 @@ def _extract_image_urls(soup: BeautifulSoup, page_url: str | None = None) -> lis
 def _extract_attributes(soup: BeautifulSoup) -> dict[str, str]:
     attributes: dict[str, str] = {}
 
+    def _add_attr(raw_key: Any, raw_value: Any) -> None:
+        key = _clean_text(raw_key)
+        value = _clean_text(raw_value)
+        if not key or not value:
+            return
+        if len(key) > 120 or len(value) > 1200:
+            return
+        if key not in attributes:
+            attributes[key] = value
+
+    # Classic tables
     for table in soup.find_all("table"):
         for tr in table.find_all("tr"):
             cells = tr.find_all(["th", "td"])
             if len(cells) < 2:
                 continue
-            key = _clean_text(cells[0].get_text(" ", strip=True))
-            value = _clean_text(cells[1].get_text(" ", strip=True))
-            if key and value and key not in attributes:
-                attributes[key] = value
+            _add_attr(cells[0].get_text(" ", strip=True), cells[1].get_text(" ", strip=True))
 
+    # Definition lists <dl><dt>key</dt><dd>value</dd></dl>
+    for dl in soup.find_all("dl"):
+        dts = dl.find_all("dt")
+        dds = dl.find_all("dd")
+        if dts and dds:
+            for dt, dd in zip(dts, dds):
+                _add_attr(dt.get_text(" ", strip=True), dd.get_text(" ", strip=True))
+
+    # Schema.org additionalProperty blocks
+    for prop in soup.select("[itemprop='additionalProperty']"):
+        name_node = prop.select_one("[itemprop='name']")
+        value_node = prop.select_one("[itemprop='value']")
+        if name_node and value_node:
+            _add_attr(
+                name_node.get("content") or name_node.get_text(" ", strip=True),
+                value_node.get("content") or value_node.get_text(" ", strip=True),
+            )
+
+    # Common specification rows in div/span grids
+    row_selectors = [
+        ".characteristics__item",
+        ".characteristic__item",
+        ".specifications__item",
+        ".specification__item",
+        ".params__item",
+        ".param__item",
+        ".product-params__item",
+        ".property__item",
+        ".props__item",
+    ]
+    for selector in row_selectors:
+        for row in soup.select(selector):
+            children = row.find_all(["div", "span", "strong", "b"], recursive=False)
+            if len(children) >= 2:
+                _add_attr(children[0].get_text(" ", strip=True), children[1].get_text(" ", strip=True))
+            else:
+                text = _clean_text(row.get_text(" ", strip=True))
+                if not text:
+                    continue
+                text = re.sub(r"\s+[|•·]\s+", ": ", text)
+                if ":" in text:
+                    left, right = text.split(":", 1)
+                    _add_attr(left, right)
+                elif "—" in text:
+                    left, right = text.split("—", 1)
+                    _add_attr(left, right)
+
+    # Generic fallback from small textual blocks like "Материал: сталь"
     for node in soup.select("li, p, div"):
         text = _clean_text(node.get_text(" ", strip=True))
         if not text or ":" not in text or len(text) > 260:
             continue
         left, right = text.split(":", 1)
-        key = _clean_text(left)
-        value = _clean_text(right)
-        if not key or not value or len(key) > 90:
-            continue
-        if key not in attributes:
-            attributes[key] = value
+        _add_attr(left, right)
 
     return attributes
 
@@ -939,14 +990,17 @@ def _build_search_queries(
     variants: list[str] = [base]
     if strong_phrases:
         variants.append(f"\"{strong_phrases[0]}\" {base}")
+        variants.append(f"\"{strong_phrases[0]}\" характеристики")
     if tokens:
         variants.append(" ".join(tokens[:5]))
+        variants.append(" ".join(tokens[:5]) + " характеристики")
     if preferred_domain:
         dom = preferred_domain.lower().replace("www.", "").strip()
         if dom:
             variants.append(f"site:{dom} {base}")
             if strong_phrases:
                 variants.append(f"site:{dom} \"{strong_phrases[0]}\"")
+                variants.append(f"site:{dom} \"{strong_phrases[0]}\" характеристики")
     deduped: list[str] = []
     seen: set[str] = set()
     for v in variants:
