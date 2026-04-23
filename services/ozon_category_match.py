@@ -13,6 +13,18 @@ STOP_TOKENS = {
     "товар", "товары", "прочее", "другое", "разное", "аксессуар", "аксессуары",
 }
 GENERIC_CATEGORY_TOKENS = {"прочее", "товары", "другое", "разное", "other", "misc"}
+WEAK_CATEGORY_VALUES = {
+    "",
+    "прочее",
+    "другое",
+    "разное",
+    "товары",
+    "товар",
+    "каталог",
+    "продукция",
+    "other",
+    "misc",
+}
 
 
 def _split_ozon_path(path: str | None) -> list[str]:
@@ -46,7 +58,8 @@ def _build_catalog_mapping_key(product_row: dict[str, Any]) -> str:
     base = _normalize_mapping_key_part(product_row.get("base_category"))
     sub = _normalize_mapping_key_part(product_row.get("subcategory"))
     cat = _normalize_mapping_key_part(product_row.get("category"))
-    if not any([supplier, base, sub, cat]):
+    strong_tokens = _strong_anchor_tokens(product_row)
+    if not any([supplier, base, sub, cat]) or not strong_tokens:
         return ""
     return f"{supplier}|{base}|{sub}|{cat}"
 
@@ -132,18 +145,43 @@ def _tokenize(text: str | None) -> set[str]:
     return {t for t in tokens if len(t) >= 2 and t not in STOP_TOKENS}
 
 
+def _is_weak_category_value(value: str | None) -> bool:
+    norm = _normalize(value)
+    if norm in WEAK_CATEGORY_VALUES:
+        return True
+    tokens = _tokenize(norm)
+    if not tokens:
+        return True
+    if tokens.issubset(GENERIC_CATEGORY_TOKENS):
+        return True
+    return False
+
+
+def _strong_anchor_tokens(product_row: dict[str, Any]) -> set[str]:
+    tokens: set[str] = set()
+    for field_name in ("base_category", "subcategory", "category"):
+        value = str(product_row.get(field_name) or "").strip()
+        if _is_weak_category_value(value):
+            continue
+        field_tokens = {t for t in _tokenize(value) if t not in GENERIC_CATEGORY_TOKENS}
+        tokens.update(field_tokens)
+    return tokens
+
+
 def _query_terms(product_row: dict[str, Any]) -> list[tuple[str, float, str]]:
     weighted_candidates = [
-        (product_row.get("base_category"), 1.25, "base_category"),
-        (product_row.get("subcategory"), 1.20, "subcategory"),
-        (product_row.get("category"), 1.10, "category"),
-        (product_row.get("name"), 0.85, "name"),
+        (product_row.get("name"), 1.35, "name"),
+        (product_row.get("subcategory"), 1.05, "subcategory"),
+        (product_row.get("base_category"), 1.0, "base_category"),
+        (product_row.get("category"), 0.95, "category"),
     ]
     out: list[tuple[str, float, str]] = []
     seen = set()
     for raw_value, weight, source in weighted_candidates:
         norm = _normalize(raw_value)
         if not norm or norm in seen:
+            continue
+        if source in {"base_category", "subcategory", "category"} and _is_weak_category_value(norm):
             continue
         seen.add(norm)
         out.append((norm, float(weight), source))
@@ -206,10 +244,7 @@ def _best_match_for_product(product_row: dict[str, Any], categories: list[dict[s
     if not terms or not categories:
         return None
 
-    anchor_tokens: set[str] = set()
-    for query, _, source in terms:
-        if source in {"base_category", "subcategory", "category"}:
-            anchor_tokens.update(_tokenize(query))
+    anchor_tokens = _strong_anchor_tokens(product_row)
 
     best: dict[str, Any] | None = None
     best_score = 0.0
@@ -221,10 +256,11 @@ def _best_match_for_product(product_row: dict[str, Any], categories: list[dict[s
         if not term_tokens:
             continue
         for category in categories:
-            # Strong filter: if we have anchor tokens, require at least one overlap.
-            if anchor_tokens and not (anchor_tokens & category["tokens"]):
-                continue
             score = _score(term, term_tokens, category, weight=weight)
+            if anchor_tokens and not (anchor_tokens & category["tokens"]):
+                score *= 0.45
+            elif anchor_tokens and (anchor_tokens & category["tokens"]):
+                score *= 1.08
             if score > best_score:
                 best_score = score
                 best = category
