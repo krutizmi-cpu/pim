@@ -228,20 +228,8 @@ def _ensure_products_table(conn: sqlite3.Connection) -> None:
         if col not in existing:
             conn.execute(f"ALTER TABLE products ADD COLUMN {col} {col_type}")
 
-    conn.execute(
-        """
-        DELETE FROM products
-        WHERE article IS NOT NULL
-          AND rowid NOT IN (
-              SELECT MAX(rowid)
-              FROM products
-              WHERE article IS NOT NULL
-              GROUP BY article
-          )
-        """
-    )
-
-    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_products_article_unique ON products(article)")
+    _dedupe_products_by_article_best_effort(conn)
+    _ensure_products_article_unique_index_best_effort(conn)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_products_category ON products(category)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_products_base_category ON products(base_category)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_products_normalized_name ON products(normalized_name)")
@@ -250,6 +238,52 @@ def _ensure_products_table(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_products_internal_article ON products(internal_article)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_products_import_batch_id ON products(import_batch_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_products_ozon_category ON products(ozon_description_category_id, ozon_type_id)")
+
+
+def _dedupe_products_by_article_best_effort(conn: sqlite3.Connection) -> None:
+    """
+    Older deployed databases may contain duplicate articles.
+    This cleanup is useful, but it must never crash app startup.
+    """
+    try:
+        dup_row = conn.execute(
+            """
+            SELECT article
+            FROM products
+            WHERE article IS NOT NULL
+            GROUP BY article
+            HAVING COUNT(*) > 1
+            LIMIT 1
+            """
+        ).fetchone()
+        if not dup_row:
+            return
+        conn.execute(
+            """
+            DELETE FROM products
+            WHERE article IS NOT NULL
+              AND id NOT IN (
+                  SELECT MAX(id)
+                  FROM products
+                  WHERE article IS NOT NULL
+                  GROUP BY article
+              )
+            """
+        )
+    except sqlite3.OperationalError:
+        # Do not block app startup if table is temporarily locked or legacy schema behaves oddly.
+        return
+
+
+def _ensure_products_article_unique_index_best_effort(conn: sqlite3.Connection) -> None:
+    """
+    Try to enforce uniqueness on article, but keep the app bootable even if
+    a legacy database still contains duplicates or the table is locked.
+    """
+    try:
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_products_article_unique ON products(article)")
+    except sqlite3.OperationalError:
+        return
 
 
 def _ensure_duplicate_table(conn: sqlite3.Connection) -> None:
