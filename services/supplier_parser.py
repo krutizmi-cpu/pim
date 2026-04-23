@@ -308,6 +308,28 @@ def _normalize_image_url(url: str | None, page_url: str | None = None) -> str | 
     return text
 
 
+def _extract_srcset_urls(srcset: str | None) -> list[str]:
+    text = _clean_text(srcset)
+    if not text:
+        return []
+    urls: list[str] = []
+    for part in text.split(","):
+        piece = _clean_text(part)
+        if not piece:
+            continue
+        url = _clean_text(piece.split(" ")[0])
+        if url:
+            urls.append(url)
+    return urls
+
+
+def _looks_like_image_url(url: str) -> bool:
+    low = str(url or "").lower()
+    if re.search(r"\.(jpg|jpeg|png|webp|gif|avif|bmp|svg)(\?|$)", low):
+        return True
+    return any(token in low for token in ["/image", "/images/", "/img/", "cdn", "upload", "photo", "picture"])
+
+
 def _extract_image_urls(soup: BeautifulSoup, page_url: str | None = None) -> list[str]:
     image_urls: list[str] = []
     seen: set[str] = set()
@@ -320,25 +342,54 @@ def _extract_image_urls(soup: BeautifulSoup, page_url: str | None = None) -> lis
         ".product img",
         "img",
     ]
+    def _add_url(candidate: str | None, selector: str) -> bool:
+        normalized = _normalize_image_url(candidate, page_url=page_url)
+        if not normalized or normalized in seen:
+            return False
+        if not _looks_like_image_url(normalized):
+            # Keep OG/Twitter even without clear extension pattern.
+            if selector not in ("meta[property='og:image']", "meta[name='twitter:image']"):
+                return False
+        seen.add(normalized)
+        image_urls.append(normalized)
+        return len(image_urls) >= 40
+
     for selector in selectors:
         nodes = soup.select(selector)
         for node in nodes:
-            candidate = None
+            candidates: list[str] = []
             if node.name == "meta":
-                candidate = node.get("content")
+                meta_val = node.get("content")
+                if meta_val:
+                    candidates.append(str(meta_val))
             else:
-                candidate = node.get("src") or node.get("data-src") or node.get("data-original")
-            normalized = _normalize_image_url(candidate, page_url=page_url)
-            if not normalized or normalized in seen:
-                continue
-            if not re.search(r"\.(jpg|jpeg|png|webp)(\?|$)", normalized.lower()):
-                # Allow image URLs without explicit extension only for OG/Twitter images.
-                if selector not in ("meta[property='og:image']", "meta[name='twitter:image']"):
-                    continue
-            seen.add(normalized)
-            image_urls.append(normalized)
-            if len(image_urls) >= 12:
-                return image_urls
+                for attr_name in (
+                    "src",
+                    "data-src",
+                    "data-original",
+                    "data-zoom-image",
+                    "data-large-image",
+                    "data-image",
+                    "data-src-large",
+                    "href",
+                ):
+                    attr_val = node.get(attr_name)
+                    if attr_val:
+                        candidates.append(str(attr_val))
+                for srcset_attr in ("srcset", "data-srcset"):
+                    for src_item in _extract_srcset_urls(node.get(srcset_attr)):
+                        candidates.append(src_item)
+
+            for candidate in candidates:
+                if _add_url(candidate, selector):
+                    return image_urls
+
+    # Some stores keep image URLs directly in inline scripts.
+    script_blob = " ".join([str(s.get_text(" ", strip=True) or "") for s in soup.find_all("script")][:80])
+    for m in re.finditer(r"https?://[^\s'\"\\]+(?:jpg|jpeg|png|webp|gif|avif)(?:\?[^\s'\"\\]*)?", script_blob, flags=re.IGNORECASE):
+        if _add_url(m.group(0), "script"):
+            return image_urls
+
     return image_urls
 
 

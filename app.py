@@ -992,6 +992,72 @@ def _infer_dimension_heuristics(product_row: dict) -> dict[str, Any]:
     return {"found": False, "scope": None, "values": {}}
 
 
+def _normalize_media_urls(values: list[object]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in values:
+        url = str(raw or "").strip()
+        if not url:
+            continue
+        if url.startswith("//"):
+            url = "https:" + url
+        if not url.lower().startswith(("http://", "https://")):
+            continue
+        if url in seen:
+            continue
+        seen.add(url)
+        out.append(url)
+    return out
+
+
+def _parse_gallery_value(raw_value: object) -> list[str]:
+    if raw_value is None:
+        return []
+    if isinstance(raw_value, (list, tuple, set)):
+        return _normalize_media_urls(list(raw_value))
+    text = str(raw_value).strip()
+    if not text:
+        return []
+    try:
+        loaded = json.loads(text)
+        if isinstance(loaded, list):
+            return _normalize_media_urls(loaded)
+        if isinstance(loaded, str):
+            text = loaded
+    except Exception:
+        pass
+    parts = re.split(r"[\n,;]+", text)
+    return _normalize_media_urls(parts)
+
+
+def _collect_product_gallery_urls(conn, product_id: int, fallback_image_url: str | None = None) -> list[str]:
+    rows = conn.execute(
+        """
+        SELECT attribute_code, value_text, value_json
+        FROM product_attribute_values
+        WHERE product_id = ?
+          AND attribute_code IN ('main_image', 'gallery_images')
+        ORDER BY id DESC
+        """,
+        (int(product_id),),
+    ).fetchall()
+    values: list[object] = []
+    for row in rows:
+        if row["attribute_code"] == "gallery_images":
+            if row["value_json"] not in (None, ""):
+                values.extend(_parse_gallery_value(row["value_json"]))
+            elif row["value_text"] not in (None, ""):
+                values.extend(_parse_gallery_value(row["value_text"]))
+        else:
+            if row["value_text"] not in (None, ""):
+                values.append(row["value_text"])
+            elif row["value_json"] not in (None, ""):
+                values.extend(_parse_gallery_value(row["value_json"]))
+    if str(fallback_image_url or "").strip():
+        values.insert(0, str(fallback_image_url).strip())
+    return _normalize_media_urls(values)
+
+
 def estimate_dimensions_for_product(
     conn,
     product_id: int,
@@ -3728,7 +3794,12 @@ def enrich_product_from_supplier(
             force=force,
         )
 
-        image_urls = [str(x).strip() for x in (parsed.get("image_urls") or []) if str(x).strip()]
+        image_urls = _normalize_media_urls([str(x).strip() for x in (parsed.get("image_urls") or []) if str(x).strip()])
+        if not image_urls and str(parsed.get("image_url") or "").strip():
+            image_urls = _normalize_media_urls([str(parsed.get("image_url") or "").strip()])
+        if image_urls:
+            parsed["image_urls"] = image_urls
+            parsed["image_url"] = image_urls[0]
         if image_urls:
             set_product_attribute_value(conn, product_id, "main_image", image_urls[0])
             save_field_source(
@@ -3740,17 +3811,17 @@ def enrich_product_from_supplier(
                 source_url=source_url,
                 confidence=0.75 if source_type == "supplier_page" else 0.5,
             )
-            if len(image_urls) > 1:
-                set_product_attribute_value(conn, product_id, "gallery_images", json.dumps(image_urls, ensure_ascii=False))
-                save_field_source(
-                    conn=conn,
-                    product_id=product_id,
-                    field_name="attr:gallery_images",
-                    source_type=source_type,
-                    source_value_raw=json.dumps(image_urls, ensure_ascii=False),
-                    source_url=source_url,
-                    confidence=0.7 if source_type == "supplier_page" else 0.45,
-                )
+            # Keep gallery_images even when there is only one image.
+            set_product_attribute_value(conn, product_id, "gallery_images", image_urls)
+            save_field_source(
+                conn=conn,
+                product_id=product_id,
+                field_name="attr:gallery_images",
+                source_type=source_type,
+                source_value_raw=json.dumps(image_urls, ensure_ascii=False),
+                source_url=source_url,
+                confidence=0.7 if source_type == "supplier_page" else 0.45,
+            )
 
         parse_comment = f"source={source_type}; strategy={source_strategy}; url={source_url}"
         if parsed.get("resolved_from_listing"):
@@ -3828,9 +3899,10 @@ def enrich_product_from_supplier(
         fallback_msg = f", использован fallback: {source_type}" if used_fallback else ""
         stats_msg = ", использован category-stats fallback" if used_stats_fallback else ""
         defaults_msg = ", использованы category defaults" if used_category_defaults else ""
+        photo_msg = f", фото найдено: {len(image_urls)}" if image_urls else ""
         return {
             "ok": True,
-            "message": f"Обогащение завершено, обновлено полей: {len(updates)}, атрибутов сохранено: {attributes_saved}{ozon_attr_msg}{fallback_msg}{stats_msg}{defaults_msg}{skipped_msg}{skipped_attr_msg}{ozon_msg}",
+            "message": f"Обогащение завершено, обновлено полей: {len(updates)}, атрибутов сохранено: {attributes_saved}{photo_msg}{ozon_attr_msg}{fallback_msg}{stats_msg}{defaults_msg}{skipped_msg}{skipped_attr_msg}{ozon_msg}",
             "updates": updates,
             "attributes": parsed.get("attributes", {}),
             "image_urls": parsed.get("image_urls", []),
@@ -3978,6 +4050,7 @@ def show_product_tab():
 - `Перезаполнить из поставщика`: force-перезапись полей из supplier page.
 - `Стратегия парсинга для этого товара`: вручную выбрать, где искать данные (только поставщик, Ozon, Яндекс, web, домены).
 - `Рассчитать габариты/вес (статистика)`: заполнить пустые логистические поля по статистике похожих товаров и типовым значениям.
+- `Галерея фото`: поле для нескольких фото (по одной ссылке в строке), даже если сейчас найдена только одна картинка.
 - `Подобрать Ozon категорию`: автоподбор эталонной категории Ozon.
 - `Перепривязать Ozon категорию (force)`: повторный подбор Ozon категории с перезаписью.
 - `Сохранить карточку`: сохранение ручных изменений.
@@ -4448,6 +4521,12 @@ def show_product_tab():
     else:
         st.info("Каналы пока не настроены. Добавь канал во вкладке Каналы, затем загрузи клиентский шаблон.")
 
+    current_gallery_urls = _collect_product_gallery_urls(
+        conn,
+        int(product_id),
+        fallback_image_url=str(product["image_url"] or ""),
+    )
+
     with st.form("product_form"):
         c1, c2, c3 = st.columns(3)
 
@@ -4518,12 +4597,25 @@ def show_product_tab():
             package_height = st.number_input("Высота упаковки", value=float(product["package_height"] or 0.0), step=1.0)
             gross_weight = st.number_input("Вес брутто", value=float(product["gross_weight"] or 0.0), step=0.1)
 
-        image_url = st.text_input("Фото", value=product["image_url"] or "")
+        image_url = st.text_input("Фото (основное)", value=product["image_url"] or "")
+        gallery_text = st.text_area(
+            "Галерея фото (по одной ссылке в строке)",
+            value="\n".join(current_gallery_urls),
+            height=130,
+            help="Можно указать 1+ ссылок. Это поле всегда доступно, даже если парсер нашел только одну картинку.",
+        )
         description = st.text_area("Описание", value=product["description"] or "", height=180)
 
         submitted = st.form_submit_button("Сохранить карточку", type="primary")
 
         if submitted:
+            gallery_urls = _parse_gallery_value(gallery_text)
+            primary_image = str(image_url or "").strip()
+            if primary_image:
+                gallery_urls = _normalize_media_urls([primary_image] + gallery_urls)
+            elif gallery_urls:
+                primary_image = str(gallery_urls[0]).strip()
+
             payload = {
                 "article": article or None,
                 "internal_article": internal_article or None,
@@ -4551,11 +4643,35 @@ def show_product_tab():
                 "package_width": package_width or None,
                 "package_height": package_height or None,
                 "gross_weight": gross_weight or None,
-                "image_url": image_url or None,
+                "image_url": primary_image or None,
                 "description": description or None,
                 "tnved_code": tnved_code or None,
             }
             save_product(conn, int(product_id), payload)
+            # Keep media attributes in sync with the card fields.
+            set_product_attribute_value(conn, int(product_id), "main_image", primary_image or None)
+            set_product_attribute_value(conn, int(product_id), "gallery_images", gallery_urls if gallery_urls else None)
+            if primary_image:
+                save_field_source(
+                    conn=conn,
+                    product_id=int(product_id),
+                    field_name="attr:main_image",
+                    source_type="manual",
+                    source_value_raw=primary_image,
+                    source_url=None,
+                    confidence=1.0,
+                    is_manual=True,
+                )
+            save_field_source(
+                conn=conn,
+                product_id=int(product_id),
+                field_name="attr:gallery_images",
+                source_type="manual",
+                source_value_raw=json.dumps(gallery_urls, ensure_ascii=False) if gallery_urls else "[]",
+                source_url=None,
+                confidence=1.0,
+                is_manual=True,
+            )
             refresh_duplicates_for_product(conn, int(product_id))
             st.success("Сохранено")
             st.rerun()
