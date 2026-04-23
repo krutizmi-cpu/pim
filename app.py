@@ -89,6 +89,17 @@ from services.supplier_profiles import list_supplier_profiles, upsert_supplier_p
 from services.ozon_api_service import is_configured, sync_category_tree, list_cached_categories, list_cached_category_pairs, get_ozon_cache_stats, get_ozon_sync_coverage, sync_missing_category_attributes, sync_category_attributes, list_cached_attributes, sync_attribute_dictionary_values, sync_all_category_dictionary_values, list_cached_attribute_values, import_cached_attributes_to_pim, import_all_cached_attributes_to_pim, suggest_mappings_for_cached_attributes, save_suggested_mappings, analyze_product_ozon_coverage, ensure_ozon_master_attributes, build_product_ozon_payload, materialize_product_ozon_attributes, preview_product_ozon_dictionary_gaps, build_product_ozon_api_attributes, build_bulk_ozon_api_payloads, build_ozon_attributes_update_request, submit_ozon_attributes_update, list_ozon_update_jobs, get_ozon_update_job, retry_ozon_update_job, list_ozon_update_job_items, save_dictionary_override, list_dictionary_overrides, delete_dictionary_override, sync_all_categories_and_attributes
 from services.ozon_category_match import bulk_assign_ozon_categories
 from services.dimension_fallback import infer_category_fields, infer_dimensions_from_catalog, infer_dimensions_from_category_defaults, is_dimension_payload_suspicious
+from services.ai_content_service import (
+    load_ai_settings,
+    save_ai_settings,
+    ai_is_configured,
+    check_ai_connection,
+    generate_seo_description_for_product,
+    generate_ai_attribute_suggestions_for_product,
+    apply_ai_attribute_suggestions,
+    build_marketing_image_prompts_for_product,
+    generate_images_from_prompts,
+)
 
 st.set_page_config(page_title="PIM", page_icon="📦", layout="wide")
 OZON_OFFER_ID_OPTIONS = ["article", "internal_article", "supplier_article"]
@@ -1555,6 +1566,7 @@ def render_section_help() -> None:
 - `Поиск товара / Категория / Подкатегория / Поставщик`: выбрать нужный товар прямо в разделе Карточка.
 - `Спарсить поставщика`: мягкое обогащение (не перетирает сильные значения).
 - `Перезаполнить из поставщика`: жесткое обогащение с перезаписью.
+- `AI: описание / атрибуты / фото`: генерация SEO-описания, подсказки для пустых Ozon-атрибутов и 2 варианта изображений.
 - `Подобрать Ozon категорию`: автоподбор эталонной Ozon-категории.
 - `Перепривязать Ozon категорию (force)`: повторный подбор с перезаписью.
 - `Атрибуты для заполнения`: редактирование Ozon и клиентских атрибутов по выбранному каналу/категории.
@@ -1567,6 +1579,10 @@ def render_section_help() -> None:
 - `Добавить несматченные в master-атрибуты`: расширить мастер-карточку новыми полями.
 - `Подтвердить значения как client_validated`: зафиксировать проверенные значения.
 - `Скачать заполненный шаблон`: выгрузка результата в формате клиента.
+
+**Каналы**
+- `AI-настройки`: выбор провайдера (OpenAI/OpenRouter/NVIDIA), моделей и API-ключа.
+- `Проверить AI-подключение`: тестовый запрос к выбранной модели.
             """
         )
 
@@ -3931,6 +3947,7 @@ def enrich_product_from_supplier(
 def show_product_tab():
     conn = get_db()
     parser_settings = load_parser_settings(conn)
+    ai_settings = load_ai_settings(conn)
     st.subheader("Поиск и выбор товара для редактирования")
     st.caption("Сначала выбери товар через фильтры, затем откроется его карточка для заполнения и обогащения.")
     with st.container(border=True):
@@ -4051,6 +4068,7 @@ def show_product_tab():
 - `Стратегия парсинга для этого товара`: вручную выбрать, где искать данные (только поставщик, Ozon, Яндекс, web, домены).
 - `Рассчитать габариты/вес (статистика)`: заполнить пустые логистические поля по статистике похожих товаров и типовым значениям.
 - `Галерея фото`: поле для нескольких фото (по одной ссылке в строке), даже если сейчас найдена только одна картинка.
+- `AI-контент`: генерация SEO-описания, AI-подсказки для пустых Ozon-атрибутов и генерация 2 маркетинг-изображений.
 - `Подобрать Ozon категорию`: автоподбор эталонной категории Ozon.
 - `Перепривязать Ozon категорию (force)`: повторный подбор Ozon категории с перезаписью.
 - `Сохранить карточку`: сохранение ручных изменений.
@@ -4245,6 +4263,175 @@ def show_product_tab():
         st.info(f"Парсинг поставщика запускался. Последний запуск: {parsed_at}")
     if parse_comment:
         st.caption(f"Комментарий: {parse_comment}")
+
+    with st.expander("AI-контент: описание, атрибуты, фото", expanded=False):
+        ai_ok, ai_msg = ai_is_configured(ai_settings)
+        if ai_ok:
+            st.success(ai_msg)
+        else:
+            st.warning(ai_msg)
+            st.caption("Проверь настройки в разделе `Каналы` -> `AI-настройки`.")
+
+        ai_desc_key = f"ai_desc_candidate_{int(product_id)}"
+        ai_attr_key = f"ai_attr_candidate_{int(product_id)}"
+        ai_img_key = f"ai_img_prompts_{int(product_id)}"
+        ai_img_result_key = f"ai_img_results_{int(product_id)}"
+        ai_desc_widget_key = f"ai_desc_text_{int(product_id)}"
+        ai_prompt1_key = f"ai_img_prompt_1_{int(product_id)}"
+        ai_prompt2_key = f"ai_img_prompt_2_{int(product_id)}"
+        ai_source_label = f"{str(ai_settings.get('provider') or '-')}/{str(ai_settings.get('chat_model') or '-')}"
+
+        d1, d2, d3 = st.columns([1, 1, 1])
+        with d1:
+            if st.button("AI: Сгенерировать SEO-описание", key=f"btn_ai_desc_{int(product_id)}"):
+                desc_result = generate_seo_description_for_product(conn, int(product_id), ai_settings)
+                if desc_result.get("ok"):
+                    generated_desc = str(desc_result.get("text") or "").strip()
+                    st.session_state[ai_desc_key] = generated_desc
+                    st.session_state[ai_desc_widget_key] = generated_desc
+                    st.success(
+                        f"AI-черновик описания готов "
+                        f"(модель: {desc_result.get('model')}, атрибутов в контексте: {int(desc_result.get('attr_count') or 0)})."
+                    )
+                else:
+                    st.error(f"Не удалось сгенерировать описание: {desc_result.get('error')}")
+        with d2:
+            if st.button("AI: Найти пустые Ozon-атрибуты", key=f"btn_ai_attrs_{int(product_id)}"):
+                attr_result = generate_ai_attribute_suggestions_for_product(conn, int(product_id), ai_settings, limit=20)
+                if attr_result.get("ok"):
+                    st.session_state[ai_attr_key] = attr_result.get("suggestions") or []
+                    st.success(
+                        f"AI подготовил подсказки: {len(st.session_state[ai_attr_key])} "
+                        f"из {int(attr_result.get('missing_total') or 0)} пустых атрибутов."
+                    )
+                else:
+                    st.error(f"Не удалось получить AI-подсказки атрибутов: {attr_result.get('error')}")
+        with d3:
+            if st.button("AI: Подготовить 2 промпта для фото", key=f"btn_ai_photo_prompts_{int(product_id)}"):
+                prompt_result = build_marketing_image_prompts_for_product(conn, int(product_id))
+                st.session_state[ai_img_key] = prompt_result
+                st.session_state[ai_prompt1_key] = str(prompt_result.get("context_prompt") or "")
+                st.session_state[ai_prompt2_key] = str(prompt_result.get("color_prompt") or "")
+                st.success("Промпты для генерации изображений подготовлены.")
+
+        ai_desc_value = str(st.session_state.get(ai_desc_key) or "").strip()
+        if ai_desc_widget_key not in st.session_state:
+            st.session_state[ai_desc_widget_key] = ai_desc_value
+        ai_desc_text = st.text_area(
+            "Черновик AI-описания",
+            height=220,
+            key=ai_desc_widget_key,
+            placeholder="Сначала нажми `AI: Сгенерировать SEO-описание`.",
+        )
+        st.session_state[ai_desc_key] = ai_desc_text
+
+        dd1, dd2 = st.columns([1, 1])
+        with dd1:
+            if st.button("Применить AI-описание в карточку", key=f"btn_ai_desc_apply_save_{int(product_id)}"):
+                text_to_apply = str(st.session_state.get(ai_desc_key) or "").strip()
+                if not text_to_apply:
+                    st.warning("Нет AI-описания для применения.")
+                else:
+                    if can_overwrite_field(conn, int(product_id), "description", "ai", force=False):
+                        save_product(conn, int(product_id), {"description": text_to_apply})
+                        save_field_source(
+                            conn=conn,
+                            product_id=int(product_id),
+                            field_name="description",
+                            source_type="ai",
+                            source_value_raw=text_to_apply,
+                            source_url=ai_source_label,
+                            confidence=0.7,
+                            is_manual=False,
+                        )
+                        st.success("AI-описание сохранено в поле `Описание`.")
+                        st.rerun()
+                    else:
+                        st.warning("Поле `Описание` защищено более приоритетным источником (например manual).")
+        with dd2:
+            if st.button("Подставить AI-описание в форму ниже", key=f"btn_ai_desc_prefill_{int(product_id)}"):
+                text_to_prefill = str(st.session_state.get(ai_desc_key) or "").strip()
+                if not text_to_prefill:
+                    st.warning("Нет AI-описания для подстановки.")
+                else:
+                    st.session_state[f"ai_description_prefill_{int(product_id)}"] = text_to_prefill
+                    st.success("Описание подставлено в форму карточки.")
+                    st.rerun()
+
+        ai_suggestions = st.session_state.get(ai_attr_key) or []
+        if ai_suggestions:
+            st.markdown("#### AI-подсказки для пустых Ozon-атрибутов")
+            ai_attr_df = pd.DataFrame(ai_suggestions)
+            st.dataframe(
+                with_ru_columns(ai_attr_df, extra_map={"reason": "Обоснование"}),
+                use_container_width=True,
+                hide_index=True,
+            )
+            if st.button("Применить AI-подсказки атрибутов", key=f"btn_ai_attrs_apply_{int(product_id)}"):
+                apply_res = apply_ai_attribute_suggestions(
+                    conn=conn,
+                    product_id=int(product_id),
+                    suggestions=ai_suggestions,
+                    channel_code=None,
+                    source_url=ai_source_label,
+                )
+                st.success(
+                    f"AI-атрибуты применены: сохранено {int(apply_res.get('saved') or 0)}, "
+                    f"пропущено {int(apply_res.get('skipped') or 0)}, ошибок {int(apply_res.get('errors') or 0)}."
+                )
+                st.rerun()
+
+        prompts_obj = st.session_state.get(ai_img_key) or {}
+        context_prompt_default = str(prompts_obj.get("context_prompt") or "")
+        color_prompt_default = str(prompts_obj.get("color_prompt") or "")
+        if ai_prompt1_key not in st.session_state:
+            st.session_state[ai_prompt1_key] = context_prompt_default
+        if ai_prompt2_key not in st.session_state:
+            st.session_state[ai_prompt2_key] = color_prompt_default
+        img_p1 = st.text_area(
+            "Промпт 1: контекстный фон + инфографика",
+            height=130,
+            key=ai_prompt1_key,
+        )
+        img_p2 = st.text_area(
+            "Промпт 2: цветной фон + инфографика",
+            height=130,
+            key=ai_prompt2_key,
+        )
+        if st.button("AI: Сгенерировать 2 изображения", key=f"btn_ai_generate_images_{int(product_id)}"):
+            generation_results = generate_images_from_prompts(
+                ai_settings,
+                prompts=[img_p1, img_p2],
+                size=str(ai_settings.get("image_size") or "1024x1024"),
+            )
+            st.session_state[ai_img_result_key] = generation_results
+            if generation_results and any(bool(x.get("ok")) for x in generation_results):
+                st.success("Генерация изображений завершена.")
+            else:
+                first_error = generation_results[0].get("error") if generation_results else "Пустой ответ image API."
+                st.error(f"Не удалось сгенерировать изображения: {first_error}")
+
+        generated_images = st.session_state.get(ai_img_result_key) or []
+        if generated_images:
+            st.markdown("#### AI-результат по изображениям")
+            for idx, item in enumerate(generated_images, start=1):
+                if not bool(item.get("ok")):
+                    st.error(f"Изображение {idx}: {item.get('error')}")
+                    continue
+                st.caption(f"Вариант {idx}. Модель: {item.get('model')}")
+                if item.get("image_bytes"):
+                    img_bytes = item.get("image_bytes")
+                    st.image(img_bytes, caption=f"AI-вариант {idx}")
+                    st.download_button(
+                        f"Скачать AI-вариант {idx}",
+                        data=img_bytes,
+                        file_name=f"product_{int(product_id)}_ai_variant_{idx}.png",
+                        mime="image/png",
+                        key=f"ai_img_download_{int(product_id)}_{idx}",
+                    )
+                elif item.get("image_url"):
+                    st.image(str(item.get("image_url")), caption=f"AI-вариант {idx}")
+                    st.code(str(item.get("image_url")), language="text")
 
     ozon_desc_id = int(product["ozon_description_category_id"] or 0)
     ozon_type_id = int(product["ozon_type_id"] or 0)
@@ -4526,6 +4713,12 @@ def show_product_tab():
         int(product_id),
         fallback_image_url=str(product["image_url"] or ""),
     )
+    prefill_description = st.session_state.pop(f"ai_description_prefill_{int(product_id)}", None)
+    description_initial_value = (
+        str(prefill_description).strip()
+        if prefill_description not in (None, "")
+        else (product["description"] or "")
+    )
 
     with st.form("product_form"):
         c1, c2, c3 = st.columns(3)
@@ -4604,7 +4797,7 @@ def show_product_tab():
             height=130,
             help="Можно указать 1+ ссылок. Это поле всегда доступно, даже если парсер нашел только одну картинку.",
         )
-        description = st.text_area("Описание", value=product["description"] or "", height=180)
+        description = st.text_area("Описание", value=description_initial_value, height=180)
 
         submitted = st.form_submit_button("Сохранить карточку", type="primary")
 
@@ -6936,6 +7129,166 @@ def show_channels_tab():
     conn = get_db()
     st.subheader("Каналы")
     st.caption("Здесь настраиваются требования и mapping rules для клиентов и каналов. Это служебный слой, который управляет экспортом.")
+    ai_settings = load_ai_settings(conn)
+
+    with st.expander("AI-настройки (описание, атрибуты, фото)", expanded=False):
+        st.caption(
+            "Поддерживаются OpenAI/OpenRouter/NVIDIA (OpenAI-compatible API). "
+            "Эти настройки используются в Карточке товара для генерации описания, подсказок атрибутов и изображений."
+        )
+        cfg_ok, cfg_msg = ai_is_configured(ai_settings)
+        if cfg_ok:
+            st.success(cfg_msg)
+        else:
+            st.warning(cfg_msg)
+
+        provider_options = ["openai", "openrouter", "nvidia"]
+        current_provider = str(ai_settings.get("provider") or "openai").strip().lower()
+        if current_provider not in provider_options:
+            current_provider = "openai"
+        a1, a2, a3 = st.columns(3)
+        with a1:
+            ai_provider = st.selectbox(
+                "Провайдер AI",
+                options=provider_options,
+                index=provider_options.index(current_provider),
+                format_func=lambda x: {"openai": "OpenAI", "openrouter": "OpenRouter", "nvidia": "NVIDIA"}.get(x, x),
+                key="ai_cfg_provider",
+            )
+        with a2:
+            ai_chat_model = st.text_input(
+                "Chat model",
+                value=str(ai_settings.get("chat_model") or ""),
+                key="ai_cfg_chat_model",
+            )
+        with a3:
+            ai_image_model = st.text_input(
+                "Image model",
+                value=str(ai_settings.get("image_model") or ""),
+                key="ai_cfg_image_model",
+            )
+
+        b1, b2, b3 = st.columns(3)
+        with b1:
+            ai_base_url = st.text_input(
+                "Base URL",
+                value=str(ai_settings.get("base_url") or ""),
+                key="ai_cfg_base_url",
+            )
+        with b2:
+            ai_temperature = st.number_input(
+                "Температура",
+                min_value=0.0,
+                max_value=1.5,
+                value=float(ai_settings.get("temperature") or 0.3),
+                step=0.1,
+                key="ai_cfg_temperature",
+            )
+        with b3:
+            ai_max_tokens = st.number_input(
+                "Max tokens",
+                min_value=256,
+                max_value=12000,
+                value=int(ai_settings.get("max_tokens") or 1800),
+                step=64,
+                key="ai_cfg_max_tokens",
+            )
+
+        c1, c2, c3 = st.columns(3)
+        image_size_options = ["1024x1024", "1536x1024", "1024x1536"]
+        current_image_size = str(ai_settings.get("image_size") or "1024x1024")
+        if current_image_size not in image_size_options:
+            current_image_size = "1024x1024"
+        with c1:
+            ai_image_size = st.selectbox(
+                "Размер изображения",
+                options=image_size_options,
+                index=image_size_options.index(current_image_size),
+                key="ai_cfg_image_size",
+            )
+        with c2:
+            ai_use_env_key = st.checkbox(
+                "Брать API key из env",
+                value=bool(ai_settings.get("use_env_api_key", True)),
+                key="ai_cfg_use_env_key",
+            )
+        with c3:
+            ai_enabled = st.checkbox(
+                "AI включен",
+                value=bool(ai_settings.get("enabled", True)),
+                key="ai_cfg_enabled",
+            )
+
+        ai_api_key = st.text_input(
+            "API key",
+            value=str(ai_settings.get("api_key") or ""),
+            type="password",
+            key="ai_cfg_api_key",
+            help="Если поле пустое и включен режим env, будет использован ключ из переменных окружения.",
+        )
+
+        if str(ai_provider) == "openrouter":
+            d1, d2 = st.columns(2)
+            with d1:
+                ai_openrouter_referer = st.text_input(
+                    "OpenRouter Referer",
+                    value=str(ai_settings.get("openrouter_referer") or ""),
+                    key="ai_cfg_or_referer",
+                )
+            with d2:
+                ai_openrouter_title = st.text_input(
+                    "OpenRouter App Title",
+                    value=str(ai_settings.get("openrouter_title") or "pim"),
+                    key="ai_cfg_or_title",
+                )
+        else:
+            ai_openrouter_referer = str(ai_settings.get("openrouter_referer") or "")
+            ai_openrouter_title = str(ai_settings.get("openrouter_title") or "pim")
+
+        s1, s2 = st.columns([1, 1])
+        with s1:
+            if st.button("Сохранить AI-настройки", key="ai_cfg_save_btn"):
+                new_settings = {
+                    "enabled": bool(ai_enabled),
+                    "provider": str(ai_provider),
+                    "base_url": str(ai_base_url or "").strip(),
+                    "chat_model": str(ai_chat_model or "").strip(),
+                    "image_model": str(ai_image_model or "").strip(),
+                    "api_key": str(ai_api_key or "").strip(),
+                    "use_env_api_key": bool(ai_use_env_key),
+                    "temperature": float(ai_temperature),
+                    "max_tokens": int(ai_max_tokens),
+                    "image_size": str(ai_image_size),
+                    "openrouter_referer": str(ai_openrouter_referer or "").strip(),
+                    "openrouter_title": str(ai_openrouter_title or "pim").strip(),
+                }
+                save_ai_settings(conn, new_settings)
+                st.success("AI-настройки сохранены.")
+                st.rerun()
+        with s2:
+            if st.button("Проверить AI-подключение", key="ai_cfg_test_btn"):
+                test_settings = {
+                    "enabled": bool(ai_enabled),
+                    "provider": str(ai_provider),
+                    "base_url": str(ai_base_url or "").strip(),
+                    "chat_model": str(ai_chat_model or "").strip(),
+                    "image_model": str(ai_image_model or "").strip(),
+                    "api_key": str(ai_api_key or "").strip(),
+                    "use_env_api_key": bool(ai_use_env_key),
+                    "temperature": float(ai_temperature),
+                    "max_tokens": int(ai_max_tokens),
+                    "image_size": str(ai_image_size),
+                    "openrouter_referer": str(ai_openrouter_referer or "").strip(),
+                    "openrouter_title": str(ai_openrouter_title or "pim").strip(),
+                }
+                check_result = check_ai_connection(test_settings)
+                if check_result.get("ok"):
+                    st.success(
+                        f"AI подключен: provider={check_result.get('provider')}, "
+                        f"model={check_result.get('model')}, ответ={str(check_result.get('text') or '').strip()}"
+                    )
+                else:
+                    st.error(f"Ошибка AI-подключения: {check_result.get('error')}")
 
     channels = conn.execute(
         "SELECT channel_code, channel_name, is_active FROM channel_profiles ORDER BY channel_name"
@@ -7059,6 +7412,7 @@ def main():
 8. **Экспорт Excel**: заполни выбранные товары, проверь gap/readiness, выгрузи готовый Excel в исходной структуре клиента.
 9. **Ozon**: синхронизируй дерево/атрибуты, используй Ozon как эталон структуры, импортируй атрибуты в PIM и контролируй покрытие.
 10. **Каналы**: поддерживай channel requirements и mapping rules для повторного безручного экспорта.
+11. **AI**: в разделе `Каналы` задай provider/model/key, затем в `Карточка` используй генерацию SEO-описания, подсказки атрибутов и 2 варианта изображений.
             """
         )
     render_section_help()
