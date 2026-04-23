@@ -2238,6 +2238,28 @@ def inspect_excel_sheets(file_bytes: bytes) -> dict:
         "поставщик",
         "ссылка",
     }
+
+    def _score_preview_header(values: list[object]) -> float:
+        tokens = [str(v).strip() for v in values if str(v).strip() and str(v).strip().lower() != "nan"]
+        if not tokens:
+            return -1.0
+        lower_tokens = [v.lower() for v in tokens]
+        exact_hits = sum(1 for v in lower_tokens if v in header_keywords)
+        contains_hits = 0
+        for value in lower_tokens:
+            if value in header_keywords:
+                continue
+            if any(keyword in value or value in keyword for keyword in header_keywords if len(keyword) >= 4):
+                contains_hits += 1
+        text_like = sum(1 for v in tokens if any(ch.isalpha() for ch in v))
+        numeric_like = sum(1 for v in tokens if re.fullmatch(r"[\d\.,\-_/]+", v) is not None)
+        url_like = sum(1 for v in lower_tokens if "http" in v or "www." in v)
+        score = (exact_hits * 100.0) + (contains_hits * 30.0) + (text_like * 2.0)
+        score -= (numeric_like * 4.0) + (url_like * 8.0)
+        if exact_hits == 0 and contains_hits <= 1:
+            score -= 40.0
+        return score
+
     preview_rows = []
     for sheet in sheets[:10]:
         try:
@@ -2248,7 +2270,7 @@ def inspect_excel_sheets(file_bytes: bytes) -> dict:
                 lower_values = [v.lower() for v in values]
                 keyword_hits = sum(1 for v in lower_values if v in header_keywords)
                 text_like = sum(1 for v in values if any(ch.isalpha() for ch in v))
-                score = len(values) + keyword_hits * 3 + text_like
+                score = _score_preview_header(probe.iloc[i].tolist())
                 row_scores.append({"row": i + 1, "non_empty": len(values), "keywords": keyword_hits, "sample": ", ".join(values[:6]), "score": score})
             recommended = 1
             if row_scores:

@@ -212,12 +212,39 @@ def _alias_universe() -> set[str]:
     return values
 
 
-def _detect_best_sheet_and_header(excel_path: Path, max_scan_rows: int = 12) -> tuple[str, int]:
+def _score_header_row(values: list[object], aliases: set[str]) -> float:
+    tokens = [str(v).strip() for v in values if str(v).strip() and str(v).strip().lower() != "nan"]
+    if not tokens:
+        return -1.0
+    lower_tokens = [t.lower() for t in tokens]
+    exact_hits = sum(1 for v in lower_tokens if v in aliases)
+    contains_hits = 0
+    for value in lower_tokens:
+        if value in aliases:
+            continue
+        if any(alias in value or value in alias for alias in aliases if len(alias) >= 4):
+            contains_hits += 1
+    short_tokens = sum(1 for v in lower_tokens if len(v) <= 40)
+    text_like = sum(1 for v in tokens if any(ch.isalpha() for ch in v))
+    numeric_like = sum(1 for v in tokens if re.fullmatch(r"[\d\.,\-_/]+", v) is not None)
+    url_like = sum(1 for v in lower_tokens if _looks_like_url(v))
+
+    # Strongly prioritize rows that look like true headers.
+    score = (exact_hits * 100.0) + (contains_hits * 30.0) + (text_like * 2.0) + (short_tokens * 0.5)
+    score -= (numeric_like * 4.0) + (url_like * 8.0)
+    if exact_hits == 0 and contains_hits <= 1:
+        score -= 40.0
+    return score
+
+
+def _rank_sheet_header_candidates(
+    excel_path: Path,
+    max_scan_rows: int = 12,
+    max_candidates: int = 8,
+) -> list[tuple[str, int, float]]:
     xls = pd.ExcelFile(excel_path)
     aliases = _alias_universe()
-    best_sheet = xls.sheet_names[0]
-    best_header = 0
-    best_score = -1
+    candidates: list[tuple[str, int, float]] = []
 
     for sheet in xls.sheet_names:
         try:
@@ -228,19 +255,31 @@ def _detect_best_sheet_and_header(excel_path: Path, max_scan_rows: int = 12) -> 
             continue
 
         for row_idx in range(min(max_scan_rows, len(probe))):
-            row_values = [str(v).strip().lower() for v in probe.iloc[row_idx].tolist() if str(v).strip() and str(v).lower() != "nan"]
-            if not row_values:
-                continue
-            score = sum(1 for v in row_values if v in aliases)
-            # slight bonus for rows that look like headers (contain multiple short tokens)
-            short_tokens = sum(1 for v in row_values if len(v) <= 30)
-            score = score * 10 + short_tokens
-            if score > best_score:
-                best_score = score
-                best_sheet = sheet
-                best_header = row_idx
+            row_values = probe.iloc[row_idx].tolist()
+            score = _score_header_row(row_values, aliases)
+            candidates.append((sheet, int(row_idx), float(score)))
 
+    if not candidates:
+        first_sheet = xls.sheet_names[0] if xls.sheet_names else "Sheet1"
+        return [(first_sheet, 0, -1.0)]
+    candidates.sort(key=lambda item: item[2], reverse=True)
+    return candidates[: max(1, int(max_candidates))]
+
+
+def _detect_best_sheet_and_header(excel_path: Path, max_scan_rows: int = 12) -> tuple[str, int]:
+    candidates = _rank_sheet_header_candidates(excel_path, max_scan_rows=max_scan_rows, max_candidates=1)
+    best_sheet, best_header, _ = candidates[0]
     return best_sheet, int(best_header)
+
+
+def _candidate_importable_rows(df: pd.DataFrame) -> int:
+    normalized = normalize_columns(df)
+    if normalized.empty:
+        return 0
+    valid_mask = normalized["name"].notna() & (
+        normalized["article"].notna() | normalized["supplier_article"].notna()
+    )
+    return int(valid_mask.sum())
 
 
 def _read_excel_smart(
@@ -254,8 +293,25 @@ def _read_excel_smart(
         selected_header = max(0, int(header_row)) if header_row is not None else 0
         df = pd.read_excel(excel_path, sheet_name=selected_sheet, header=selected_header)
     else:
-        selected_sheet, selected_header = _detect_best_sheet_and_header(excel_path)
-        df = pd.read_excel(excel_path, sheet_name=selected_sheet, header=selected_header)
+        ranked = _rank_sheet_header_candidates(excel_path)
+        best_df: pd.DataFrame | None = None
+        best_importable = -1
+        best_score = float("-inf")
+        for selected_sheet, selected_header, header_score in ranked:
+            try:
+                candidate_df = pd.read_excel(excel_path, sheet_name=selected_sheet, header=selected_header)
+            except Exception:
+                continue
+            candidate_df = candidate_df.dropna(axis=1, how="all").dropna(axis=0, how="all")
+            importable = _candidate_importable_rows(candidate_df)
+            if importable > best_importable or (importable == best_importable and header_score > best_score):
+                best_df = candidate_df
+                best_importable = importable
+                best_score = header_score
+        if best_df is None:
+            selected_sheet, selected_header = _detect_best_sheet_and_header(excel_path)
+            best_df = pd.read_excel(excel_path, sheet_name=selected_sheet, header=selected_header)
+        df = best_df
     # Drop fully empty columns and rows early.
     df = df.dropna(axis=1, how="all").dropna(axis=0, how="all")
     return df
