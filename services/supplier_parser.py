@@ -1067,18 +1067,37 @@ def _build_search_queries(
     query: str,
     hints: list[str] | None = None,
     preferred_domain: str | None = None,
+    blocked_source_domain: bool = False,
 ) -> list[str]:
     base = _clean_text(query)
     if not base:
         return []
     strong_phrases, tokens = _build_hint_tokens((hints or []) + [base])
     variants: list[str] = [base]
+    descriptive_tokens = [tok for tok in tokens if len(tok) >= 4 and not _is_probably_product_code(tok)]
     if strong_phrases:
         variants.append(f"\"{strong_phrases[0]}\" {base}")
         variants.append(f"\"{strong_phrases[0]}\" характеристики")
+        if descriptive_tokens:
+            variants.append(f"\"{strong_phrases[0]}\" {' '.join(descriptive_tokens[:5])}")
+            variants.append(f"\"{strong_phrases[0]}\" {' '.join(descriptive_tokens[:5])} характеристики")
+            variants.append(f"\"{strong_phrases[0]}\" {' '.join(descriptive_tokens[:5])} купить")
     if tokens:
         variants.append(" ".join(tokens[:5]))
         variants.append(" ".join(tokens[:5]) + " характеристики")
+    if descriptive_tokens:
+        variants.append(" ".join(descriptive_tokens[:6]) + " характеристики")
+        variants.append(" ".join(descriptive_tokens[:6]) + " описание")
+    if blocked_source_domain:
+        if strong_phrases:
+            variants.append(f"\"{strong_phrases[0]}\" ozon")
+            variants.append(f"\"{strong_phrases[0]}\" яндекс маркет")
+            variants.append(f"\"{strong_phrases[0]}\" купить характеристики")
+        if descriptive_tokens:
+            short_desc = " ".join(descriptive_tokens[:5])
+            variants.append(f"{short_desc} ozon характеристики")
+            variants.append(f"{short_desc} яндекс маркет характеристики")
+            variants.append(f"{short_desc} купить характеристики")
     if preferred_domain:
         dom = preferred_domain.lower().replace("www.", "").strip()
         if dom:
@@ -1094,7 +1113,7 @@ def _build_search_queries(
             continue
         seen.add(clean)
         deduped.append(clean)
-    return deduped[:5]
+    return deduped[:10]
 
 
 def fallback_search_product_data(
@@ -1103,12 +1122,18 @@ def fallback_search_product_data(
     max_results: int = 3,
     hints: list[str] | None = None,
     preferred_domain: str | None = None,
+    blocked_source_domain: bool = False,
 ) -> dict[str, Any]:
     text_query = _clean_text(query)
     if not text_query:
         return {}
 
-    query_variants = _build_search_queries(text_query, hints=hints, preferred_domain=preferred_domain)
+    query_variants = _build_search_queries(
+        text_query,
+        hints=hints,
+        preferred_domain=preferred_domain,
+        blocked_source_domain=blocked_source_domain,
+    )
     all_hints = [text_query] + [h for h in (hints or []) if _clean_text(h)]
     seen_links: set[str] = set()
     best: dict[str, Any] | None = None

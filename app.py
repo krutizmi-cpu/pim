@@ -72,6 +72,7 @@ def fallback_search_product_data(
     max_results: int = 3,
     hints: list[str] | None = None,
     preferred_domain: str | None = None,
+    blocked_source_domain: bool = False,
 ) -> dict:
     if _supplier_parser is not None and hasattr(_supplier_parser, "fallback_search_product_data"):
         return _supplier_parser.fallback_search_product_data(
@@ -80,6 +81,7 @@ def fallback_search_product_data(
             max_results=max_results,
             hints=hints,
             preferred_domain=preferred_domain,
+            blocked_source_domain=blocked_source_domain,
         )
     return {}
 
@@ -3628,6 +3630,7 @@ def enrich_product_from_supplier(
                     max_results=int(fallback_max_results),
                     hints=parse_hints,
                     preferred_domain=domain,
+                    blocked_source_domain=bool(blocked_supplier_domain),
                 )
                 if fallback:
                     fallback_stage = stage_name
