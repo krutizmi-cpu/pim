@@ -58,6 +58,21 @@ SEARCH_BLOCKED_DOMAINS = (
     "wikipedia.org",
 )
 
+ANTI_BOT_HINTS = (
+    "__qb",
+    "__qca",
+    "access denied",
+    "bot verification",
+    "captcha",
+    "проверка, что вы не робот",
+    "проверка что вы не робот",
+    "подтвердите, что вы не робот",
+)
+
+LIKELY_BLOCKED_SUPPLIER_DOMAINS = (
+    "sportmaster.ru",
+)
+
 DIMENSION_PATTERNS = {
     "weight": [r"вес[^\d]{0,20}(\d+[\.,]?\d*)\s*(кг|г)", r"weight[^\d]{0,20}(\d+[\.,]?\d*)\s*(kg|g)"],
     "gross_weight": [r"вес\s*брутто[^\d]{0,20}(\d+[\.,]?\d*)\s*(кг|г)", r"gross\s*weight[^\d]{0,20}(\d+[\.,]?\d*)\s*(kg|g)"],
@@ -177,6 +192,20 @@ def _normalize_result_url(href: str) -> str | None:
             if target.lower().startswith(("http://", "https://")):
                 candidate = target
     return candidate
+
+
+def is_likely_blocked_supplier_domain(url: str | None) -> bool:
+    host = (urlparse(str(url or "")).netloc or "").lower().replace("www.", "")
+    if not host:
+        return False
+    return any(host.endswith(dom) or dom in host for dom in LIKELY_BLOCKED_SUPPLIER_DOMAINS)
+
+
+def looks_like_access_block_page(html: str | None) -> bool:
+    text = str(html or "").lower()
+    if not text:
+        return False
+    return any(marker in text for marker in ANTI_BOT_HINTS)
 
 
 def _extract_article_like_value(parsed: dict[str, Any]) -> str:
@@ -763,8 +792,13 @@ def _detect_page_kind(soup: BeautifulSoup, page_url: str, raw_product_count: int
 def fetch_supplier_page(url: str, timeout: float = 10.0) -> str:
     with httpx.Client(headers=HEADERS, follow_redirects=True, timeout=timeout) as client:
         response = client.get(url)
-        response.raise_for_status()
-        return response.text
+        body = response.text
+        if response.status_code >= 400:
+            snippet = _clean_text(body)[:180]
+            raise RuntimeError(f"HTTP {int(response.status_code)} for {url}: {snippet}")
+        if looks_like_access_block_page(body):
+            raise RuntimeError(f"Access blocked for {url}")
+        return body
 
 
 def extract_supplier_data(html: str, url: str | None = None) -> dict[str, Any]:

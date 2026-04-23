@@ -82,6 +82,15 @@ def fallback_search_product_data(
             preferred_domain=preferred_domain,
         )
     return {}
+
+
+def is_likely_blocked_supplier_domain(url: str | None) -> bool:
+    if _supplier_parser is not None and hasattr(_supplier_parser, "is_likely_blocked_supplier_domain"):
+        try:
+            return bool(_supplier_parser.is_likely_blocked_supplier_domain(url))
+        except Exception:
+            return False
+    return False
 from services.template_matching import auto_match_template_columns, apply_saved_mapping_rules, fill_template_dataframe, apply_client_validated_values, fill_template_workbook_bytes, dataframe_to_excel_bytes, detect_template_data_start_row, sanitize_template_xlsx_bytes
 from services.template_profiles import save_template_profile, list_template_profiles, get_template_profile_columns
 from services.readiness_service import analyze_template_readiness
@@ -3538,6 +3547,7 @@ def enrich_product_from_supplier(
         source_type = "supplier_page"
         used_fallback = False
         fallback_rejected_reason = ""
+        parse_error_text = ""
         used_stats_fallback = False
         used_category_defaults = False
         field_source_types: dict[str, str] = {}
@@ -3562,6 +3572,7 @@ def enrich_product_from_supplier(
                 parsed = {}
                 source_type = "web_search_fallback"
                 source_url = effective_supplier_url
+                parse_error_text = str(parse_error)[:220]
                 # Keep flow alive: fallback to internet search below.
 
         dim_fields = [
@@ -3583,6 +3594,9 @@ def enrich_product_from_supplier(
                 preferred_domain = (urlparse(str(source_url or supplier_url)).netloc or "").lower().replace("www.", "")
             except Exception:
                 preferred_domain = ""
+            blocked_supplier_domain = is_likely_blocked_supplier_domain(source_url or supplier_url)
+            if blocked_supplier_domain:
+                preferred_domain = ""
             fallback_query_parts = [
                 str(product["name"] or "").strip(),
                 str(product["article"] or "").strip(),
@@ -3603,7 +3617,9 @@ def enrich_product_from_supplier(
             for dom in extra_fallback_domains:
                 fallback_targets.append(("domain_search_fallback", dom))
             if enable_web_fallback:
-                fallback_targets.append(("web_search_fallback", preferred_domain or None))
+                if preferred_domain:
+                    fallback_targets.append(("web_search_fallback_domain", preferred_domain))
+                fallback_targets.append(("web_search_fallback", None))
 
             for stage_name, domain in fallback_targets:
                 fallback = fallback_search_product_data(
@@ -3722,6 +3738,11 @@ def enrich_product_from_supplier(
         if not has_meaningful_supplier_data(parsed):
             has_any_dims_after_fallback = any(parsed.get(k) not in (None, "", 0, 0.0) for k in dim_fields)
             if not (used_stats_fallback or used_category_defaults or has_any_dims_after_fallback):
+                fail_comment = "Не удалось получить полезные данные"
+                if parse_error_text:
+                    fail_comment += f"; supplier_parse_error={parse_error_text}"
+                if fallback_rejected_reason:
+                    fail_comment += f"; fallback_rejected={fallback_rejected_reason[:180]}"
                 conn.execute(
                     """
                     UPDATE products
@@ -3731,10 +3752,10 @@ def enrich_product_from_supplier(
                         updated_at = CURRENT_TIMESTAMP
                     WHERE id = ?
                     """,
-                    ("error", "Не удалось получить полезные данные: supplier_url не содержит карточку товара", product_id),
+                    ("error", fail_comment[:500], product_id),
                 )
                 conn.commit()
-                return {"ok": False, "message": "Не удалось получить полезные данные с supplier_url или через web fallback"}
+                return {"ok": False, "message": fail_comment}
 
         updates = {}
         skipped_manual_fields = []
@@ -3866,6 +3887,8 @@ def enrich_product_from_supplier(
             parse_comment += "; listing->product resolved"
         if used_fallback:
             parse_comment += "; web_fallback=1"
+        if parse_error_text:
+            parse_comment += f"; supplier_parse_error={parse_error_text}"
         if fallback_rejected_reason:
             parse_comment += f"; fallback_rejected={fallback_rejected_reason[:180]}"
         if used_stats_fallback:
