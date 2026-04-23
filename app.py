@@ -1345,6 +1345,113 @@ def ensure_ozon_requirements_for_products(
     }
 
 
+def materialize_ozon_attribute_slots_for_product(
+    conn,
+    product_id: int,
+    description_category_id: int,
+    type_id: int,
+    required_only: bool = False,
+) -> dict[str, int | bool]:
+    pid = int(product_id or 0)
+    desc_id = int(description_category_id or 0)
+    typ_id = int(type_id or 0)
+    if pid <= 0 or desc_id <= 0 or typ_id <= 0:
+        return {"ok": False, "created": 0, "existing": 0, "requirements": 0}
+
+    ensure_ozon_requirements_for_product_category(conn, desc_id, typ_id)
+    category_code = f"ozon:{desc_id}:{typ_id}"
+    req_rows = list_channel_requirements(conn, channel_code="ozon", category_code=category_code)
+    if bool(required_only):
+        req_rows = [row for row in req_rows if int(row.get("is_required") or 0) == 1]
+    attr_codes = [str(row.get("attribute_code") or "").strip() for row in req_rows if str(row.get("attribute_code") or "").strip()]
+    if not attr_codes:
+        return {"ok": True, "created": 0, "existing": 0, "requirements": 0}
+
+    placeholders = ", ".join(["?"] * len(attr_codes))
+    existing_rows = conn.execute(
+        f"""
+        SELECT DISTINCT attribute_code
+        FROM product_attribute_values
+        WHERE product_id = ?
+          AND attribute_code IN ({placeholders})
+        """,
+        [pid] + attr_codes,
+    ).fetchall()
+    existing_codes = {str(row["attribute_code"] or "").strip() for row in existing_rows}
+
+    created = 0
+    for code in attr_codes:
+        if code in existing_codes:
+            continue
+        set_product_attribute_value(
+            conn=conn,
+            product_id=pid,
+            attribute_code=code,
+            value=None,
+            channel_code=None,
+        )
+        created += 1
+
+    return {
+        "ok": True,
+        "created": int(created),
+        "existing": int(len(existing_codes)),
+        "requirements": int(len(attr_codes)),
+    }
+
+
+def materialize_ozon_attribute_slots_for_products(
+    conn,
+    product_ids: list[int],
+    required_only: bool = False,
+) -> dict[str, int]:
+    ids = [int(x) for x in product_ids if str(x).strip()]
+    if not ids:
+        return {"products_total": 0, "products_with_ozon_category": 0, "slots_created": 0, "requirements_total": 0}
+
+    chunk_size = 900
+    rows: list[sqlite3.Row] = []
+    for start in range(0, len(ids), chunk_size):
+        chunk = ids[start : start + chunk_size]
+        placeholders = ", ".join(["?"] * len(chunk))
+        rows.extend(
+            conn.execute(
+                f"""
+                SELECT id, ozon_description_category_id, ozon_type_id
+                FROM products
+                WHERE id IN ({placeholders})
+                """,
+                tuple(chunk),
+            ).fetchall()
+        )
+
+    total_with_ozon = 0
+    total_created = 0
+    total_requirements = 0
+    for row in rows:
+        desc_id = int(row["ozon_description_category_id"] or 0)
+        type_id = int(row["ozon_type_id"] or 0)
+        if desc_id <= 0 or type_id <= 0:
+            continue
+        total_with_ozon += 1
+        result = materialize_ozon_attribute_slots_for_product(
+            conn,
+            product_id=int(row["id"]),
+            description_category_id=desc_id,
+            type_id=type_id,
+            required_only=bool(required_only),
+        )
+        total_created += int(result.get("created") or 0)
+        total_requirements += int(result.get("requirements") or 0)
+
+    return {
+        "products_total": int(len(ids)),
+        "products_with_ozon_category": int(total_with_ozon),
+        "slots_created": int(total_created),
+        "requirements_total": int(total_requirements),
+    }
+
+
 def _build_ozon_template_category_options(
     conn,
     channel_code: str | None = None,
@@ -3279,38 +3386,50 @@ def show_catalog_tab():
     with cextra1:
         if st.button("Автопривязать Ozon категории (текущая страница)", help="Сначала назначить эталонную Ozon категорию для товаров этой страницы"):
             res = bulk_assign_ozon_categories(conn, [int(x) for x in ids], min_score=OZON_CATEGORY_MIN_SCORE, force=False)
+            materialized = materialize_ozon_attribute_slots_for_products(conn, [int(x) for x in ids])
             if res.get("message"):
                 st.info(str(res["message"]))
             else:
-                st.success(f"Ozon автопривязка: обработано {res['processed']}, привязано {res['assigned']}, пропущено {res['skipped']}")
+                st.success(
+                    f"Ozon автопривязка: обработано {res['processed']}, привязано {res['assigned']}, пропущено {res['skipped']}. "
+                    f"Слотов Ozon-атрибутов создано: {int(materialized.get('slots_created') or 0)}."
+                )
             st.rerun()
     with cextra2:
         if st.button("Перепривязать Ozon категории (force, текущая страница)", help="Повторный подбор Ozon категории с возможной перезаписью текущей привязки"):
             res = bulk_assign_ozon_categories(conn, [int(x) for x in ids], min_score=OZON_CATEGORY_MIN_SCORE, force=True)
+            materialized = materialize_ozon_attribute_slots_for_products(conn, [int(x) for x in ids])
             if res.get("message"):
                 st.info(str(res["message"]))
             else:
-                st.success(f"Ozon force-привязка: обработано {res['processed']}, привязано {res['assigned']}, пропущено {res['skipped']}")
+                st.success(
+                    f"Ozon force-привязка: обработано {res['processed']}, привязано {res['assigned']}, пропущено {res['skipped']}. "
+                    f"Слотов Ozon-атрибутов создано: {int(materialized.get('slots_created') or 0)}."
+                )
             st.rerun()
 
     oextra1, oextra2 = st.columns(2)
     with oextra1:
         if st.button("Подтянуть Ozon-атрибуты (текущая страница)", help="Подготовить category requirements Ozon для товаров текущей страницы, чтобы атрибуты появились в карточках"):
             seeded = ensure_ozon_requirements_for_products(conn, [int(x) for x in ids])
+            materialized = materialize_ozon_attribute_slots_for_products(conn, [int(x) for x in ids])
             st.success(
                 "Готово по текущей странице: "
                 f"товаров с Ozon-категорией {int(seeded.get('products_with_ozon_category') or 0)} из {int(seeded.get('products_total') or 0)}, "
                 f"пар категорий {int(seeded.get('category_pairs') or 0)}, "
-                f"импортировано атрибутов {int(seeded.get('imported_attributes') or 0)}."
+                f"импортировано атрибутов {int(seeded.get('imported_attributes') or 0)}, "
+                f"создано слотов атрибутов у товаров {int(materialized.get('slots_created') or 0)}."
             )
     with oextra2:
         if st.button("Подтянуть Ozon-атрибуты (вся выборка фильтра)", help="Подготовить category requirements Ozon для всей текущей выборки"):
             seeded = ensure_ozon_requirements_for_products(conn, [int(x) for x in all_filtered_candidate_ids])
+            materialized = materialize_ozon_attribute_slots_for_products(conn, [int(x) for x in all_filtered_candidate_ids])
             st.success(
                 "Готово по всей выборке: "
                 f"товаров с Ozon-категорией {int(seeded.get('products_with_ozon_category') or 0)} из {int(seeded.get('products_total') or 0)}, "
                 f"пар категорий {int(seeded.get('category_pairs') or 0)}, "
-                f"импортировано атрибутов {int(seeded.get('imported_attributes') or 0)}."
+                f"импортировано атрибутов {int(seeded.get('imported_attributes') or 0)}, "
+                f"создано слотов атрибутов у товаров {int(materialized.get('slots_created') or 0)}."
             )
 
     b1, b2, b3 = st.columns(3)
@@ -4251,18 +4370,42 @@ def show_product_tab():
     with ctop3:
         if st.button("Подобрать Ozon категорию", help="Подобрать эталонную Ozon категорию автоматически"):
             res = bulk_assign_ozon_categories(conn, [int(product_id)], min_score=OZON_CATEGORY_MIN_SCORE, force=False)
+            refreshed_product = get_product(conn, int(product_id))
+            materialized = {"slots_created": 0}
+            if refreshed_product:
+                materialized = materialize_ozon_attribute_slots_for_product(
+                    conn,
+                    product_id=int(product_id),
+                    description_category_id=int(refreshed_product["ozon_description_category_id"] or 0),
+                    type_id=int(refreshed_product["ozon_type_id"] or 0),
+                )
             if res.get("message"):
                 st.info(str(res["message"]))
             else:
-                st.success(f"Ozon автопривязка: обработано {res['processed']}, привязано {res['assigned']}, пропущено {res['skipped']}")
+                st.success(
+                    f"Ozon автопривязка: обработано {res['processed']}, привязано {res['assigned']}, пропущено {res['skipped']}. "
+                    f"Создано слотов Ozon-атрибутов: {int(materialized.get('slots_created') or 0)}."
+                )
             st.rerun()
     with ctop4:
         if st.button("Перепривязать Ozon категорию (force)", help="Повторно назначить Ozon категорию с перезаписью текущей привязки"):
             res = bulk_assign_ozon_categories(conn, [int(product_id)], min_score=OZON_CATEGORY_MIN_SCORE, force=True)
+            refreshed_product = get_product(conn, int(product_id))
+            materialized = {"slots_created": 0}
+            if refreshed_product:
+                materialized = materialize_ozon_attribute_slots_for_product(
+                    conn,
+                    product_id=int(product_id),
+                    description_category_id=int(refreshed_product["ozon_description_category_id"] or 0),
+                    type_id=int(refreshed_product["ozon_type_id"] or 0),
+                )
             if res.get("message"):
                 st.info(str(res["message"]))
             else:
-                st.success(f"Ozon force-привязка: обработано {res['processed']}, привязано {res['assigned']}, пропущено {res['skipped']}")
+                st.success(
+                    f"Ozon force-привязка: обработано {res['processed']}, привязано {res['assigned']}, пропущено {res['skipped']}. "
+                    f"Создано слотов Ozon-атрибутов: {int(materialized.get('slots_created') or 0)}."
+                )
             st.rerun()
 
     ctop5, ctop6, ctop7 = st.columns([1, 1, 2])
@@ -4485,10 +4628,16 @@ def show_product_tab():
     ozon_type_id = int(product["ozon_type_id"] or 0)
     if ozon_desc_id > 0 and ozon_type_id > 0:
         auto_req = ensure_ozon_requirements_for_product_category(conn, ozon_desc_id, ozon_type_id)
+        auto_slots = materialize_ozon_attribute_slots_for_product(conn, int(product_id), ozon_desc_id, ozon_type_id)
         if int(auto_req.get("imported") or 0) > 0:
             st.success(
                 "Ozon-атрибуты этой категории автоматически добавлены в карточку: "
                 f"{int(auto_req.get('imported') or 0)} (обязательных: {int(auto_req.get('required') or 0)})."
+            )
+        if int(auto_slots.get("created") or 0) > 0:
+            st.info(
+                "Для товара автоматически созданы пустые Ozon-атрибуты для заполнения: "
+                f"{int(auto_slots.get('created') or 0)} из {int(auto_slots.get('requirements') or 0)}."
             )
         st.markdown("### Ozon-атрибуты выбранной категории")
         oz1, oz2 = st.columns([1, 1])
@@ -4499,9 +4648,11 @@ def show_product_tab():
                     description_category_id=ozon_desc_id,
                     type_id=ozon_type_id,
                 )
+                materialized = materialize_ozon_attribute_slots_for_product(conn, int(product_id), ozon_desc_id, ozon_type_id)
                 st.success(
                     f"Импорт в справочник выполнен: {int(import_result.get('imported') or 0)} атрибутов, "
-                    f"обязательных: {int(import_result.get('required') or 0)}."
+                    f"обязательных: {int(import_result.get('required') or 0)}. "
+                    f"Создано слотов у товара: {int(materialized.get('created') or 0)}."
                 )
                 st.rerun()
         with oz2:
@@ -5062,6 +5213,24 @@ def show_attributes_tab():
             f"Поставщик: {selected_product['supplier_name'] or '-'} | "
             f"Ozon категория: {selected_product['ozon_category_path'] or '-'}"
         )
+        try:
+            selected_desc_id = int(selected_product["ozon_description_category_id"] or 0)
+            selected_type_id = int(selected_product["ozon_type_id"] or 0)
+        except Exception:
+            selected_desc_id = 0
+            selected_type_id = 0
+        if selected_desc_id > 0 and selected_type_id > 0:
+            materialized = materialize_ozon_attribute_slots_for_product(
+                conn,
+                product_id=int(selected_product["id"]),
+                description_category_id=selected_desc_id,
+                type_id=selected_type_id,
+            )
+            if int(materialized.get("created") or 0) > 0:
+                st.info(
+                    f"Для выбранного товара автоматически созданы пустые Ozon-атрибуты: "
+                    f"{int(materialized.get('created') or 0)}."
+                )
     else:
         st.warning("Товар не выбран. Выбери товар во вкладке `Карточка` или `Каталог`, чтобы редактировать значения атрибутов.")
 
