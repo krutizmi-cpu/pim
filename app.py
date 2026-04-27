@@ -4890,7 +4890,7 @@ def show_product_tab():
                         save_field_source(
                             conn=conn,
                             product_id=int(product_id),
-                            field_name=code,
+                            field_name=f"attr:{code}",
                             source_type="manual",
                             source_value_raw=value_to_save,
                             source_url=None,
@@ -5407,6 +5407,16 @@ def show_attributes_tab():
                         value=value,
                         locale=locale or None,
                         channel_code=channel_code or None,
+                    )
+                    save_field_source(
+                        conn=conn,
+                        product_id=int(product_id),
+                        field_name=f"attr:{attribute_code}",
+                        source_type="manual",
+                        source_value_raw=value or None,
+                        source_url=None,
+                        confidence=1.0,
+                        is_manual=True,
                     )
                     st.success("Значение атрибута сохранено.")
                     st.rerun()
