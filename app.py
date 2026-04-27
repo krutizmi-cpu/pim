@@ -4,7 +4,12 @@ import json
 import hashlib
 from io import BytesIO
 import math
+import mimetypes
+import ntpath
+import os
+import posixpath
 import re
+import zipfile
 from pathlib import Path
 import threading
 from datetime import datetime, timezone
@@ -13,6 +18,7 @@ from urllib.parse import quote, urlparse
 import pandas as pd
 import sqlite3
 import streamlit as st
+import httpx
 from openpyxl import load_workbook
 
 from db import get_connection, init_db
@@ -179,6 +185,10 @@ PARSER_SETTINGS_DEFAULTS: dict[str, object] = {
     "enable_defaults_fallback": True,
 }
 
+MEDIA_SETTINGS_DEFAULTS: dict[str, object] = {
+    "public_base_url": "",
+}
+
 
 def _ensure_system_settings_table(conn) -> None:
     conn.execute(
@@ -274,6 +284,17 @@ def save_parser_settings(conn, settings: dict[str, object]) -> None:
     _set_system_setting(conn, "parser.enable_yandex_fallback", 1 if bool(settings.get("enable_yandex_fallback", True)) else 0)
     _set_system_setting(conn, "parser.enable_stats_fallback", 1 if bool(settings.get("enable_stats_fallback", True)) else 0)
     _set_system_setting(conn, "parser.enable_defaults_fallback", 1 if bool(settings.get("enable_defaults_fallback", True)) else 0)
+
+
+def load_media_settings(conn) -> dict[str, object]:
+    _ensure_system_settings_table(conn)
+    return {
+        "public_base_url": str(_get_system_setting(conn, "media.public_base_url", MEDIA_SETTINGS_DEFAULTS["public_base_url"]) or "").strip(),
+    }
+
+
+def save_media_settings(conn, settings: dict[str, object]) -> None:
+    _set_system_setting(conn, "media.public_base_url", str(settings.get("public_base_url", "") or "").strip())
 
 
 def _set_ozon_bg_state(**kwargs) -> None:
@@ -1021,9 +1042,8 @@ def _normalize_media_urls(values: list[object]) -> list[str]:
         url = str(raw or "").strip()
         if not url:
             continue
-        if url.startswith("//"):
-            url = "https:" + url
-        if not url.lower().startswith(("http://", "https://")):
+        url = normalize_media_reference(url) or ""
+        if not url:
             continue
         if url in seen:
             continue
@@ -1032,27 +1052,71 @@ def _normalize_media_urls(values: list[object]) -> list[str]:
     return out
 
 
-def _parse_gallery_value(raw_value: object) -> list[str]:
+def _looks_like_local_media_path(value: str | None) -> bool:
+    text = str(value or "").strip()
+    if not text:
+        return False
+    low = text.lower()
+    if text.startswith("\\\\") and re.search(r"\.(jpg|jpeg|png|webp|gif)$", low):
+        return True
+    if re.match(r"^[a-zA-Z]:\\", text) and re.search(r"\.(jpg|jpeg|png|webp|gif)$", low):
+        return True
+    return False
+
+
+def _normalize_local_media_path_to_public(value: str | None, public_base_url: str | None = None) -> str | None:
+    text = str(value or "").strip()
+    base = str(public_base_url or "").strip().rstrip("/")
+    if not text or not base or not _looks_like_local_media_path(text):
+        return None
+    normalized = text.replace("/", "\\")
+    if normalized.startswith("\\\\"):
+        parts = [p for p in normalized.split("\\") if p]
+        rel_parts = parts[1:] if len(parts) >= 2 else parts
+    elif re.match(r"^[a-zA-Z]:\\", normalized):
+        rel_parts = [p for p in normalized[3:].split("\\") if p]
+    else:
+        rel_parts = [p for p in normalized.split("\\") if p]
+    if not rel_parts:
+        return None
+    rel_path = posixpath.join(*rel_parts)
+    return f"{base}/{rel_path}"
+
+
+def normalize_media_reference(value: str | None, public_base_url: str | None = None) -> str | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if text.startswith("//"):
+        return "https:" + text
+    if text.lower().startswith(("http://", "https://")):
+        return text
+    if re.match(r"^[a-z0-9][a-z0-9\.\-]+\.[a-z]{2,}.*$", text.lower()) and " " not in text:
+        return f"https://{text}"
+    return _normalize_local_media_path_to_public(text, public_base_url=public_base_url)
+
+
+def _parse_gallery_value(raw_value: object, public_base_url: str | None = None) -> list[str]:
     if raw_value is None:
         return []
     if isinstance(raw_value, (list, tuple, set)):
-        return _normalize_media_urls(list(raw_value))
+        return _normalize_media_urls([normalize_media_reference(v, public_base_url=public_base_url) or v for v in list(raw_value)])
     text = str(raw_value).strip()
     if not text:
         return []
     try:
         loaded = json.loads(text)
         if isinstance(loaded, list):
-            return _normalize_media_urls(loaded)
+            return _normalize_media_urls([normalize_media_reference(v, public_base_url=public_base_url) or v for v in loaded])
         if isinstance(loaded, str):
             text = loaded
     except Exception:
         pass
     parts = re.split(r"[\n,;]+", text)
-    return _normalize_media_urls(parts)
+    return _normalize_media_urls([normalize_media_reference(v, public_base_url=public_base_url) or v for v in parts])
 
 
-def _collect_product_gallery_urls(conn, product_id: int, fallback_image_url: str | None = None) -> list[str]:
+def _collect_product_gallery_urls(conn, product_id: int, fallback_image_url: str | None = None, public_base_url: str | None = None) -> list[str]:
     rows = conn.execute(
         """
         SELECT attribute_code, value_text, value_json
@@ -1067,17 +1131,103 @@ def _collect_product_gallery_urls(conn, product_id: int, fallback_image_url: str
     for row in rows:
         if row["attribute_code"] == "gallery_images":
             if row["value_json"] not in (None, ""):
-                values.extend(_parse_gallery_value(row["value_json"]))
+                values.extend(_parse_gallery_value(row["value_json"], public_base_url=public_base_url))
             elif row["value_text"] not in (None, ""):
-                values.extend(_parse_gallery_value(row["value_text"]))
+                values.extend(_parse_gallery_value(row["value_text"], public_base_url=public_base_url))
         else:
             if row["value_text"] not in (None, ""):
-                values.append(row["value_text"])
+                values.append(normalize_media_reference(row["value_text"], public_base_url=public_base_url) or row["value_text"])
             elif row["value_json"] not in (None, ""):
-                values.extend(_parse_gallery_value(row["value_json"]))
+                values.extend(_parse_gallery_value(row["value_json"], public_base_url=public_base_url))
     if str(fallback_image_url or "").strip():
-        values.insert(0, str(fallback_image_url).strip())
+        values.insert(0, normalize_media_reference(str(fallback_image_url).strip(), public_base_url=public_base_url) or str(fallback_image_url).strip())
     return _normalize_media_urls(values)
+
+
+def _reset_card_filters() -> None:
+    st.session_state["card_product_search"] = ""
+    st.session_state["card_product_category_filter"] = "Все"
+    st.session_state["card_product_subcategory_filter"] = "Все"
+    st.session_state["card_product_supplier_filter"] = "Все"
+
+
+def _sanitize_filename_part(value: str | None) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return "ITEM"
+    text = re.sub(r'[<>:"/\\|?*\x00-\x1F]+', "_", text)
+    text = re.sub(r"\s+", "_", text).strip("._ ")
+    return text[:120] or "ITEM"
+
+
+def _download_binary_resource(source: str, timeout: float = 25.0) -> bytes | None:
+    src = str(source or "").strip()
+    if not src:
+        return None
+    if src.lower().startswith(("http://", "https://")):
+        try:
+            with httpx.Client(follow_redirects=True, timeout=timeout) as client:
+                response = client.get(src)
+                response.raise_for_status()
+                return response.content
+        except Exception:
+            return None
+    if _looks_like_local_media_path(src):
+        try:
+            return Path(src).read_bytes()
+        except Exception:
+            return None
+    return None
+
+
+def build_product_images_zip(
+    conn,
+    product_ids: list[int],
+    public_base_url: str | None = None,
+) -> tuple[bytes, dict[str, int]]:
+    ids = [int(x) for x in product_ids if str(x).strip()]
+    output = BytesIO()
+    stats = {"products": 0, "images_written": 0, "images_skipped": 0}
+    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for product_id in ids:
+            row = conn.execute(
+                """
+                SELECT id, article, supplier_article, image_url
+                FROM products
+                WHERE id = ?
+                LIMIT 1
+                """,
+                (int(product_id),),
+            ).fetchone()
+            if not row:
+                continue
+            stats["products"] += 1
+            article = str(row["article"] or row["supplier_article"] or f"product_{int(product_id)}")
+            base_name = _sanitize_filename_part(article)
+            urls = _collect_product_gallery_urls(
+                conn,
+                int(product_id),
+                fallback_image_url=str(row["image_url"] or ""),
+                public_base_url=public_base_url,
+            )
+            if not urls:
+                stats["images_skipped"] += 1
+                continue
+            for idx, url in enumerate(urls, start=1):
+                binary = _download_binary_resource(url)
+                if not binary:
+                    stats["images_skipped"] += 1
+                    continue
+                ext = os.path.splitext(urlparse(url).path)[1].lower()
+                if ext not in {".jpg", ".jpeg", ".png", ".webp", ".gif"}:
+                    guessed = mimetypes.guess_extension(
+                        mimetypes.guess_type(url)[0] or "image/jpeg"
+                    ) or ".jpg"
+                    ext = guessed if guessed in {".jpg", ".jpeg", ".png", ".webp", ".gif"} else ".jpg"
+                zf.writestr(f"{base_name}_{idx}{ext}", binary)
+                stats["images_written"] += 1
+    output.seek(0)
+    return output.getvalue(), stats
 
 
 def estimate_dimensions_for_product(
@@ -1257,8 +1407,6 @@ def ensure_ozon_requirements_for_product_category(
         ).fetchone()[0]
         or 0
     )
-    if existing > 0:
-        return {"ok": True, "imported": 0, "required": 0, "existing": existing, "cached": 0}
 
     cached = int(
         conn.execute(
@@ -1274,13 +1422,27 @@ def ensure_ozon_requirements_for_product_category(
     )
     if cached <= 0:
         return {"ok": False, "imported": 0, "required": 0, "existing": existing, "cached": cached}
+    if existing >= cached:
+        return {"ok": True, "imported": 0, "required": 0, "existing": existing, "cached": cached}
 
     result = import_cached_attributes_to_pim(conn, description_category_id=desc_id, type_id=typ_id)
+    final_existing = int(
+        conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM channel_attribute_requirements
+            WHERE channel_code = 'ozon'
+              AND category_code = ?
+            """,
+            (category_code,),
+        ).fetchone()[0]
+        or 0
+    )
     return {
         "ok": True,
         "imported": int(result.get("imported") or 0),
         "required": int(result.get("required") or 0),
-        "existing": existing,
+        "existing": final_existing,
         "cached": cached,
     }
 
@@ -3194,6 +3356,8 @@ def show_catalog_tab():
         file_name=f"pim_products_page_{int(page)}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
+    media_settings = load_media_settings(conn)
+    media_public_base_url = str(media_settings.get("public_base_url") or "").strip()
 
     ids = df["id"].tolist()
     selected_id = st.selectbox("Открыть карточку товара", ids, format_func=lambda x: f"ID {x}")
@@ -3228,6 +3392,8 @@ def show_catalog_tab():
         if include_without_url
         else [int(x) for x in filtered_supplier_candidate_ids]
     )
+    page_zip_signature = f"page:{int(page)}:{hashlib.sha1(','.join([str(int(x)) for x in ids]).encode('utf-8')).hexdigest()}"
+    filtered_zip_signature = f"filtered:{hashlib.sha1(','.join([str(int(x)) for x in all_filtered_candidate_ids]).encode('utf-8')).hexdigest()}"
     bc1, bc2, bc3 = st.columns(3)
     with bc1:
         max_bulk_enrich_page = st.number_input(
@@ -3471,6 +3637,63 @@ def show_catalog_tab():
                 candidate_ids=[int(x) for x in all_filtered_candidate_ids],
                 run_limit=int(max_bulk_enrich_filtered),
                 run_label="Вся выборка фильтра",
+            )
+    z1, z2 = st.columns(2)
+    with z1:
+        if st.button("Подготовить ZIP фото текущей страницы", key="catalog_prepare_images_page_zip"):
+            zip_page_bytes, zip_page_stats = build_product_images_zip(
+                conn,
+                [int(x) for x in ids],
+                public_base_url=media_public_base_url,
+            )
+            st.session_state["catalog_page_zip_bytes"] = zip_page_bytes
+            st.session_state["catalog_page_zip_stats"] = zip_page_stats
+            st.session_state["catalog_page_zip_signature"] = page_zip_signature
+            if int(zip_page_stats.get("images_written") or 0) > 0:
+                st.success(
+                    f"ZIP по текущей странице подготовлен. Фото: {int(zip_page_stats.get('images_written') or 0)}, "
+                    f"пропущено: {int(zip_page_stats.get('images_skipped') or 0)}."
+                )
+            else:
+                st.warning("Для текущей страницы не удалось собрать публичные фото в ZIP.")
+        if (
+            st.session_state.get("catalog_page_zip_signature") == page_zip_signature
+            and st.session_state.get("catalog_page_zip_bytes")
+        ):
+            st.download_button(
+                "Скачать фото текущей страницы ZIP",
+                data=st.session_state["catalog_page_zip_bytes"],
+                file_name=f"pim_product_images_page_{int(page)}.zip",
+                mime="application/zip",
+                key="catalog_export_images_page_zip",
+            )
+    with z2:
+        if st.button("Подготовить ZIP фото всей выборки", key="catalog_prepare_images_filtered_zip"):
+            zip_filtered_bytes, zip_filtered_stats = build_product_images_zip(
+                conn,
+                [int(x) for x in all_filtered_candidate_ids],
+                public_base_url=media_public_base_url,
+            )
+            st.session_state["catalog_filtered_zip_bytes"] = zip_filtered_bytes
+            st.session_state["catalog_filtered_zip_stats"] = zip_filtered_stats
+            st.session_state["catalog_filtered_zip_signature"] = filtered_zip_signature
+            if int(zip_filtered_stats.get("images_written") or 0) > 0:
+                st.success(
+                    f"ZIP по всей выборке подготовлен. Фото: {int(zip_filtered_stats.get('images_written') or 0)}, "
+                    f"пропущено: {int(zip_filtered_stats.get('images_skipped') or 0)}."
+                )
+            else:
+                st.warning("Для текущей фильтрации не удалось собрать публичные фото в ZIP.")
+        if (
+            st.session_state.get("catalog_filtered_zip_signature") == filtered_zip_signature
+            and st.session_state.get("catalog_filtered_zip_bytes")
+        ):
+            st.download_button(
+                "Скачать фото всей выборки ZIP",
+                data=st.session_state["catalog_filtered_zip_bytes"],
+                file_name="pim_product_images_filtered.zip",
+                mime="application/zip",
+                key="catalog_export_images_filtered_zip",
             )
 
     st.dataframe(with_ru_columns(df), use_container_width=True, hide_index=True)
@@ -4115,6 +4338,8 @@ def show_product_tab():
     conn = get_db()
     parser_settings = load_parser_settings(conn)
     ai_settings = load_ai_settings(conn)
+    media_settings = load_media_settings(conn)
+    media_public_base_url = str(media_settings.get("public_base_url") or "").strip()
     st.subheader("Поиск и выбор товара для редактирования")
     st.caption("Сначала выбери товар через фильтры, затем откроется его карточка для заполнения и обогащения.")
     with st.container(border=True):
@@ -4151,12 +4376,7 @@ def show_product_tab():
             )
         with fs5:
             st.markdown("<br>", unsafe_allow_html=True)
-            if st.button("Сброс", key="card_filters_reset"):
-                st.session_state["card_product_search"] = ""
-                st.session_state["card_product_category_filter"] = "Все"
-                st.session_state["card_product_subcategory_filter"] = "Все"
-                st.session_state["card_product_supplier_filter"] = "Все"
-                st.rerun()
+            st.button("Сброс", key="card_filters_reset", on_click=_reset_card_filters)
 
     filtered_products = find_products_for_card(
         conn,
@@ -4911,6 +5131,7 @@ def show_product_tab():
         conn,
         int(product_id),
         fallback_image_url=str(product["image_url"] or ""),
+        public_base_url=media_public_base_url,
     )
     prefill_description = st.session_state.pop(f"ai_description_prefill_{int(product_id)}", None)
     description_initial_value = (
@@ -4989,20 +5210,20 @@ def show_product_tab():
             package_height = st.number_input("Высота упаковки", value=float(product["package_height"] or 0.0), step=1.0)
             gross_weight = st.number_input("Вес брутто", value=float(product["gross_weight"] or 0.0), step=0.1)
 
-        image_url = st.text_input("Фото (основное)", value=product["image_url"] or "")
+        image_url = st.text_input("Фото (основное)", value=normalize_media_reference(product["image_url"] or "", public_base_url=media_public_base_url) or (product["image_url"] or ""))
         gallery_text = st.text_area(
             "Галерея фото (по одной ссылке в строке)",
             value="\n".join(current_gallery_urls),
             height=130,
-            help="Можно указать 1+ ссылок. Это поле всегда доступно, даже если парсер нашел только одну картинку.",
+            help="Можно указать 1+ ссылок. Лучше использовать публичные http/https ссылки на .jpg/.jpeg/.png. Если настроен public media URL, локальные пути будут конвертированы в веб-ссылки.",
         )
         description = st.text_area("Описание", value=description_initial_value, height=180)
 
         submitted = st.form_submit_button("Сохранить карточку", type="primary")
 
         if submitted:
-            gallery_urls = _parse_gallery_value(gallery_text)
-            primary_image = str(image_url or "").strip()
+            gallery_urls = _parse_gallery_value(gallery_text, public_base_url=media_public_base_url)
+            primary_image = normalize_media_reference(str(image_url or "").strip(), public_base_url=media_public_base_url) or str(image_url or "").strip()
             if primary_image:
                 gallery_urls = _normalize_media_urls([primary_image] + gallery_urls)
             elif gallery_urls:
@@ -5067,6 +5288,19 @@ def show_product_tab():
             refresh_duplicates_for_product(conn, int(product_id))
             st.success("Сохранено")
             st.rerun()
+
+    if current_gallery_urls:
+        zip_bytes, zip_stats = build_product_images_zip(conn, [int(product_id)], public_base_url=media_public_base_url)
+        if int(zip_stats.get("images_written") or 0) > 0:
+            st.download_button(
+                "Скачать все фото товара ZIP",
+                data=zip_bytes,
+                file_name=f"{_sanitize_filename_part(str(product['article'] or product['supplier_article'] or product_id))}_images.zip",
+                mime="application/zip",
+                key=f"product_images_zip_{int(product_id)}",
+            )
+        else:
+            st.caption("Фото у товара есть, но сейчас не удалось собрать ZIP. Проверь, что ссылки публичные или настроен public media URL.")
 
     st.markdown("### Источники ключевых полей")
     st.caption("Важно видеть, что пришло руками, что от поставщика, и какие значения ещё слабые по источнику.")
@@ -5235,6 +5469,8 @@ def show_attributes_tab():
         st.warning("Товар не выбран. Выбери товар во вкладке `Карточка` или `Каталог`, чтобы редактировать значения атрибутов.")
 
     required_map: dict[str, int] = {}
+    selected_scope_cached_total = 0
+    selected_scope_cached_required = 0
     if category_scope != "Все":
         req_rows = conn.execute(
             """
@@ -5246,6 +5482,37 @@ def show_attributes_tab():
             (str(category_scope),),
         ).fetchall()
         required_map = {str(r["attribute_code"]): int(r["is_required"] or 0) for r in req_rows}
+        parts = str(category_scope).split(":")
+        if len(parts) == 3 and parts[0] == "ozon":
+            try:
+                selected_scope_cached_total = int(
+                    conn.execute(
+                        """
+                        SELECT COUNT(*)
+                        FROM ozon_attribute_cache
+                        WHERE description_category_id = ?
+                          AND type_id = ?
+                        """,
+                        (int(parts[1]), int(parts[2])),
+                    ).fetchone()[0]
+                    or 0
+                )
+                selected_scope_cached_required = int(
+                    conn.execute(
+                        """
+                        SELECT COUNT(*)
+                        FROM ozon_attribute_cache
+                        WHERE description_category_id = ?
+                          AND type_id = ?
+                          AND is_required = 1
+                        """,
+                        (int(parts[1]), int(parts[2])),
+                    ).fetchone()[0]
+                    or 0
+                )
+            except Exception:
+                selected_scope_cached_total = 0
+                selected_scope_cached_required = 0
 
     defs = list_attribute_definitions(conn)
     defs_df = pd.DataFrame(defs) if defs else pd.DataFrame()
@@ -5297,6 +5564,17 @@ def show_attributes_tab():
             "SELECT COUNT(*) FROM channel_attribute_requirements WHERE channel_code = 'ozon'"
         ).fetchone()[0]
         m4.metric("Всего Ozon requirements", int(total_requirements or 0))
+        if category_scope != "Все":
+            st.caption(
+                f"Для выбранной Ozon-пары: в кэше Ozon {int(selected_scope_cached_total)} атрибутов, "
+                f"обязательных {int(selected_scope_cached_required)}; "
+                f"в PIM requirements {int(len(required_map))}."
+            )
+            if int(selected_scope_cached_total) > 0 and int(len(required_map)) < int(selected_scope_cached_total):
+                st.warning(
+                    "Для этой Ozon-категории в PIM пока меньше требований, чем в кэше Ozon. "
+                    "Теперь система умеет добирать недостающие атрибуты; запусти `Подтянуть Ozon-атрибуты` для товара или выборки."
+                )
 
         if defs_df.empty:
             st.info("По текущим фильтрам атрибуты не найдены.")
@@ -7357,6 +7635,7 @@ def show_channels_tab():
     st.subheader("Каналы")
     st.caption("Здесь настраиваются требования и mapping rules для клиентов и каналов. Это служебный слой, который управляет экспортом.")
     ai_settings = load_ai_settings(conn)
+    media_settings = load_media_settings(conn)
 
     with st.expander("AI-настройки (описание, атрибуты, фото)", expanded=False):
         st.caption(
@@ -7516,6 +7795,29 @@ def show_channels_tab():
                     )
                 else:
                     st.error(f"Ошибка AI-подключения: {check_result.get('error')}")
+
+    with st.expander("Медиа / фото", expanded=False):
+        st.caption(
+            "Если в прайсах или 1С приходят локальные пути к картинкам, здесь можно задать публичный base URL. "
+            "Тогда система будет конвертировать пути вида `\\\\fs03\\share\\folder\\image.jpg` "
+            "в нормальные web-ссылки для карточки, Excel-выгрузки и ZIP-архивов."
+        )
+        media_public_base_url = st.text_input(
+            "Public base URL для фото",
+            value=str(media_settings.get("public_base_url") or ""),
+            placeholder="Например: https://cdn.example.ru/photos",
+            key="media_cfg_public_base_url",
+            help="Пример: `\\\\fs03\\1c_photo\\LinkPics\\153\\153246_0.jpg` -> `https://.../1c_photo/LinkPics/153/153246_0.jpg`.",
+        )
+        if st.button("Сохранить настройки фото", key="media_cfg_save_btn"):
+            save_media_settings(
+                conn,
+                {
+                    "public_base_url": str(media_public_base_url or "").strip(),
+                },
+            )
+            st.success("Настройки фото сохранены.")
+            st.rerun()
 
     channels = conn.execute(
         "SELECT channel_code, channel_name, is_active FROM channel_profiles ORDER BY channel_name"

@@ -2,8 +2,10 @@ from __future__ import annotations
 
 from io import BytesIO
 from pathlib import Path
+import posixpath
 import re
 import zipfile
+import json
 
 import pandas as pd
 from openpyxl import load_workbook
@@ -34,6 +36,90 @@ BASE_PRODUCT_FIELD_ALIASES = {
     "image_url": ["фото", "изображение", "image", "main image", "image links", "image_links"],
     "tnved_code": ["tnved", "тнвэд", "тн вэд", "код тнвэд"],
 }
+
+
+def _get_public_media_base_url(conn) -> str:
+    try:
+        row = conn.execute(
+            "SELECT value FROM system_settings WHERE key = 'media.public_base_url' LIMIT 1"
+        ).fetchone()
+    except Exception:
+        return ""
+    if not row:
+        return ""
+    try:
+        value = row["value"]
+    except Exception:
+        value = row[0] if len(row) > 0 else ""
+    return str(value or "").strip().rstrip("/")
+
+
+def _looks_like_local_media_path(value: str | None) -> bool:
+    text = str(value or "").strip()
+    if not text:
+        return False
+    low = text.lower()
+    if text.startswith("\\\\") and re.search(r"\.(jpg|jpeg|png|webp|gif)$", low):
+        return True
+    if re.match(r"^[a-zA-Z]:\\", text) and re.search(r"\.(jpg|jpeg|png|webp|gif)$", low):
+        return True
+    return False
+
+
+def _normalize_media_reference(value: object, public_base_url: str = "") -> str | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if text.startswith("//"):
+        return "https:" + text
+    if text.lower().startswith(("http://", "https://")):
+        return text
+    if re.match(r"^[a-z0-9][a-z0-9\\.\\-]+\\.[a-z]{2,}.*$", text.lower()) and " " not in text:
+        return f"https://{text}"
+    if not public_base_url or not _looks_like_local_media_path(text):
+        return text
+    normalized = text.replace("/", "\\")
+    if normalized.startswith("\\\\"):
+        parts = [p for p in normalized.split("\\") if p]
+        rel_parts = parts[1:] if len(parts) >= 2 else parts
+    elif re.match(r"^[a-zA-Z]:\\", normalized):
+        rel_parts = [p for p in normalized[3:].split("\\") if p]
+    else:
+        rel_parts = [p for p in normalized.split("\\") if p]
+    if not rel_parts:
+        return text
+    rel_path = posixpath.join(*rel_parts)
+    return f"{public_base_url}/{rel_path}"
+
+
+def _parse_media_value(raw_value: object, public_base_url: str = "") -> list[str]:
+    if raw_value in (None, ""):
+        return []
+    if isinstance(raw_value, (list, tuple, set)):
+        values = list(raw_value)
+    else:
+        text = str(raw_value).strip()
+        if not text:
+            return []
+        try:
+            loaded = json.loads(text)
+            if isinstance(loaded, list):
+                values = loaded
+            elif isinstance(loaded, str):
+                values = re.split(r"[\n,;]+", loaded)
+            else:
+                values = re.split(r"[\n,;]+", text)
+        except Exception:
+            values = re.split(r"[\n,;]+", text)
+    out: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        normalized = _normalize_media_reference(value, public_base_url=public_base_url)
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        out.append(normalized)
+    return out
 
 SPECIAL_TEMPLATE_MATCHERS = [
     # Online Trade standard template (long headers)
@@ -263,6 +349,7 @@ def build_product_value_map(conn, product_id: int) -> dict[str, object]:
         return {}
     # sqlite3.Row doesn't support .get(); normalize once to a plain dict.
     product = dict(product_row)
+    public_media_base_url = _get_public_media_base_url(conn)
 
     value_map = dict(product)
 
@@ -298,13 +385,23 @@ def build_product_value_map(conn, product_id: int) -> dict[str, object]:
     media_values = []
     for row in media_rows:
         if row["value_json"]:
-            media_values.append(row["value_json"])
+            media_values.extend(_parse_media_value(row["value_json"], public_base_url=public_media_base_url))
         elif row["value_text"]:
-            media_values.append(row["value_text"])
-    image_url = value_map.get("image_url")
+            media_values.extend(_parse_media_value(row["value_text"], public_base_url=public_media_base_url))
+    image_url = _normalize_media_reference(value_map.get("image_url"), public_base_url=public_media_base_url)
     if image_url:
         media_values.insert(0, image_url)
-    value_map["media_gallery"] = media_values
+    deduped_media_values: list[str] = []
+    seen_media: set[str] = set()
+    for item in media_values:
+        normalized = _normalize_media_reference(item, public_base_url=public_media_base_url)
+        if not normalized or normalized in seen_media:
+            continue
+        seen_media.add(normalized)
+        deduped_media_values.append(normalized)
+    if image_url:
+        value_map["image_url"] = image_url
+    value_map["media_gallery"] = deduped_media_values
 
     return value_map
 
