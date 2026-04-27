@@ -2,6 +2,28 @@
 
 ## 2026-04-27
 
+### `pending` Analyze Detmir bike template and improve auto-matching
+
+- Разобран клиентский шаблон `Детский Мир -> Велосипеды` (`categoryId=68`) и зафиксирован как референсный канал для проверки template flow.
+- Причина:
+  - у шаблона двухслойная шапка: машинные коды в строке 1 и русские названия в строке 2;
+  - часть очевидных полей Детского мира не матчилось автоматически, хотя в master уже есть подходящие атрибуты.
+- Что изменено:
+  - в `services/template_matching.py` добавлены явные Detmir-mappings для:
+    - `strana_proizvodstva -> country_of_origin`
+    - `pol -> gender`
+    - `material_igr_osn -> material`
+    - `tip_velosipedy -> child_bike_type`
+    - `tip_koles_kgt -> wheel_type`
+    - `tip_tormoza -> brake_type`
+    - `cvet_f -> color`
+    - `komplektaciya_velo -> equipment`
+  - знание о шаблоне `Детский Мир -> Велосипеды` и его проблемных полях зафиксировано в `PROJECT_CONTEXT.md`.
+- Что проверить вручную:
+  - загрузить шаблон ДМ во вкладке `Клиентский шаблон`;
+  - убедиться, что число авто-сматченных полей стало выше и указанные поля больше не попадают в `unmatched`;
+  - проверить, что оставшиеся `unmatched` — это действительно category/client-specific поля, а не очевидная база товара.
+
 ### `pending` Add FSA certificate/declaration parsing to product card
 
 - Добавлен рабочий блок ФСА в `Карточка`, чтобы подтягивать сертификаты и декларации прямо к товару.
