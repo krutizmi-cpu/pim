@@ -8,6 +8,7 @@ from pathlib import Path
 
 DB_PATH = Path("data/catalog.db")
 _ACTIVE_DB_PATH: Path | None = None
+PERSISTENT_DB_PATH = Path.home() / ".pim" / "catalog.db"
 
 
 REQUIRED_PRODUCT_COLUMNS: dict[str, str] = {
@@ -61,7 +62,7 @@ def _candidate_db_paths(db_path: Path) -> list[Path]:
     if env_path:
         candidates.append(Path(env_path).expanduser())
     # Prefer user-home persistent path over repo-local data path.
-    candidates.append(Path.home() / ".pim" / "catalog.db")
+    candidates.append(PERSISTENT_DB_PATH)
     candidates.append(Path(db_path).expanduser())
     candidates.append(Path.cwd() / "data" / "catalog.db")
     candidates.append(Path(tempfile.gettempdir()) / "pim" / "catalog.db")
@@ -101,22 +102,102 @@ def _db_is_readable_with_products(path: Path) -> bool:
             conn.close()
 
 
+def _safe_count(conn: sqlite3.Connection, table_name: str) -> int:
+    try:
+        row = conn.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()
+    except Exception:
+        return 0
+    if not row:
+        return 0
+    try:
+        return int(row[0] or 0)
+    except Exception:
+        return 0
+
+
+def _db_state_summary(path: Path) -> dict[str, int] | None:
+    if not path.exists() or not path.is_file():
+        return None
+
+    conn: sqlite3.Connection | None = None
+    try:
+        conn = sqlite3.connect(path)
+        tables = {
+            str(row[0])
+            for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+            if row and row[0]
+        }
+        if not tables:
+            return {
+                "products": 0,
+                "product_attribute_values": 0,
+                "template_profiles": 0,
+                "channel_mapping_rules": 0,
+                "channel_attribute_requirements": 0,
+                "ozon_category_cache": 0,
+                "ozon_attribute_cache": 0,
+                "ozon_attribute_value_cache": 0,
+                "supplier_profiles": 0,
+                "product_registry_documents": 0,
+                "score": 0,
+            }
+
+        summary = {
+            "products": _safe_count(conn, "products") if "products" in tables else 0,
+            "product_attribute_values": _safe_count(conn, "product_attribute_values") if "product_attribute_values" in tables else 0,
+            "template_profiles": _safe_count(conn, "template_profiles") if "template_profiles" in tables else 0,
+            "channel_mapping_rules": _safe_count(conn, "channel_mapping_rules") if "channel_mapping_rules" in tables else 0,
+            "channel_attribute_requirements": _safe_count(conn, "channel_attribute_requirements") if "channel_attribute_requirements" in tables else 0,
+            "ozon_category_cache": _safe_count(conn, "ozon_category_cache") if "ozon_category_cache" in tables else 0,
+            "ozon_attribute_cache": _safe_count(conn, "ozon_attribute_cache") if "ozon_attribute_cache" in tables else 0,
+            "ozon_attribute_value_cache": _safe_count(conn, "ozon_attribute_value_cache") if "ozon_attribute_value_cache" in tables else 0,
+            "supplier_profiles": _safe_count(conn, "supplier_profiles") if "supplier_profiles" in tables else 0,
+            "product_registry_documents": _safe_count(conn, "product_registry_documents") if "product_registry_documents" in tables else 0,
+        }
+        # Weight product/master data highest, but preserve Ozon cache and mappings too.
+        summary["score"] = (
+            summary["products"] * 1000
+            + summary["product_attribute_values"] * 30
+            + summary["template_profiles"] * 200
+            + summary["channel_mapping_rules"] * 120
+            + summary["channel_attribute_requirements"] * 10
+            + summary["ozon_category_cache"] * 5
+            + summary["ozon_attribute_cache"] * 2
+            + summary["ozon_attribute_value_cache"]
+            + summary["supplier_profiles"] * 20
+            + summary["product_registry_documents"] * 25
+        )
+        return summary
+    except Exception:
+        return None
+    finally:
+        if conn is not None:
+            conn.close()
+
+
 def _seed_preferred_db_if_needed(preferred: Path, fallbacks: list[Path]) -> None:
     """
-    If preferred DB is absent/empty, try to copy the richest existing DB from fallback paths.
-    This protects catalog data when app path changes (e.g., Streamlit Cloud redeploy).
+    If preferred DB is absent/empty, or clearly poorer than another known DB,
+    copy the richest existing DB from fallback paths. This protects catalog,
+    Ozon cache, and mappings when app path changes or an empty DB file was
+    accidentally created earlier.
     """
-    if preferred.exists() and preferred.is_file():
-        return
+    preferred_summary = _db_state_summary(preferred)
+    preferred_score = int((preferred_summary or {}).get("score") or 0)
 
     source: Path | None = None
+    source_score = preferred_score
     for candidate in fallbacks:
         if candidate.resolve() == preferred.resolve():
             continue
-        if _db_is_readable_with_products(candidate):
+        candidate_summary = _db_state_summary(candidate)
+        candidate_score = int((candidate_summary or {}).get("score") or 0)
+        if candidate_score > source_score:
             source = candidate
-            break
-    if source is None:
+            source_score = candidate_score
+    if source is None or source_score <= 0:
+        return
+    if preferred.exists() and preferred.is_file() and preferred_score >= source_score:
         return
 
     try:

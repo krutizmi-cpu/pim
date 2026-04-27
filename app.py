@@ -99,7 +99,7 @@ def is_likely_blocked_supplier_domain(url: str | None) -> bool:
         except Exception:
             return False
     return False
-from services.template_matching import auto_match_template_columns, apply_saved_mapping_rules, fill_template_dataframe, apply_client_validated_values, fill_template_workbook_bytes, dataframe_to_excel_bytes, detect_template_data_start_row, sanitize_template_xlsx_bytes
+from services.template_matching import auto_match_template_columns, apply_saved_mapping_rules, fill_template_dataframe, apply_client_validated_values, fill_template_workbook_bytes, dataframe_to_excel_bytes, detect_template_data_start_row, sanitize_template_xlsx_bytes, read_client_template_dataframe
 from services.template_profiles import save_template_profile, list_template_profiles, get_template_profile_columns
 from services.readiness_service import analyze_template_readiness
 from services.supplier_profiles import list_supplier_profiles, upsert_supplier_profile, ensure_default_supplier_profiles
@@ -1980,11 +1980,8 @@ def apply_mass_product_updates(
             continue
         current = dict(row)
         row_updates: dict[str, str] = {}
-        ozon_locked = bool(int(current.get("ozon_description_category_id") or 0) > 0 and int(current.get("ozon_type_id") or 0) > 0)
         for field, value in updates.items():
             if value is None:
-                continue
-            if ozon_locked and field in {"category", "base_category", "subcategory"}:
                 continue
             if only_empty and not _is_blank_value(current.get(field)):
                 continue
@@ -5610,20 +5607,27 @@ def show_product_tab():
             barcode_source = st.text_input("Источник штрихкода", value=product["barcode_source"] or "")
 
         with c2:
-            category_options = [""] + sorted(set(category_values + ([str(product["category"])] if product["category"] else [])))
-            category_default = str(product["category"] or "")
-            category_idx = category_options.index(category_default) if category_default in category_options else 0
-            category = st.selectbox("Категория (приоритет Ozon)", options=category_options, index=category_idx)
-
-            base_options = [""] + sorted(set(category_values + ([str(product["base_category"])] if product["base_category"] else [])))
-            base_default = str(product["base_category"] or "")
-            base_idx = base_options.index(base_default) if base_default in base_options else 0
-            base_category = st.selectbox("Базовая категория (приоритет Ozon)", options=base_options, index=base_idx)
-
-            sub_options = [""] + sorted(set(category_values + ([str(product["subcategory"])] if product["subcategory"] else [])))
-            sub_default = str(product["subcategory"] or "")
-            sub_idx = sub_options.index(sub_default) if sub_default in sub_options else 0
-            subcategory = st.selectbox("Подкатегория (приоритет Ozon)", options=sub_options, index=sub_idx)
+            st.caption(
+                "Если Ozon подобрал каталог неточно, эти поля можно скорректировать вручную. "
+                "Ручное значение сохраняется как `manual` и не должно затираться обычной автопривязкой без force."
+            )
+            if product["ozon_category_path"]:
+                st.caption(f"Ozon path сейчас: {product['ozon_category_path']}")
+            category = st.text_input(
+                "Категория (ручная корректировка)",
+                value=str(product["category"] or ""),
+                help="Можно ввести своё значение, даже если его ещё нет в списках PIM.",
+            )
+            base_category = st.text_input(
+                "Базовая категория (ручная корректировка)",
+                value=str(product["base_category"] or ""),
+            )
+            subcategory = st.text_input(
+                "Подкатегория (ручная корректировка)",
+                value=str(product["subcategory"] or ""),
+            )
+            with st.expander("Подсказки по существующим категориям", expanded=False):
+                st.write(sorted(category_values)[:300] if category_values else ["Справочник категорий пока пуст"])
             wheel_diameter_inch = st.number_input(
                 "Диаметр колеса, inch",
                 value=float(product["wheel_diameter_inch"] or 0.0),
@@ -6277,7 +6281,13 @@ def show_template_tab():
         template_sheet_name = st.selectbox(
             "Лист шаблона",
             options=template_sheet_options,
-            index=(template_sheet_options.index("Товары") if "Товары" in template_sheet_options else 0),
+            index=(
+                template_sheet_options.index("Товары")
+                if "Товары" in template_sheet_options
+                else template_sheet_options.index("Шаблон для заполнения")
+                if "Шаблон для заполнения" in template_sheet_options
+                else 0
+            ),
             key="template_sheet_name",
         )
         suggested_data_start_row = detect_template_data_start_row(safe_uploaded_bytes, sheet_name=template_sheet_name)
@@ -6300,7 +6310,7 @@ def show_template_tab():
                 key="preserve_template_workbook",
             )
 
-        template_df = pd.read_excel(BytesIO(safe_uploaded_bytes), sheet_name=template_sheet_name)
+        template_df = read_client_template_dataframe(safe_uploaded_bytes, sheet_name=template_sheet_name)
         template_signature = hashlib.md5(safe_uploaded_bytes).hexdigest()
         autoreg_key = f"{channel_code}|{category_code}|{template_sheet_name}|{template_signature}"
         if st.session_state.get("template_autoreg_key") != autoreg_key:

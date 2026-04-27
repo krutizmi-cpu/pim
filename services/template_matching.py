@@ -185,11 +185,133 @@ SPECIAL_TEMPLATE_MATCHERS = [
     (("exact:высота предмета",), "column", "height", "wb_standard", None),
     (("exact:глубина предмета",), "column", "length", "wb_standard", None),
     (("exact:тнвэд",), "column", "tnved_code", "wb_standard", None),
+    # Sportmaster templates (shared layout)
+    (("exact:артикул продавца",), "column", "article", "sportmaster_standard", None),
+    (("exact:штрихкод",), "column", "barcode", "sportmaster_standard", None),
+    (("exact:наименование",), "column", "name", "sportmaster_standard", None),
+    (("exact:цена",), "attribute", "sportmaster_purchase_price", "sportmaster_standard", None),
+    (("exact:цена со скидкой",), "attribute", "sportmaster_discount_price", "sportmaster_standard", None),
+    (("exact:описание товара",), "column", "description", "sportmaster_standard", None),
+    (("exact:тнвэд",), "column", "tnved_code", "sportmaster_standard", None),
+    (("exact:страна производства",), "attribute", "country_of_origin", "sportmaster_standard", None),
+    (("exact:высота в упаковке, см",), "column", "package_height", "sportmaster_standard", None),
+    (("exact:длина в упаковке, см",), "column", "package_length", "sportmaster_standard", None),
+    (("exact:ширина в упаковке, см",), "column", "package_width", "sportmaster_standard", None),
+    (("exact:вес в упаковке, кг",), "column", "gross_weight", "sportmaster_standard", None),
+    (("exact:ссылки на фото",), "column", "media_gallery", "sportmaster_standard", "join_images"),
 ]
+
+PARTIAL_ALIAS_BLOCKLIST = {
+    "name",
+    "title",
+    "товар",
+    "товары",
+    "product",
+}
 
 
 def normalize_key(value: str) -> str:
-    return " ".join(str(value).strip().lower().replace("_", " ").split())
+    text = str(value or "").strip().lower().replace("_", " ")
+    text = text.replace("\n", " ")
+    text = text.replace("*", "")
+    text = re.sub(r"\.\d+$", "", text)
+    return " ".join(text.split())
+
+
+def detect_template_layout(template_bytes: bytes, sheet_name: str | None = None) -> dict[str, int | str]:
+    safe_bytes = template_bytes
+    try:
+        workbook = load_workbook(BytesIO(safe_bytes), read_only=True, data_only=False)
+    except Exception:
+        safe_bytes = sanitize_template_xlsx_bytes(template_bytes)
+        workbook = load_workbook(BytesIO(safe_bytes), read_only=True, data_only=False)
+
+    try:
+        chosen_sheet = sheet_name if sheet_name and sheet_name in workbook.sheetnames else workbook.sheetnames[0]
+        ws = workbook[chosen_sheet]
+        if "Коды характеристик" in workbook.sheetnames and chosen_sheet in {"Шаблон для заполнения", "Пример"}:
+            row3 = [str(ws.cell(3, c).value or "").strip() for c in range(1, int(ws.max_column or 1) + 1)]
+            row4 = [str(ws.cell(4, c).value or "").strip().lower() for c in range(1, int(ws.max_column or 1) + 1)]
+            non_empty_row3 = [v for v in row3 if v]
+            required_markers = sum(1 for v in row4 if "обязательный атрибут" in v)
+            if len(non_empty_row3) >= 8 and required_markers >= 4:
+                return {"header_row": 3, "data_start_row": 5, "template_kind": "sportmaster"}
+    finally:
+        workbook.close()
+
+    try:
+        xls = pd.ExcelFile(BytesIO(safe_bytes))
+    except Exception:
+        safe_bytes = sanitize_template_xlsx_bytes(template_bytes)
+        xls = pd.ExcelFile(BytesIO(safe_bytes))
+    chosen_sheet = sheet_name if sheet_name and sheet_name in xls.sheet_names else xls.sheet_names[0]
+    probe = pd.read_excel(BytesIO(safe_bytes), sheet_name=chosen_sheet, header=None, nrows=120)
+
+    header_tokens = {
+        "артикул", "article", "sku", "name", "название", "наименование",
+        "barcode", "штрихкод", "бренд", "brand", "описание", "description",
+        "артикул продавца", "категория продавца", "артикул wb",
+    }
+    instruction_markers = (
+        "введите",
+        "выберите",
+        "формат",
+        "минимальное кол-во",
+        "максимальное кол-во",
+        "можно выбрать",
+        "присваивается автоматически",
+        "выпадающий список",
+        "это номер или название",
+        "список ссылок",
+        "поставьте значение",
+        "обязательный атрибут",
+    )
+
+    candidate_header_row = None
+    best_score = -1
+    for i in range(len(probe)):
+        values = [str(v).strip().lower() for v in probe.iloc[i].tolist() if str(v).strip() and str(v).strip().lower() != "nan"]
+        if not values:
+            continue
+        score = 0
+        for v in values:
+            if any(token in v for token in header_tokens):
+                score += 3
+            if len(v) <= 80:
+                score += 1
+        if score > best_score and len(values) >= 2:
+            best_score = score
+            candidate_header_row = i + 1
+
+    if candidate_header_row is None:
+        return {"header_row": 1, "data_start_row": 2, "template_kind": "generic"}
+
+    data_start = int(candidate_header_row + 1)
+    for r in range(data_start, min(data_start + 10, len(probe)) + 1):
+        row_values = [str(v).strip().lower() for v in probe.iloc[r - 1].tolist() if str(v).strip() and str(v).strip().lower() != "nan"]
+        if not row_values:
+            continue
+        if any(any(marker in val for marker in instruction_markers) for val in row_values):
+            data_start = r + 1
+            continue
+        break
+    return {"header_row": int(max(1, candidate_header_row)), "data_start_row": int(max(2, data_start)), "template_kind": "generic"}
+
+
+def read_client_template_dataframe(template_bytes: bytes, sheet_name: str | None = None) -> pd.DataFrame:
+    safe_template_bytes = template_bytes
+    try:
+        pd.ExcelFile(BytesIO(safe_template_bytes))
+    except Exception:
+        safe_template_bytes = sanitize_template_xlsx_bytes(template_bytes)
+
+    layout = detect_template_layout(safe_template_bytes, sheet_name=sheet_name)
+    header_row = int(layout.get("header_row") or 1)
+    chosen_sheet = sheet_name
+    if not chosen_sheet:
+        xls = pd.ExcelFile(BytesIO(safe_template_bytes))
+        chosen_sheet = xls.sheet_names[0]
+    return pd.read_excel(BytesIO(safe_template_bytes), sheet_name=chosen_sheet, header=max(0, header_row - 1))
 
 
 def sanitize_template_xlsx_bytes(template_bytes: bytes) -> bytes:
@@ -270,6 +392,8 @@ def auto_match_template_columns(conn, columns: list[str]) -> list[dict]:
         if not matched:
             # Partial alias match for verbose client headers.
             for alias_norm, source_type, source_name, matched_by in alias_rows:
+                if alias_norm in PARTIAL_ALIAS_BLOCKLIST:
+                    continue
                 if len(alias_norm) >= 4 and alias_norm in norm:
                     matched = (source_type, source_name, f"alias_contains:{matched_by}")
                     break
@@ -496,64 +620,8 @@ def dataframe_to_excel_bytes(df: pd.DataFrame, sheet_name: str = "template") -> 
 
 
 def detect_template_data_start_row(template_bytes: bytes, sheet_name: str | None = None) -> int:
-    try:
-        xls = pd.ExcelFile(BytesIO(template_bytes))
-        bytes_to_use = template_bytes
-    except Exception:
-        bytes_to_use = sanitize_template_xlsx_bytes(template_bytes)
-        xls = pd.ExcelFile(BytesIO(bytes_to_use))
-    chosen_sheet = sheet_name if sheet_name and sheet_name in xls.sheet_names else xls.sheet_names[0]
-    probe = pd.read_excel(BytesIO(bytes_to_use), sheet_name=chosen_sheet, header=None, nrows=120)
-
-    header_tokens = {
-        "артикул", "article", "sku", "name", "название", "наименование",
-        "barcode", "штрихкод", "бренд", "brand", "описание", "description",
-        "артикул продавца", "категория продавца", "артикул wb",
-    }
-    instruction_markers = (
-        "введите",
-        "выберите",
-        "формат",
-        "минимальное кол-во",
-        "максимальное кол-во",
-        "можно выбрать",
-        "присваивается автоматически",
-        "выпадающий список",
-        "это номер или название",
-        "список ссылок",
-        "поставьте значение",
-    )
-
-    candidate_header_row = None
-    best_score = -1
-    for i in range(len(probe)):
-        values = [str(v).strip().lower() for v in probe.iloc[i].tolist() if str(v).strip() and str(v).strip().lower() != "nan"]
-        if not values:
-            continue
-        score = 0
-        for v in values:
-            if any(token in v for token in header_tokens):
-                score += 3
-            if len(v) <= 80:
-                score += 1
-        if score > best_score and len(values) >= 2:
-            best_score = score
-            candidate_header_row = i + 1  # 1-based
-
-    if candidate_header_row is None:
-        return 2
-
-    data_start = int(candidate_header_row + 1)
-    # Skip post-header instruction rows (WB/Detmir style).
-    for r in range(data_start, min(data_start + 10, len(probe)) + 1):
-        row_values = [str(v).strip().lower() for v in probe.iloc[r - 1].tolist() if str(v).strip() and str(v).strip().lower() != "nan"]
-        if not row_values:
-            continue
-        if any(any(marker in val for marker in instruction_markers) for val in row_values):
-            data_start = r + 1
-            continue
-        break
-    return int(max(2, data_start))
+    layout = detect_template_layout(template_bytes, sheet_name=sheet_name)
+    return int(layout.get("data_start_row") or 2)
 
 
 def fill_template_workbook_bytes(
@@ -574,15 +642,16 @@ def fill_template_workbook_bytes(
         except Exception:
             # Fallback for malformed workbook structures (seen in some WB exports).
             chosen_sheet = sheet_name or "template"
-            template_df = pd.read_excel(BytesIO(safe_template_bytes), sheet_name=sheet_name) if sheet_name else pd.read_excel(BytesIO(safe_template_bytes))
+            template_df = read_client_template_dataframe(safe_template_bytes, sheet_name=sheet_name)
             filled_df = fill_template_dataframe(conn, template_df, product_ids, matches)
             return dataframe_to_excel_bytes(filled_df, sheet_name=chosen_sheet)
     ws = workbook[sheet_name] if sheet_name and sheet_name in workbook.sheetnames else workbook.active
 
-    start_row = int(data_start_row or detect_template_data_start_row(safe_template_bytes, sheet_name=ws.title))
+    layout = detect_template_layout(safe_template_bytes, sheet_name=ws.title)
+    start_row = int(data_start_row or layout.get("data_start_row") or 2)
     if start_row < 2:
         start_row = 2
-    header_row = start_row - 1
+    header_row = int(layout.get("header_row") or max(1, start_row - 1))
 
     column_map: dict[str, int] = {}
     for col_idx in range(1, int(ws.max_column or 1) + 1):

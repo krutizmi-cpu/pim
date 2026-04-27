@@ -8,7 +8,9 @@ from services.source_tracking import get_latest_field_source
 SOURCE_PRIORITY = {
     "manual": 100,
     "client_validated": 90,
+    "ozon_category_match": 80,
     "supplier_page": 70,
+    "ozon_autofill": 64,
     "ozon_search_fallback": 62,
     "yandex_search_fallback": 60,
     "domain_search_fallback": 59,

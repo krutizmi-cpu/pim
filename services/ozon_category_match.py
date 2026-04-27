@@ -5,6 +5,7 @@ import sqlite3
 from difflib import SequenceMatcher
 from typing import Any
 
+from services.source_priority import can_overwrite_field
 from services.source_tracking import save_field_source
 
 
@@ -320,39 +321,82 @@ def bulk_assign_ozon_categories(
             existing_cat = category_by_key.get(key)
             existing_path = str(product.get("ozon_category_path") or (existing_cat or {}).get("full_path") or "").strip()
             derived = _derive_catalog_categories_from_ozon_path(existing_path)
-            if existing_path and (
-                str(product.get("category") or "").strip() != str(derived.get("category") or "").strip()
-                or not str(product.get("base_category") or "").strip()
-                or not str(product.get("subcategory") or "").strip()
-            ):
+            category_value = str(product.get("category") or "").strip()
+            base_value = str(product.get("base_category") or "").strip()
+            sub_value = str(product.get("subcategory") or "").strip()
+            desired_category = category_value
+            desired_base = base_value
+            desired_sub = sub_value
+            category_changed = False
+            base_changed = False
+            sub_changed = False
+            if existing_path and can_overwrite_field(conn, int(product_id), "category", "ozon_category_match", force=force):
+                candidate = str(derived.get("category") or category_value or "").strip()
+                if candidate and candidate != category_value:
+                    desired_category = candidate
+                    category_changed = True
+            if existing_path and (not base_value) and can_overwrite_field(conn, int(product_id), "base_category", "ozon_category_match", force=force):
+                candidate = str(derived.get("base_category") or "").strip()
+                if candidate:
+                    desired_base = candidate
+                    base_changed = True
+            if existing_path and (not sub_value) and can_overwrite_field(conn, int(product_id), "subcategory", "ozon_category_match", force=force):
+                candidate = str(derived.get("subcategory") or "").strip()
+                if candidate:
+                    desired_sub = candidate
+                    sub_changed = True
+            if existing_path and (category_changed or base_changed or sub_changed):
                 conn.execute(
                     """
                     UPDATE products
                     SET category = ?,
-                        base_category = CASE WHEN IFNULL(TRIM(base_category), '') = '' THEN ? ELSE base_category END,
-                        subcategory = CASE WHEN IFNULL(TRIM(subcategory), '') = '' THEN ? ELSE subcategory END,
+                        base_category = ?,
+                        subcategory = ?,
                         ozon_category_path = ?,
                         updated_at = CURRENT_TIMESTAMP
                     WHERE id = ?
                     """,
                     (
-                        str(derived.get("category") or product.get("category") or ""),
-                        str(derived.get("base_category") or ""),
-                        str(derived.get("subcategory") or ""),
+                        desired_category,
+                        desired_base,
+                        desired_sub,
                         existing_path,
                         int(product_id),
                     ),
                 )
-                save_field_source(
-                    conn=conn,
-                    product_id=int(product_id),
-                    field_name="category",
-                    source_type="ozon_category_match",
-                    source_value_raw=str(derived.get("category") or ""),
-                    source_url=existing_path,
-                    confidence=max(0.6, float(existing_conf)),
-                    is_manual=False,
-                )
+                if category_changed:
+                    save_field_source(
+                        conn=conn,
+                        product_id=int(product_id),
+                        field_name="category",
+                        source_type="ozon_category_match",
+                        source_value_raw=desired_category,
+                        source_url=existing_path,
+                        confidence=max(0.6, float(existing_conf)),
+                        is_manual=False,
+                    )
+                if base_changed:
+                    save_field_source(
+                        conn=conn,
+                        product_id=int(product_id),
+                        field_name="base_category",
+                        source_type="ozon_category_match",
+                        source_value_raw=desired_base,
+                        source_url=existing_path,
+                        confidence=max(0.6, float(existing_conf)),
+                        is_manual=False,
+                    )
+                if sub_changed:
+                    save_field_source(
+                        conn=conn,
+                        product_id=int(product_id),
+                        field_name="subcategory",
+                        source_type="ozon_category_match",
+                        source_value_raw=desired_sub,
+                        source_url=existing_path,
+                        confidence=max(0.6, float(existing_conf)),
+                        is_manual=False,
+                    )
             skipped += 1
             continue
 
@@ -382,13 +426,22 @@ def bulk_assign_ozon_categories(
         desired_category = str(derived.get("category") or product.get("category") or "")
         desired_base = str(derived.get("base_category") or "")
         desired_sub = str(derived.get("subcategory") or "")
+        current_category = str(product.get("category") or "").strip()
         current_base = str(product.get("base_category") or "").strip()
         current_sub = str(product.get("subcategory") or "").strip()
-        if not force:
-            if current_base:
-                desired_base = current_base
-            if current_sub:
-                desired_sub = current_sub
+        apply_category = can_overwrite_field(conn, int(product_id), "category", "ozon_category_match", force=force)
+        apply_base = can_overwrite_field(conn, int(product_id), "base_category", "ozon_category_match", force=force)
+        apply_sub = can_overwrite_field(conn, int(product_id), "subcategory", "ozon_category_match", force=force)
+        if not apply_category:
+            desired_category = current_category
+        if not force and current_base:
+            desired_base = current_base
+        if not force and current_sub:
+            desired_sub = current_sub
+        if not apply_base:
+            desired_base = current_base
+        if not apply_sub:
+            desired_sub = current_sub
 
         conn.execute(
             """
@@ -434,17 +487,18 @@ def bulk_assign_ozon_categories(
             confidence=float(match["score"]),
             is_manual=False,
         )
-        save_field_source(
-            conn=conn,
-            product_id=int(product_id),
-            field_name="category",
-            source_type="ozon_category_match",
-            source_value_raw=desired_category,
-            source_url=str(match["full_path"] or ""),
-            confidence=float(match["score"]),
-            is_manual=False,
-        )
-        if force or not current_base:
+        if apply_category:
+            save_field_source(
+                conn=conn,
+                product_id=int(product_id),
+                field_name="category",
+                source_type="ozon_category_match",
+                source_value_raw=desired_category,
+                source_url=str(match["full_path"] or ""),
+                confidence=float(match["score"]),
+                is_manual=False,
+            )
+        if apply_base and (force or not current_base):
             save_field_source(
                 conn=conn,
                 product_id=int(product_id),
@@ -455,7 +509,7 @@ def bulk_assign_ozon_categories(
                 confidence=float(match["score"]),
                 is_manual=False,
             )
-        if force or not current_sub:
+        if apply_sub and (force or not current_sub):
             save_field_source(
                 conn=conn,
                 product_id=int(product_id),
