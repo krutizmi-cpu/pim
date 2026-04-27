@@ -7,6 +7,7 @@ from typing import Any
 DEFAULT_SUPPLIER_PROFILES: list[dict[str, Any]] = [
     {
         "supplier_name": "Рокви",
+        "legal_entity_name": "",
         "base_url": "https://velocitygroup.ru/catalog/",
         "url_template": "https://velocitygroup.ru/catalog/?q={supplier_article_q}",
         "notes": "Поиск по артикулу поставщика",
@@ -20,9 +21,10 @@ def ensure_default_supplier_profiles(conn: sqlite3.Connection) -> int:
     for item in DEFAULT_SUPPLIER_PROFILES:
         supplier_name = str(item.get("supplier_name") or "").strip()
         existing = conn.execute(
-            "SELECT id, base_url, url_template, notes, is_active FROM supplier_profiles WHERE supplier_name = ? LIMIT 1",
+            "SELECT id, legal_entity_name, base_url, url_template, notes, is_active FROM supplier_profiles WHERE supplier_name = ? LIMIT 1",
             (supplier_name,),
         ).fetchone()
+        desired_legal = item.get("legal_entity_name") or None
         desired_base = item.get("base_url") or None
         desired_template = item.get("url_template") or None
         desired_notes = item.get("notes") or None
@@ -31,6 +33,7 @@ def ensure_default_supplier_profiles(conn: sqlite3.Connection) -> int:
             upsert_supplier_profile(
                 conn=conn,
                 supplier_name=supplier_name,
+                legal_entity_name=desired_legal,
                 base_url=desired_base,
                 url_template=desired_template,
                 notes=desired_notes,
@@ -39,6 +42,8 @@ def ensure_default_supplier_profiles(conn: sqlite3.Connection) -> int:
             created_or_updated += 1
             continue
         need_update = (
+            (existing["legal_entity_name"] or None) != desired_legal
+            or
             (existing["base_url"] or None) != desired_base
             or (existing["url_template"] or None) != desired_template
             or (existing["notes"] or None) != desired_notes
@@ -48,6 +53,7 @@ def ensure_default_supplier_profiles(conn: sqlite3.Connection) -> int:
             upsert_supplier_profile(
                 conn=conn,
                 supplier_name=supplier_name,
+                legal_entity_name=desired_legal,
                 base_url=desired_base,
                 url_template=desired_template,
                 notes=desired_notes,
@@ -81,6 +87,7 @@ def list_supplier_profiles(conn: sqlite3.Connection, only_active: bool = True) -
 def upsert_supplier_profile(
     conn: sqlite3.Connection,
     supplier_name: str,
+    legal_entity_name: str | None = None,
     base_url: str | None = None,
     url_template: str | None = None,
     notes: str | None = None,
@@ -94,7 +101,8 @@ def upsert_supplier_profile(
         conn.execute(
             """
             UPDATE supplier_profiles
-            SET base_url = ?,
+            SET legal_entity_name = ?,
+                base_url = ?,
                 url_template = ?,
                 notes = ?,
                 is_active = ?,
@@ -102,6 +110,7 @@ def upsert_supplier_profile(
             WHERE id = ?
             """,
             (
+                legal_entity_name or None,
                 base_url or None,
                 url_template or None,
                 notes or None,
@@ -116,16 +125,18 @@ def upsert_supplier_profile(
         """
         INSERT INTO supplier_profiles (
             supplier_name,
+            legal_entity_name,
             base_url,
             url_template,
             notes,
             is_active,
             created_at,
             updated_at
-        ) VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+        ) VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
         """,
         (
             str(supplier_name).strip(),
+            legal_entity_name or None,
             base_url or None,
             url_template or None,
             notes or None,

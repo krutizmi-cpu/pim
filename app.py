@@ -103,6 +103,13 @@ from services.template_matching import auto_match_template_columns, apply_saved_
 from services.template_profiles import save_template_profile, list_template_profiles, get_template_profile_columns
 from services.readiness_service import analyze_template_readiness
 from services.supplier_profiles import list_supplier_profiles, upsert_supplier_profile, ensure_default_supplier_profiles
+from services.certificate_registry import (
+    search_fsa_registry_candidates,
+    parse_fsa_document_resource,
+    save_fsa_document,
+    list_fsa_documents,
+    delete_fsa_document,
+)
 from services.ozon_api_service import is_configured, sync_category_tree, list_cached_categories, list_cached_category_pairs, get_ozon_cache_stats, get_ozon_sync_coverage, sync_missing_category_attributes, sync_category_attributes, list_cached_attributes, sync_attribute_dictionary_values, sync_all_category_dictionary_values, list_cached_attribute_values, import_cached_attributes_to_pim, import_all_cached_attributes_to_pim, suggest_mappings_for_cached_attributes, save_suggested_mappings, analyze_product_ozon_coverage, ensure_ozon_master_attributes, build_product_ozon_payload, materialize_product_ozon_attributes, preview_product_ozon_dictionary_gaps, build_product_ozon_api_attributes, build_bulk_ozon_api_payloads, build_ozon_attributes_update_request, submit_ozon_attributes_update, list_ozon_update_jobs, get_ozon_update_job, retry_ozon_update_job, list_ozon_update_job_items, save_dictionary_override, list_dictionary_overrides, delete_dictionary_override, sync_all_categories_and_attributes
 from services.ozon_category_match import bulk_assign_ozon_categories
 from services.dimension_fallback import infer_category_fields, infer_dimensions_from_catalog, infer_dimensions_from_category_defaults, is_dimension_payload_suspicious
@@ -167,6 +174,34 @@ def get_db():
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _registry_kind_label(kind: str | None) -> str:
+    value = str(kind or "").strip().lower()
+    if value == "declaration":
+        return "Декларация"
+    if value == "certificate":
+        return "Сертификат"
+    return value or "-"
+
+
+def _build_registry_product_kind(product_row) -> str:
+    candidates = [
+        str(product_row.get("subcategory") or "").strip(),
+        "",
+        str(product_row.get("base_category") or "").strip(),
+        str(product_row.get("category") or "").strip(),
+        str(product_row.get("name") or "").strip(),
+    ]
+    ozon_path = str(product_row.get("ozon_category_path") or "").strip()
+    if ozon_path:
+        parts = [p.strip() for p in ozon_path.split("/") if str(p).strip()]
+        if parts:
+            candidates[1] = parts[-1]
+    for item in candidates:
+        if item:
+            return item
+    return ""
 
 
 PARSER_SETTINGS_DEFAULTS: dict[str, object] = {
@@ -3068,6 +3103,8 @@ def show_import_tab():
         st.session_state["import_default_supplier_url_template"] = profile.get("url_template") or profile.get("base_url") or ""
         if profile.get("base_url"):
             st.caption(f"Базовый сайт поставщика: {profile.get('base_url')}")
+        if profile.get("legal_entity_name"):
+            st.caption(f"Юрлицо поставщика: {profile.get('legal_entity_name')}")
     uploaded = st.file_uploader("Excel файл", type=["xlsx", "xls"])
     s1, s2 = st.columns(2)
     with s1:
@@ -3090,16 +3127,19 @@ def show_import_tab():
         )
         st.session_state["import_default_supplier_url_template"] = default_supplier_url_template
     with st.expander("Профили поставщиков", expanded=False):
-        sp1, sp2, sp3 = st.columns([2, 2, 1])
+        editing_profile = profile_map.get(selected_profile_name or "", {})
+        sp1, sp2, sp3, sp4 = st.columns([2, 2, 2, 1])
         with sp1:
             profile_name_input = st.text_input("Имя профиля", value=default_supplier_name or "", key="supplier_profile_name_input")
         with sp2:
-            profile_base_url = st.text_input("Базовый URL", value="", key="supplier_profile_base_url")
+            profile_base_url = st.text_input("Базовый URL", value=str(editing_profile.get("base_url") or ""), key="supplier_profile_base_url")
         with sp3:
+            profile_legal_entity = st.text_input("Юрлицо поставщика", value=str(editing_profile.get("legal_entity_name") or ""), key="supplier_profile_legal_entity")
+        with sp4:
             save_profile_btn = st.button("Сохранить профиль", help="Сохранить/обновить профиль поставщика в базе")
         profile_url_template = st.text_input(
             "URL template профиля",
-            value=default_supplier_url_template or "",
+            value=str(editing_profile.get("url_template") or default_supplier_url_template or ""),
             key="supplier_profile_url_template",
         )
         if save_profile_btn and profile_name_input.strip():
@@ -3107,6 +3147,7 @@ def show_import_tab():
             profile_id = upsert_supplier_profile(
                 conn=conn,
                 supplier_name=profile_name_input.strip(),
+                legal_entity_name=profile_legal_entity.strip() or None,
                 base_url=profile_base_url.strip() or None,
                 url_template=profile_url_template.strip() or None,
                 notes="Сохранено из вкладки Импорт",
@@ -4860,6 +4901,196 @@ def show_product_tab():
         st.info(f"Парсинг поставщика запускался. Последний запуск: {parsed_at}")
     if parse_comment:
         st.caption(f"Комментарий: {parse_comment}")
+
+    registry_legal_key = f"registry_legal_entity_{int(product_id)}"
+    registry_kind_key = f"registry_product_kind_{int(product_id)}"
+    registry_tnved_key = f"registry_tnved_{int(product_id)}"
+    registry_url_key = f"registry_manual_url_{int(product_id)}"
+    registry_candidates_key = f"registry_candidates_{int(product_id)}"
+    registry_queries_key = f"registry_queries_{int(product_id)}"
+    registry_errors_key = f"registry_errors_{int(product_id)}"
+    registry_timeout_key = f"registry_timeout_{int(product_id)}"
+    registry_limit_key = f"registry_limit_{int(product_id)}"
+
+    profile_legal_entity = ""
+    if product["supplier_name"]:
+        profile_legal_entity = str(supplier_profile_map.get(str(product["supplier_name"]), {}).get("legal_entity_name") or "").strip()
+    if registry_legal_key not in st.session_state:
+        st.session_state[registry_legal_key] = profile_legal_entity
+    if registry_kind_key not in st.session_state:
+        st.session_state[registry_kind_key] = _build_registry_product_kind(dict(product))
+    if registry_tnved_key not in st.session_state:
+        st.session_state[registry_tnved_key] = str(product["tnved_code"] or "").strip()
+    if registry_url_key not in st.session_state:
+        st.session_state[registry_url_key] = ""
+    if registry_timeout_key not in st.session_state:
+        st.session_state[registry_timeout_key] = 35
+    if registry_limit_key not in st.session_state:
+        st.session_state[registry_limit_key] = 8
+
+    with st.expander("Сертификаты / декларации ФСА", expanded=False):
+        st.caption(
+            "Поиск идёт по юрлицу поставщика, виду товара и коду ТН ВЭД. "
+            "Найденный документ сохраняется к товару вместе с PDF, если файл доступен."
+        )
+        if not profile_legal_entity:
+            st.info("У профиля поставщика пока не задано юрлицо. Его можно заполнить во вкладке Импорт -> Профили поставщиков.")
+        rg1, rg2, rg3 = st.columns([2, 2, 1.2])
+        with rg1:
+            registry_legal_entity = st.text_input("Юрлицо поставщика", key=registry_legal_key)
+        with rg2:
+            registry_product_kind = st.text_input("Вид товара", key=registry_kind_key, help="Например: беговел, велосипед, велофонарь, насос.")
+        with rg3:
+            registry_tnved = st.text_input("Код ТН ВЭД", key=registry_tnved_key)
+        rg4, rg5, rg6 = st.columns([3, 1, 1])
+        with rg4:
+            registry_manual_url = st.text_input(
+                "Ручной URL документа/карточки ФСА",
+                key=registry_url_key,
+                placeholder="https://pub.fsa.gov.ru/rds/declaration/view/...",
+            )
+        with rg5:
+            registry_limit = st.number_input("Кандидатов", min_value=1, max_value=20, step=1, key=registry_limit_key)
+        with rg6:
+            registry_timeout = st.number_input("Таймаут, сек", min_value=5, max_value=90, step=1, key=registry_timeout_key)
+
+        rb1, rb2 = st.columns([1, 1])
+        with rb1:
+            if st.button("Найти в реестре ФСА", key=f"registry_search_btn_{int(product_id)}", type="primary"):
+                search_result = search_fsa_registry_candidates(
+                    legal_entity=registry_legal_entity,
+                    product_name=str(product["name"] or "").strip(),
+                    product_kind=registry_product_kind,
+                    tnved_code=registry_tnved,
+                    max_results=int(registry_limit),
+                    timeout=float(registry_timeout),
+                )
+                st.session_state[registry_candidates_key] = search_result.get("items") or []
+                st.session_state[registry_queries_key] = search_result.get("queries") or []
+                st.session_state[registry_errors_key] = search_result.get("errors") or []
+                if search_result.get("ok"):
+                    st.success(f"Найдено кандидатов: {len(search_result.get('items') or [])}")
+                else:
+                    st.warning(str(search_result.get("error") or "Кандидаты не найдены"))
+        with rb2:
+            if st.button("Разобрать ручной URL", key=f"registry_parse_manual_btn_{int(product_id)}"):
+                if not str(registry_manual_url or "").strip():
+                    st.warning("Сначала вставь URL документа или карточки ФСА.")
+                else:
+                    try:
+                        parsed_registry_doc = parse_fsa_document_resource(
+                            str(registry_manual_url).strip(),
+                            timeout=float(registry_timeout),
+                        )
+                        save_result = save_fsa_document(
+                            conn,
+                            int(product_id),
+                            parsed_registry_doc,
+                            pdf_bytes=parsed_registry_doc.get("pdf_bytes"),
+                        )
+                        st.success(
+                            f"Документ сохранён: {_registry_kind_label(parsed_registry_doc.get('kind'))}, "
+                            f"№ {parsed_registry_doc.get('doc_number') or '-'}"
+                        )
+                        if save_result.get("file_path"):
+                            st.caption(f"PDF сохранён: {save_result.get('file_path')}")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Не удалось разобрать URL ФСА: {e}")
+
+        search_errors = st.session_state.get(registry_errors_key) or []
+        search_queries = st.session_state.get(registry_queries_key) or []
+        if search_queries:
+            st.caption("Поисковые запросы: " + " | ".join([str(x) for x in search_queries if x]))
+        if search_errors:
+            for err in search_errors[:4]:
+                st.warning(str(err))
+
+        candidate_rows = st.session_state.get(registry_candidates_key) or []
+        if candidate_rows:
+            candidate_options = list(range(len(candidate_rows)))
+            selected_registry_idx = st.selectbox(
+                "Найденные кандидаты",
+                options=candidate_options,
+                index=0,
+                format_func=lambda idx: (
+                    f"{_registry_kind_label(candidate_rows[idx].get('kind'))} | "
+                    f"{candidate_rows[idx].get('title') or '-'} | "
+                    f"{candidate_rows[idx].get('link') or '-'}"
+                ),
+                key=f"registry_candidate_idx_{int(product_id)}",
+            )
+            chosen_candidate = candidate_rows[int(selected_registry_idx)]
+            st.caption(str(chosen_candidate.get("description") or ""))
+            if st.button("Разобрать и сохранить выбранный документ", key=f"registry_parse_candidate_btn_{int(product_id)}"):
+                try:
+                    parsed_registry_doc = parse_fsa_document_resource(
+                        str(chosen_candidate.get("link") or "").strip(),
+                        timeout=float(registry_timeout),
+                    )
+                    save_result = save_fsa_document(
+                        conn,
+                        int(product_id),
+                        parsed_registry_doc,
+                        pdf_bytes=parsed_registry_doc.get("pdf_bytes"),
+                    )
+                    st.success(
+                        f"Документ сохранён: {_registry_kind_label(parsed_registry_doc.get('kind'))}, "
+                        f"№ {parsed_registry_doc.get('doc_number') or '-'}"
+                    )
+                    if save_result.get("file_path"):
+                        st.caption(f"PDF сохранён: {save_result.get('file_path')}")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Не удалось разобрать выбранный документ: {e}")
+
+        registry_docs = list_fsa_documents(conn, int(product_id))
+        if registry_docs:
+            st.markdown("#### Сохранённые документы ФСА")
+            latest_doc = registry_docs[0]
+            m1, m2, m3, m4, m5 = st.columns(5)
+            m1.metric("Тип", _registry_kind_label(latest_doc.get("doc_kind")))
+            m2.metric("Номер", str(latest_doc.get("doc_number") or "-"))
+            m3.metric("Начало", str(latest_doc.get("valid_from") or "-"))
+            m4.metric("Окончание", str(latest_doc.get("valid_to") or "-"))
+            m5.metric("Файлов", str(sum(1 for row in registry_docs if row.get("local_file_path") or row.get("pdf_url"))))
+            for doc in registry_docs:
+                with st.container(border=True):
+                    d1, d2, d3 = st.columns([3, 2, 1])
+                    with d1:
+                        st.markdown(
+                            f"**{_registry_kind_label(doc.get('doc_kind'))}**  \n"
+                            f"Номер: `{doc.get('doc_number') or '-'}`  \n"
+                            f"Срок: {doc.get('valid_from') or '-'} -> {doc.get('valid_to') or '-'}  \n"
+                            f"Орган: {doc.get('authority_name') or '-'}  \n"
+                            f"Заявитель: {doc.get('applicant_name') or '-'}"
+                        )
+                        if doc.get("source_url"):
+                            st.caption(f"Источник: {doc.get('source_url')}")
+                    with d2:
+                        st.caption(f"ТН ВЭД: {doc.get('tnved_code') or '-'}")
+                        if doc.get("pdf_url"):
+                            st.caption(f"PDF URL: {doc.get('pdf_url')}")
+                    with d3:
+                        local_file = str(doc.get("local_file_path") or "").strip()
+                        if local_file and Path(local_file).exists():
+                            try:
+                                pdf_bytes = Path(local_file).read_bytes()
+                                st.download_button(
+                                    "Скачать PDF",
+                                    data=pdf_bytes,
+                                    file_name=Path(local_file).name,
+                                    mime="application/pdf",
+                                    key=f"registry_pdf_download_{int(doc['id'])}",
+                                )
+                            except Exception as e:
+                                st.caption(f"PDF недоступен: {e}")
+                        if st.button("Удалить", key=f"registry_delete_{int(doc['id'])}"):
+                            delete_fsa_document(conn, int(doc["id"]))
+                            st.success("Документ удалён")
+                            st.rerun()
+        else:
+            st.info("По этому товару ещё нет сохранённых сертификатов или деклараций ФСА.")
 
     with st.expander("AI-контент: описание, атрибуты, фото", expanded=False):
         ai_ok, ai_msg = ai_is_configured(ai_settings)

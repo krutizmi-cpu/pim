@@ -487,6 +487,7 @@ def _ensure_supplier_profiles_table(conn: sqlite3.Connection) -> None:
         CREATE TABLE IF NOT EXISTS supplier_profiles (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             supplier_name TEXT NOT NULL,
+            legal_entity_name TEXT,
             base_url TEXT,
             url_template TEXT,
             is_active INTEGER DEFAULT 1,
@@ -496,8 +497,41 @@ def _ensure_supplier_profiles_table(conn: sqlite3.Connection) -> None:
         )
         """
     )
+    existing_cols = _table_columns(conn, "supplier_profiles")
+    if "legal_entity_name" not in existing_cols:
+        try:
+            conn.execute("ALTER TABLE supplier_profiles ADD COLUMN legal_entity_name TEXT")
+        except Exception:
+            pass
     conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_supplier_profiles_name ON supplier_profiles(supplier_name)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_supplier_profiles_active ON supplier_profiles(is_active)")
+
+
+def _ensure_product_registry_documents_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS product_registry_documents (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            product_id INTEGER NOT NULL,
+            doc_kind TEXT,
+            doc_number TEXT,
+            valid_from TEXT,
+            valid_to TEXT,
+            authority_name TEXT,
+            applicant_name TEXT,
+            tnved_code TEXT,
+            source_url TEXT,
+            pdf_url TEXT,
+            local_file_path TEXT,
+            raw_payload TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_prd_product_id ON product_registry_documents(product_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_prd_doc_number ON product_registry_documents(doc_number)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_prd_kind ON product_registry_documents(doc_kind)")
 
 
 def _ensure_ozon_tables(conn: sqlite3.Connection) -> None:
@@ -853,35 +887,38 @@ def _seed_supplier_profiles(conn: sqlite3.Connection) -> None:
     defaults = [
         (
             "Веломай",
+            None,
             "https://technosite.ru/",
             "https://technosite.ru/search/?q={article_q}",
             "Базовый профиль поставщика для ассортимента велосипедов под Детский Мир.",
         ),
         (
             "Рокви",
+            None,
             "https://velocitygroup.ru/?category=velo",
             "https://velocitygroup.ru/?category=velo&search={article_q}",
             "Профиль поставщика для ассортимента Rockbros / Moon / SKS.",
         ),
     ]
-    for supplier_name, base_url, url_template, notes in defaults:
+    for supplier_name, legal_entity_name, base_url, url_template, notes in defaults:
         conn.execute(
             """
-            INSERT OR IGNORE INTO supplier_profiles (supplier_name, base_url, url_template, is_active, notes, created_at, updated_at)
-            VALUES (?, ?, ?, 1, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            INSERT OR IGNORE INTO supplier_profiles (supplier_name, legal_entity_name, base_url, url_template, is_active, notes, created_at, updated_at)
+            VALUES (?, ?, ?, ?, 1, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
             """,
-            (supplier_name, base_url, url_template, notes),
+            (supplier_name, legal_entity_name, base_url, url_template, notes),
         )
         conn.execute(
             """
             UPDATE supplier_profiles
-            SET base_url = COALESCE(NULLIF(base_url, ''), ?),
+            SET legal_entity_name = COALESCE(NULLIF(legal_entity_name, ''), ?),
+                base_url = COALESCE(NULLIF(base_url, ''), ?),
                 url_template = COALESCE(NULLIF(url_template, ''), ?),
                 notes = COALESCE(NULLIF(notes, ''), ?),
                 updated_at = CURRENT_TIMESTAMP
             WHERE supplier_name = ?
             """,
-            (base_url, url_template, notes, supplier_name),
+            (legal_entity_name, base_url, url_template, notes, supplier_name),
         )
 
 
@@ -895,6 +932,7 @@ def init_db(conn: sqlite3.Connection) -> None:
     _ensure_system_settings_table(conn)
     _ensure_template_profile_tables(conn)
     _ensure_supplier_profiles_table(conn)
+    _ensure_product_registry_documents_table(conn)
     _ensure_ozon_tables(conn)
     _ensure_ozon_catalog_mapping_memory_table(conn)
     _ensure_channel_tables(conn)
