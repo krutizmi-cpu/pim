@@ -858,6 +858,78 @@ def _build_parsed_candidates(parsed: dict, product_row: dict) -> tuple[list[dict
     return candidates, scalar_map
 
 
+def _build_product_state_candidates(conn, product_row: dict) -> tuple[list[dict], dict[str, object]]:
+    product_id = int(product_row.get("id") or 0)
+    candidates: list[dict] = []
+    scalar_map: dict[str, object] = {
+        "name": product_row.get("name"),
+        "brand": product_row.get("brand"),
+        "description": product_row.get("description"),
+        "image_url": product_row.get("image_url"),
+        "weight": product_row.get("weight"),
+        "gross_weight": product_row.get("gross_weight"),
+        "length": product_row.get("length"),
+        "width": product_row.get("width"),
+        "height": product_row.get("height"),
+        "package_length": product_row.get("package_length"),
+        "package_width": product_row.get("package_width"),
+        "package_height": product_row.get("package_height"),
+        "article": product_row.get("supplier_article") or product_row.get("article") or product_row.get("internal_article"),
+        "barcode": product_row.get("barcode"),
+        "category": product_row.get("category"),
+        "color": None,
+        "material": None,
+    }
+    if product_id > 0:
+        defs = list_attribute_definitions(conn)
+        defs_map = {str(d.get("code") or ""): d for d in defs}
+        for row in get_product_attribute_values(conn, product_id):
+            code = str(row.get("attribute_code") or "").strip()
+            if not code:
+                continue
+            value = row.get("value")
+            if _is_empty_like(value):
+                continue
+            attr_def = defs_map.get(code, {})
+            attr_name = str(attr_def.get("name") or humanize_attribute_code(code))
+            key_norm = _normalize_attr_text(attr_name)
+            key_tokens = _tokenize_attr_text(key_norm)
+            candidates.append(
+                {
+                    "key": attr_name,
+                    "key_norm": key_norm,
+                    "key_tokens": key_tokens,
+                    "value": value,
+                }
+            )
+            code_norm = _normalize_attr_text(code)
+            code_tokens = _tokenize_attr_text(code_norm)
+            candidates.append(
+                {
+                    "key": code,
+                    "key_norm": code_norm,
+                    "key_tokens": code_tokens,
+                    "value": value,
+                }
+            )
+            semantic_key = _infer_attr_semantic_key(attr_name) or _infer_attr_semantic_key(code)
+            if semantic_key and _is_empty_like(scalar_map.get(semantic_key)):
+                scalar_map[semantic_key] = value
+
+    for semantic_key, semantic_value in scalar_map.items():
+        if _is_empty_like(semantic_value):
+            continue
+        candidates.append(
+            {
+                "key": f"scalar:{semantic_key}",
+                "key_norm": _normalize_attr_text(str(semantic_key)),
+                "key_tokens": _tokenize_attr_text(str(semantic_key)),
+                "value": semantic_value,
+            }
+        )
+    return candidates, scalar_map
+
+
 def _resolve_best_value_for_attr(attr_name: str, candidates: list[dict], scalar_map: dict[str, object]) -> tuple[object, str, float] | None:
     attr_norm = _normalize_attr_text(attr_name)
     attr_tokens = _tokenize_attr_text(attr_norm)
@@ -888,6 +960,98 @@ def _resolve_best_value_for_attr(attr_name: str, candidates: list[dict], scalar_
     if best and float(best[2]) >= 2.5:
         return best
     return None
+
+
+def _load_target_attribute_rows(
+    conn,
+    channel_code: str,
+    category_code: str | None = None,
+) -> list[dict]:
+    req_rows = list_channel_requirements(conn, channel_code=channel_code, category_code=category_code or None)
+    rule_rows = list_channel_mapping_rules(conn, channel_code=channel_code, category_code=category_code or None)
+    defs = list_attribute_definitions(conn)
+    defs_map = {str(d.get("code") or ""): d for d in defs}
+    target_codes: set[str] = set()
+    for row in req_rows:
+        code = str(row.get("attribute_code") or "").strip()
+        if code:
+            target_codes.add(code)
+    for row in rule_rows:
+        if str(row.get("source_type") or "") == "attribute":
+            code = str(row.get("source_name") or "").strip()
+            if code:
+                target_codes.add(code)
+    rows: list[dict] = []
+    for code in sorted(target_codes):
+        attr_def = defs_map.get(code, {})
+        rows.append(
+            {
+                "attribute_code": code,
+                "attribute_name": str(attr_def.get("name") or humanize_attribute_code(code)),
+                "data_type": str(attr_def.get("data_type") or "text"),
+                "is_required": int(next((int(r.get("is_required") or 0) for r in req_rows if str(r.get("attribute_code") or "") == code), 0)),
+            }
+        )
+    return rows
+
+
+def _fill_channel_attrs_from_product_state(
+    conn,
+    product_row: dict,
+    channel_code: str,
+    category_code: str | None = None,
+    source_type: str = "derived_from_master",
+    source_url: str = "product_state",
+    force: bool = False,
+    target_channel_code: str | None = None,
+) -> dict[str, int]:
+    product_id = int(product_row.get("id") or 0)
+    if product_id <= 0 or not str(channel_code or "").strip():
+        return {"saved": 0, "skipped": 0, "targets": 0}
+    target_rows = _load_target_attribute_rows(conn, str(channel_code), category_code=category_code)
+    if not target_rows:
+        return {"saved": 0, "skipped": 0, "targets": 0}
+    candidates, scalar_map = _build_product_state_candidates(conn, product_row)
+    saved = 0
+    skipped = 0
+    for row in target_rows:
+        code = str(row.get("attribute_code") or "").strip()
+        attr_name = str(row.get("attribute_name") or code)
+        if not code:
+            continue
+        resolved = _resolve_best_value_for_attr(attr_name, candidates, scalar_map)
+        if not resolved:
+            continue
+        value, matched_by, score = resolved
+        if _is_empty_like(value):
+            continue
+        field_name = f"attr:{code}"
+        effective_field_source = str(source_type or "derived_from_master")
+        if not can_overwrite_field(conn, product_id, field_name, effective_field_source, force=force):
+            skipped += 1
+            continue
+        coerced = _coerce_value_for_attr_type(value, str(row.get("data_type") or "text"))
+        try:
+            set_product_attribute_value(
+                conn,
+                product_id,
+                code,
+                coerced,
+                channel_code=target_channel_code,
+            )
+            save_field_source(
+                conn=conn,
+                product_id=product_id,
+                field_name=field_name,
+                source_type=effective_field_source,
+                source_value_raw=coerced,
+                source_url=f"{source_url} | match={matched_by}",
+                confidence=min(0.95, max(0.45, float(score) / 10.0)),
+            )
+            saved += 1
+        except Exception:
+            skipped += 1
+    return {"saved": int(saved), "skipped": int(skipped), "targets": int(len(target_rows))}
 
 
 def _fill_ozon_attrs_from_parsed(
@@ -4197,6 +4361,7 @@ def enrich_product_from_supplier(
             source_url=source_url,
             force=force,
         )
+        post_state_backfill = {"saved": 0, "skipped": 0, "targets": 0}
 
         image_urls = _normalize_media_urls([str(x).strip() for x in (parsed.get("image_urls") or []) if str(x).strip()])
         if not image_urls and str(parsed.get("image_url") or "").strip():
@@ -4293,12 +4458,32 @@ def enrich_product_from_supplier(
             )
 
         conn.commit()
+        refreshed_row = get_product(conn, int(product_id))
+        if refreshed_row:
+            product_row = dict(refreshed_row)
+        if int(product_row.get("ozon_description_category_id") or 0) > 0 and int(product_row.get("ozon_type_id") or 0) > 0:
+            post_state_backfill = _fill_channel_attrs_from_product_state(
+                conn=conn,
+                product_row=product_row,
+                channel_code="ozon",
+                category_code=f"ozon:{int(product_row.get('ozon_description_category_id') or 0)}:{int(product_row.get('ozon_type_id') or 0)}",
+                source_type=source_type,
+                source_url=f"{source_url} | product_state",
+                force=force,
+                target_channel_code=None,
+            )
+            conn.commit()
         ozon_match = bulk_assign_ozon_categories(conn, [int(product_id)], min_score=OZON_CATEGORY_MIN_SCORE, force=False)
         skipped_msg = f", пропущено ручных полей: {len(skipped_manual_fields)}" if skipped_manual_fields else ""
         skipped_attr_msg = f", пропущено атрибутов по приоритету: {len(skipped_attribute_fields)}" if skipped_attribute_fields else ""
         ozon_attr_msg = (
             f", Ozon-атрибутов заполнено: {int(ozon_attr_fill.get('saved') or 0)}"
             if int(ozon_attr_fill.get("saved") or 0) > 0
+            else ""
+        )
+        post_state_msg = (
+            f", из карточки/мастера дозаполнено: {int(post_state_backfill.get('saved') or 0)}"
+            if int(post_state_backfill.get("saved") or 0) > 0
             else ""
         )
         ozon_msg = f", Ozon category match: {ozon_match.get('assigned', 0)}" if ozon_match.get("processed") else ""
@@ -4308,13 +4493,14 @@ def enrich_product_from_supplier(
         photo_msg = f", фото найдено: {len(image_urls)}" if image_urls else ""
         return {
             "ok": True,
-            "message": f"Обогащение завершено, обновлено полей: {len(updates)}, атрибутов сохранено: {attributes_saved}{photo_msg}{ozon_attr_msg}{fallback_msg}{stats_msg}{defaults_msg}{skipped_msg}{skipped_attr_msg}{ozon_msg}",
+            "message": f"Обогащение завершено, обновлено полей: {len(updates)}, атрибутов сохранено: {attributes_saved}{photo_msg}{ozon_attr_msg}{post_state_msg}{fallback_msg}{stats_msg}{defaults_msg}{skipped_msg}{skipped_attr_msg}{ozon_msg}",
             "updates": updates,
             "attributes": parsed.get("attributes", {}),
             "image_urls": parsed.get("image_urls", []),
             "skipped_manual_fields": skipped_manual_fields,
             "skipped_attribute_fields": skipped_attribute_fields,
             "ozon_attrs_filled": int(ozon_attr_fill.get("saved") or 0),
+            "state_attr_backfill": int(post_state_backfill.get("saved") or 0),
             "source_url": source_url,
             "source_type": source_type,
         }
@@ -4849,6 +5035,16 @@ def show_product_tab():
     if ozon_desc_id > 0 and ozon_type_id > 0:
         auto_req = ensure_ozon_requirements_for_product_category(conn, ozon_desc_id, ozon_type_id)
         auto_slots = materialize_ozon_attribute_slots_for_product(conn, int(product_id), ozon_desc_id, ozon_type_id)
+        auto_backfill = _fill_channel_attrs_from_product_state(
+            conn=conn,
+            product_row=dict(product),
+            channel_code="ozon",
+            category_code=f"ozon:{ozon_desc_id}:{ozon_type_id}",
+            source_type="derived_from_master",
+            source_url="product_state",
+            force=False,
+            target_channel_code=None,
+        )
         if int(auto_req.get("imported") or 0) > 0:
             st.success(
                 "Ozon-атрибуты этой категории автоматически добавлены в карточку: "
@@ -4858,6 +5054,11 @@ def show_product_tab():
             st.info(
                 "Для товара автоматически созданы пустые Ozon-атрибуты для заполнения: "
                 f"{int(auto_slots.get('created') or 0)} из {int(auto_slots.get('requirements') or 0)}."
+            )
+        if int(auto_backfill.get("saved") or 0) > 0:
+            st.info(
+                "Для товара автоматически дозаполнены Ozon-атрибуты из уже накопленных полей карточки: "
+                f"{int(auto_backfill.get('saved') or 0)}."
             )
         st.markdown("### Ozon-атрибуты выбранной категории")
         oz1, oz2 = st.columns([1, 1])
@@ -5071,6 +5272,27 @@ def show_product_tab():
         if editor_rows:
             ed_df = pd.DataFrame(editor_rows)
             st.caption("Здесь собраны атрибуты категории канала и атрибуты из mapping rules (source_type=attribute). Для карточки с Ozon-категорией по умолчанию открыт Ozon scope.")
+            if st.button(
+                "Автозаполнить этот блок из уже найденных данных товара",
+                key=f"card_attr_autofill_btn_{int(product_id)}_{selected_channel}_{selected_scope or 'all'}",
+                help="Берёт уже заполненные поля карточки и мастер-атрибуты и пытается перенести их в атрибуты текущего канала/категории.",
+            ):
+                autofill_res = _fill_channel_attrs_from_product_state(
+                    conn=conn,
+                    product_row=dict(product),
+                    channel_code=str(selected_channel),
+                    category_code=(selected_scope or None),
+                    source_type="derived_from_master",
+                    source_url="product_state",
+                    force=False,
+                    target_channel_code=(selected_channel if save_as_channel else None),
+                )
+                st.success(
+                    f"Автозаполнение завершено: заполнено {int(autofill_res.get('saved') or 0)}, "
+                    f"пропущено {int(autofill_res.get('skipped') or 0)}, "
+                    f"всего атрибутов в блоке {int(autofill_res.get('targets') or 0)}."
+                )
+                st.rerun()
             edited_df = st.data_editor(
                 ed_df,
                 use_container_width=True,
