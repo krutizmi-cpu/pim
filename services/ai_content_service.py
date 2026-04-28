@@ -409,24 +409,28 @@ def generate_seo_description_for_product(
     attrs_block = _attributes_for_prompt(attr_rows)
     product_name = _clean_text(product.get("name"))
     article = _clean_text(product.get("article") or product.get("supplier_article"))
+    category_path = _clean_text(product.get("ozon_category_path") or product.get("category"))
+    brand = _clean_text(product.get("brand"))
 
     system_prompt = (
-        "Ты — опытный e-commerce копирайтер и SEO-специалист. "
-        "Пиши только готовый текст на русском в Markdown. Ничего не выдумывай сверх входных данных."
+        "Ты — сильный e-commerce копирайтер и редактор карточек товара для маркетплейсов и интернет-магазинов. "
+        "Пиши только готовый текст на русском в Markdown. Не выдумывай характеристики и не добавляй факты, которых нет во входных данных."
     )
     user_prompt = f"""
 Напиши описание товара для карточки интернет-магазина, используя входные данные:
 - Название: {product_name or "-"}
 - Артикул: {article or "-"}
+- Бренд: {brand or "-"}
+- Категория: {category_path or "-"}
 - Атрибуты/характеристики:
 {attrs_block}
 
 Требования:
 1) Структура:
-- Вводный абзац (1-3 предложения): что это и какую задачу закрывает.
+- Вводный абзац (1-3 предложения): что это за товар, для кого он подходит и какую задачу закрывает.
 - Ключевые выгоды: 3-5 пунктов в формате «Характеристика -> Польза».
 - Технические параметры: маркированный список; артикул укажи один раз в этом блоке.
-- Сценарии использования / для кого подходит: 1-2 предложения.
+- Сценарии использования / для кого подходит: 2-4 предложения, с ориентацией на целевую аудиторию.
 - Финал: спокойный CTA без давления.
 2) SEO:
 - Выбери 1 основное ключевое слово и 2-3 смежных.
@@ -458,6 +462,88 @@ def generate_seo_description_for_product(
         "model": result.get("model"),
         "usage": result.get("usage"),
         "attr_count": len(attr_rows),
+    }
+
+
+def generate_selling_title_for_product(
+    conn: sqlite3.Connection,
+    product_id: int,
+    settings: dict[str, Any],
+) -> dict[str, Any]:
+    product = _product_row(conn, int(product_id))
+    if not product:
+        return {"ok": False, "error": "Товар не найден."}
+    attr_rows = _collect_product_attributes(conn, int(product_id), limit=60)
+    attrs_block = _attributes_for_prompt(attr_rows[:14])
+    current_name = _clean_text(product.get("name"))
+    article = _clean_text(product.get("article") or product.get("supplier_article"))
+    brand = _clean_text(product.get("brand"))
+    category_path = _clean_text(product.get("ozon_category_path") or product.get("category"))
+
+    system_prompt = (
+        "Ты редактор товарных названий для маркетплейсов. "
+        "Твоя задача — собирать короткое, продающее и честное название товара по входным данным. "
+        "Не выдумывай характеристики. Отвечай только JSON."
+    )
+    user_prompt = f"""
+Собери 1 итоговое название товара для карточки.
+
+Входные данные:
+- Текущее название: {current_name or "-"}
+- Артикул: {article or "-"}
+- Бренд: {brand or "-"}
+- Категория: {category_path or "-"}
+- Атрибуты:
+{attrs_block}
+
+Требования к названию:
+- Русский язык.
+- 70-140 символов.
+- Формат: тип товара + бренд/модель + ключевые характеристики + целевая аудитория/применение, если это реально следует из данных.
+- Не дублируй артикул больше одного раза.
+- Не пиши пустой маркетинг вроде «лучший», «супер», «топ».
+- Не вставляй характеристики, которых нет во входных данных.
+- Не делай название слишком техническим или слишком коротким.
+
+Верни JSON:
+{{
+  "title": "готовое название",
+  "reason": "кратко, какие данные использованы"
+}}
+"""
+    result = _chat_completion(
+        settings=settings,
+        system_prompt=system_prompt,
+        user_prompt=user_prompt,
+        temperature=min(0.45, float(settings.get("temperature", 0.3))),
+        max_tokens=min(1200, int(settings.get("max_tokens", 1800))),
+        force_json=True,
+    )
+    if not result.get("ok"):
+        return result
+
+    text = str(result.get("text") or "").strip()
+    try:
+        parsed = json.loads(text)
+    except Exception:
+        match = re.search(r"\{.*\}", text, flags=re.DOTALL)
+        if not match:
+            return {"ok": False, "error": "AI вернул невалидный JSON для названия."}
+        try:
+            parsed = json.loads(match.group(0))
+        except Exception:
+            return {"ok": False, "error": "AI вернул невалидный JSON для названия."}
+    title = _clean_text(parsed.get("title")) if isinstance(parsed, dict) else ""
+    if not title:
+        return {"ok": False, "error": "AI не вернул итоговое название."}
+    reason = _clean_text(parsed.get("reason")) if isinstance(parsed, dict) else ""
+    return {
+        "ok": True,
+        "title": title,
+        "reason": reason,
+        "provider": result.get("provider"),
+        "model": result.get("model"),
+        "usage": result.get("usage"),
     }
 
 
@@ -599,7 +685,8 @@ def apply_ai_attribute_suggestions(
         value = _clean_text(item.get("value"))
         if not code or not value:
             continue
-        if not can_overwrite_field(conn, int(product_id), code, "ai", force=False):
+        field_name = f"attr:{code}"
+        if not can_overwrite_field(conn, int(product_id), field_name, "ai", force=False):
             skipped += 1
             continue
         try:
@@ -613,7 +700,7 @@ def apply_ai_attribute_suggestions(
             save_field_source(
                 conn=conn,
                 product_id=int(product_id),
-                field_name=code,
+                field_name=field_name,
                 source_type="ai",
                 source_value_raw=value,
                 source_url=source_url,
@@ -625,6 +712,109 @@ def apply_ai_attribute_suggestions(
             errors += 1
     conn.commit()
     return {"saved": saved, "skipped": skipped, "errors": errors}
+
+
+def run_ai_enrichment_for_product(
+    conn: sqlite3.Connection,
+    product_id: int,
+    settings: dict[str, Any],
+    *,
+    include_title: bool = True,
+    include_description: bool = True,
+    include_attributes: bool = True,
+    force: bool = False,
+) -> dict[str, Any]:
+    product = _product_row(conn, int(product_id))
+    if not product:
+        return {"ok": False, "error": "Товар не найден."}
+
+    result: dict[str, Any] = {
+        "ok": True,
+        "title_applied": False,
+        "description_applied": False,
+        "attributes_saved": 0,
+        "attributes_skipped": 0,
+        "title_candidate": "",
+        "description_candidate": "",
+        "errors": [],
+    }
+
+    ai_source_label = f"{str(settings.get('provider') or '-')}/{str(settings.get('chat_model') or '-')}"
+
+    if include_title:
+        title_res = generate_selling_title_for_product(conn, int(product_id), settings)
+        if title_res.get("ok"):
+            title_candidate = _clean_text(title_res.get("title"))
+            result["title_candidate"] = title_candidate
+            if title_candidate and can_overwrite_field(conn, int(product_id), "name", "ai", force=bool(force)):
+                conn.execute(
+                    """
+                    UPDATE products
+                    SET name = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    """,
+                    (title_candidate, int(product_id)),
+                )
+                save_field_source(
+                    conn=conn,
+                    product_id=int(product_id),
+                    field_name="name",
+                    source_type="ai",
+                    source_value_raw=title_candidate,
+                    source_url=ai_source_label,
+                    confidence=0.72,
+                    is_manual=False,
+                )
+                conn.commit()
+                result["title_applied"] = True
+        else:
+            result["errors"].append(f"title: {title_res.get('error')}")
+
+    if include_description:
+        desc_res = generate_seo_description_for_product(conn, int(product_id), settings)
+        if desc_res.get("ok"):
+            description_candidate = str(desc_res.get("text") or "").strip()
+            result["description_candidate"] = description_candidate
+            if description_candidate and can_overwrite_field(conn, int(product_id), "description", "ai", force=bool(force)):
+                conn.execute(
+                    """
+                    UPDATE products
+                    SET description = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    """,
+                    (description_candidate, int(product_id)),
+                )
+                save_field_source(
+                    conn=conn,
+                    product_id=int(product_id),
+                    field_name="description",
+                    source_type="ai",
+                    source_value_raw=description_candidate,
+                    source_url=ai_source_label,
+                    confidence=0.7,
+                    is_manual=False,
+                )
+                conn.commit()
+                result["description_applied"] = True
+        else:
+            result["errors"].append(f"description: {desc_res.get('error')}")
+
+    if include_attributes:
+        attr_res = generate_ai_attribute_suggestions_for_product(conn, int(product_id), settings, limit=20)
+        if attr_res.get("ok"):
+            apply_res = apply_ai_attribute_suggestions(
+                conn=conn,
+                product_id=int(product_id),
+                suggestions=attr_res.get("suggestions") or [],
+                channel_code=None,
+                source_url=ai_source_label,
+            )
+            result["attributes_saved"] = int(apply_res.get("saved") or 0)
+            result["attributes_skipped"] = int(apply_res.get("skipped") or 0)
+        else:
+            result["errors"].append(f"attributes: {attr_res.get('error')}")
+
+    return result
 
 
 def build_marketing_image_prompts_for_product(conn: sqlite3.Connection, product_id: int) -> dict[str, str]:
@@ -646,13 +836,18 @@ def build_marketing_image_prompts_for_product(conn: sqlite3.Connection, product_
         f"Референс фото: {main_image or '-'}."
     )
     context_prompt = (
-        "Ты AI-дизайнер e-commerce. Сгенерируй квадратное коммерческое фото 1:1 с реалистичным контекстным фоном, "
-        "товар в фокусе, мягкий свет, корректные тени, без людей. Добавь 3-5 инфографических выносок (коротко, до 5 слов). "
+        "Ты AI-дизайнер e-commerce и маркетплейс-инфографики. "
+        "Сгенерируй квадратное коммерческое фото 1:1 с реалистичным контекстным фоном. "
+        "Товар должен быть главным объектом, без людей, без лишнего шума, без искажения формы товара. "
+        "Добавь 3-5 инфографических выносок с опорой только на реальные свойства товара: короткие фразы до 5 слов, читабельные, без фейковых обещаний. "
+        "Сделай результат пригодным для карточки маркетплейса."
         + common
     )
     color_prompt = (
-        "Ты AI-дизайнер e-commerce. Сгенерируй квадратное коммерческое фото 1:1 на однотонном или мягком градиентном фоне, "
-        "цвет фона под категорию товара, товар в фокусе, аккуратные выноски инфографики (3-5 пунктов). "
+        "Ты AI-дизайнер e-commerce и маркетплейс-инфографики. "
+        "Сгенерируй квадратное коммерческое фото 1:1 на чистом однотонном или мягком градиентном фоне под категорию товара. "
+        "Товар в фокусе, аккуратный свет, без людей, без лишних декоративных объектов. "
+        "Добавь 3-5 инфографических выносок только по реальным свойствам товара, в стиле карточки маркетплейса."
         + common
     )
     return {"context_prompt": context_prompt, "color_prompt": color_prompt}
