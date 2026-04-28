@@ -2234,7 +2234,7 @@ def find_products_for_card(
         SELECT
             id, article, internal_article, supplier_article, name,
             category, base_category, subcategory, supplier_name, ozon_category_path,
-            ozon_description_category_id, ozon_type_id
+            ozon_description_category_id, ozon_type_id, supplier_parse_status, updated_at
         FROM products
     """
     if where:
@@ -2260,6 +2260,28 @@ def find_products_for_card(
         if len(out) >= int(limit):
             break
     return out
+
+
+def _card_product_sort_key(item: dict, search: str = "") -> tuple:
+    query = str(search or "").strip().lower()
+    article = str(item.get("article") or "").strip().lower()
+    internal_article = str(item.get("internal_article") or "").strip().lower()
+    supplier_article = str(item.get("supplier_article") or "").strip().lower()
+    name = str(item.get("name") or "").strip().lower()
+    exact = 0 if query and query in {article, internal_article, supplier_article} else 1
+    starts = 0 if query and (
+        article.startswith(query) or internal_article.startswith(query) or supplier_article.startswith(query)
+    ) else 1
+    contains = 0 if query and query and (
+        query in article or query in internal_article or query in supplier_article or query in name
+    ) else 1
+    return (
+        exact,
+        starts,
+        contains,
+        article or supplier_article or internal_article or name,
+        -int(item.get("id") or 0),
+    )
 
 
 def list_channel_codes(conn) -> list[str]:
@@ -3382,20 +3404,16 @@ def show_catalog_tab():
     parser_settings = load_parser_settings(conn)
     ai_settings = load_ai_settings(conn)
     st.subheader("Каталог")
-    st.caption("Рекомендуемый поток: 1) Ozon автопривязка категорий (эталон) -> 2) supplier enrichment -> 3) ручная доводка в Карточке.")
+    st.caption("Рекомендуемый поток: 1) загрузили каталог 2) нажали `Заполнить...` 3) точечно довели сложные товары в `Карточка`.")
     st.info("Фильтр `Категория` учитывает Ozon-эталон в приоритете (ozon_category_path), затем категории из каталога.")
     with st.expander("Инструкция по кнопкам раздела Каталог", expanded=False):
         st.markdown(
             """
 - `◀ Назад` / `Вперед ▶`: постраничный переход по каталогу.
 - `Скачать текущую страницу Excel`: выгружает только отображаемую страницу.
-- `Автопривязать Ozon категории (текущая страница)`: сначала назначает эталонные Ozon категории/подкатегории.
-- `Перепривязать Ozon категории (force)`: автоподбор с перезаписью.
-- `Подтянуть Ozon-атрибуты (текущая страница)`: массово подготовить Ozon-атрибуты категорий для карточек товаров страницы.
-- `Подтянуть Ozon-атрибуты (вся выборка фильтра)`: то же действие для всей выборки по фильтрам.
-- `Обогатить поставщика по текущей странице`: после Ozon-привязки тянет данные с supplier_url и fallback-источников.
-- `Обогатить поставщика по всей выборке фильтра`: тот же этап, но на всей фильтрации.
-- `AI-дозаполнение ...`: массово прогоняет товары через связку Ozon-категория -> supplier/web -> AI название/описание/атрибуты.
+- `Заполнить текущую страницу` / `Заполнить всю выборку фильтра`: основной рабочий путь. Система сама проходит этапы Ozon -> supplier/web -> AI.
+- `Быстрый список товаров`: компактный список по артикулу для перехода к карточке.
+- `Дополнительные и технические операции`: ручные Ozon/supplier действия, если нужен точечный контроль.
 - `Рассчитать габариты/вес (текущая страница)`: заполнить пустые логистические поля статистикой по похожим товарам.
 - `Рассчитать габариты/вес (вся выборка фильтра)`: тот же расчёт массово по всей выборке.
 - `Обновить дубли по текущей выборке`: пересчет дублей по текущей странице.
@@ -3456,9 +3474,7 @@ def show_catalog_tab():
             strategy_options = [
                 ("auto_full", "Авто: поставщик -> web-поиск -> AI"),
                 ("supplier_only", "Только сайт поставщика"),
-                ("supplier_plus_ozon", "Поставщик + web-поиск с упором на Ozon"),
-                ("supplier_plus_yandex", "Поставщик + web-поиск с упором на Яндекс Маркет"),
-                ("web_only", "Только интернет-поиск (без Ozon/Яндекс)"),
+                ("web_only", "Только интернет-поиск + AI"),
                 ("custom_domains", "Только выбранные домены"),
             ]
             strategy_values = [x[0] for x in strategy_options]
@@ -3471,21 +3487,6 @@ def show_catalog_tab():
                 index=strategy_values.index(current_strategy),
                 format_func=lambda x: next((label for key, label in strategy_options if key == x), x),
                 key="parser_cfg_source_strategy",
-            )
-            ps_web = st.checkbox(
-                "Включить web fallback",
-                value=bool(parser_settings.get("enable_web_fallback", True)),
-                key="parser_cfg_enable_web_fallback",
-            )
-            ps_ozon = st.checkbox(
-                "Пробовать Ozon (ozon.ru)",
-                value=bool(parser_settings.get("enable_ozon_fallback", True)),
-                key="parser_cfg_enable_ozon_fallback",
-            )
-            ps_yandex = st.checkbox(
-                "Пробовать Яндекс Маркет",
-                value=bool(parser_settings.get("enable_yandex_fallback", True)),
-                key="parser_cfg_enable_yandex_fallback",
             )
             ps_require_article_match = st.checkbox(
                 "Требовать совпадение артикула/кода",
@@ -3532,18 +3533,22 @@ def show_catalog_tab():
                 help="Минимум общих токенов в названии товара и найденной страницы.",
             )
         if st.button("Сохранить настройки парсинга", key="parser_cfg_save_button", type="primary"):
+            strategy = str(ps_source_strategy or "auto_full")
+            enable_web = strategy in {"auto_full", "web_only", "custom_domains"}
+            enable_ozon = strategy == "auto_full"
+            enable_yandex = strategy == "auto_full"
             new_settings = {
                 "timeout_seconds": float(ps_timeout),
                 "max_hops": int(ps_max_hops),
                 "fallback_max_results": int(ps_max_results),
-                "source_strategy": str(ps_source_strategy),
+                "source_strategy": strategy,
                 "extra_fallback_domains": str(ps_extra_domains or "").strip(),
                 "require_article_match": bool(ps_require_article_match),
                 "min_name_overlap": int(ps_min_overlap),
                 "min_fallback_score": float(ps_min_score),
-                "enable_web_fallback": bool(ps_web),
-                "enable_ozon_fallback": bool(ps_ozon),
-                "enable_yandex_fallback": bool(ps_yandex),
+                "enable_web_fallback": bool(enable_web),
+                "enable_ozon_fallback": bool(enable_ozon),
+                "enable_yandex_fallback": bool(enable_yandex),
                 "enable_stats_fallback": bool(ps_stats),
                 "enable_defaults_fallback": bool(ps_defaults),
             }
@@ -3631,7 +3636,21 @@ def show_catalog_tab():
     media_public_base_url = str(media_settings.get("public_base_url") or "").strip()
 
     ids = df["id"].tolist()
-    selected_id = st.selectbox("Открыть карточку товара", ids, format_func=lambda x: f"ID {x}")
+    selected_id = st.selectbox(
+        "Открыть карточку товара",
+        ids,
+        format_func=lambda x: next(
+            (
+                f"{str(row.get('article') or row.get('supplier_article') or row.get('internal_article') or '-')} | "
+                f"{str(row.get('name') or '-')} | "
+                f"{str(row.get('supplier_name') or '-')} | "
+                f"{str(row.get('ozon_category_path') or row.get('category') or '-')}"
+                for _, row in df.iterrows()
+                if int(row["id"]) == int(x)
+            ),
+            f"ID {x}",
+        ),
+    )
     supplier_candidate_ids = [
         int(row["id"])
         for _, row in df.iterrows()
@@ -3934,171 +3953,187 @@ def show_catalog_tab():
             f"источники {source_text}, отложено по лимиту {skipped_by_limit}."
         )
 
-    cextra1, cextra2 = st.columns(2)
-    with cextra1:
-        if st.button("Автопривязать Ozon категории (текущая страница)", help="Сначала назначить эталонную Ozon категорию для товаров этой страницы"):
-            res = bulk_assign_ozon_categories(conn, [int(x) for x in ids], min_score=OZON_CATEGORY_MIN_SCORE, force=False)
-            materialized = materialize_ozon_attribute_slots_for_products(conn, [int(x) for x in ids])
-            if res.get("message"):
-                st.info(str(res["message"]))
-            else:
-                st.success(
-                    f"Ozon автопривязка: обработано {res['processed']}, привязано {res['assigned']}, пропущено {res['skipped']}. "
-                    f"Слотов Ozon-атрибутов создано: {int(materialized.get('slots_created') or 0)}."
-                )
-            st.rerun()
-    with cextra2:
-        if st.button("Перепривязать Ozon категории (force, текущая страница)", help="Повторный подбор Ozon категории с возможной перезаписью текущей привязки"):
-            res = bulk_assign_ozon_categories(conn, [int(x) for x in ids], min_score=OZON_CATEGORY_MIN_SCORE, force=True)
-            materialized = materialize_ozon_attribute_slots_for_products(conn, [int(x) for x in ids])
-            if res.get("message"):
-                st.info(str(res["message"]))
-            else:
-                st.success(
-                    f"Ozon force-привязка: обработано {res['processed']}, привязано {res['assigned']}, пропущено {res['skipped']}. "
-                    f"Слотов Ozon-атрибутов создано: {int(materialized.get('slots_created') or 0)}."
-                )
-            st.rerun()
-
-    oextra1, oextra2 = st.columns(2)
-    with oextra1:
-        if st.button("Подтянуть Ozon-атрибуты (текущая страница)", help="Подготовить category requirements Ozon для товаров текущей страницы, чтобы атрибуты появились в карточках"):
-            seeded = ensure_ozon_requirements_for_products(conn, [int(x) for x in ids])
-            materialized = materialize_ozon_attribute_slots_for_products(conn, [int(x) for x in ids])
-            st.success(
-                "Готово по текущей странице: "
-                f"товаров с Ozon-категорией {int(seeded.get('products_with_ozon_category') or 0)} из {int(seeded.get('products_total') or 0)}, "
-                f"пар категорий {int(seeded.get('category_pairs') or 0)}, "
-                f"импортировано атрибутов {int(seeded.get('imported_attributes') or 0)}, "
-                f"создано слотов атрибутов у товаров {int(materialized.get('slots_created') or 0)}."
-            )
-    with oextra2:
-        if st.button("Подтянуть Ozon-атрибуты (вся выборка фильтра)", help="Подготовить category requirements Ozon для всей текущей выборки"):
-            seeded = ensure_ozon_requirements_for_products(conn, [int(x) for x in all_filtered_candidate_ids])
-            materialized = materialize_ozon_attribute_slots_for_products(conn, [int(x) for x in all_filtered_candidate_ids])
-            st.success(
-                "Готово по всей выборке: "
-                f"товаров с Ozon-категорией {int(seeded.get('products_with_ozon_category') or 0)} из {int(seeded.get('products_total') or 0)}, "
-                f"пар категорий {int(seeded.get('category_pairs') or 0)}, "
-                f"импортировано атрибутов {int(seeded.get('imported_attributes') or 0)}, "
-                f"создано слотов атрибутов у товаров {int(materialized.get('slots_created') or 0)}."
-            )
-
-    b1, b2, b3 = st.columns(3)
-    with b1:
-        if st.button("Обогатить поставщика по текущей странице", help="Запустить supplier parsing для товаров текущей страницы с предварительной Ozon-автопривязкой (если включено)"):
-            run_supplier_enrichment_batch(
-                candidate_ids=supplier_candidate_ids,
-                run_limit=int(max_bulk_enrich_page),
-                run_label="Текущая страница",
-            )
-    with b2:
-        if st.button("Обогатить поставщика по всей выборке фильтра", help="Запустить supplier parsing для всей выборки фильтров с предварительной Ozon-автопривязкой (если включено). При включенной опции обработаются и товары без supplier_url через fallback-поиск."):
-            run_supplier_enrichment_batch(
-                candidate_ids=effective_filtered_candidate_ids,
-                run_limit=int(max_bulk_enrich_filtered),
-                run_label="Вся выборка фильтра",
-            )
-    with b3:
-        if st.button("Обновить дубли по текущей выборке", help="Пересчитать кандидатов дублей только для товаров на текущей странице"):
-            total = 0
-            progress = st.progress(0)
-            for i, pid in enumerate(ids, start=1):
-                refresh_duplicates_for_product(conn, int(pid))
-                total += 1
-                progress.progress(i / len(ids))
-            st.success(f"Проверка дублей завершена: {total} товаров")
-
     ai1, ai2 = st.columns(2)
     with ai1:
-        if st.button("AI-дозаполнение по текущей странице", help="Массово: Ozon категория -> supplier/web -> AI название/описание/атрибуты"):
+        if st.button("Заполнить текущую страницу", type="primary", help="Основной поток: Ozon категория -> supplier/web -> AI название/описание/атрибуты"):
             run_ai_enrichment_batch(
                 candidate_ids=[int(x) for x in ids],
                 run_limit=int(max_bulk_enrich_page),
                 run_label="AI / Текущая страница",
             )
     with ai2:
-        if st.button("AI-дозаполнение по всей выборке фильтра", help="Массово: Ozon категория -> supplier/web -> AI название/описание/атрибуты по текущему фильтру"):
+        if st.button("Заполнить всю выборку фильтра", type="primary", help="Основной поток: Ozon категория -> supplier/web -> AI название/описание/атрибуты по текущему фильтру"):
             run_ai_enrichment_batch(
                 candidate_ids=[int(x) for x in effective_filtered_candidate_ids],
                 run_limit=int(max_bulk_enrich_filtered),
                 run_label="AI / Вся выборка фильтра",
             )
 
-    d1, d2 = st.columns(2)
-    with d1:
-        if st.button("Рассчитать габариты/вес (текущая страница)", help="Заполнить пустые логистические поля товара статистикой похожих товаров и типовыми значениями."):
-            run_dimension_estimation_batch(
-                candidate_ids=[int(x) for x in ids],
-                run_limit=int(max_bulk_enrich_page),
-                run_label="Текущая страница",
-            )
-    with d2:
-        if st.button("Рассчитать габариты/вес (вся выборка фильтра)", help="Массово заполнить пустые логистические поля по всей текущей фильтрации."):
-            run_dimension_estimation_batch(
-                candidate_ids=[int(x) for x in all_filtered_candidate_ids],
-                run_limit=int(max_bulk_enrich_filtered),
-                run_label="Вся выборка фильтра",
-            )
-    z1, z2 = st.columns(2)
-    with z1:
-        if st.button("Подготовить ZIP фото текущей страницы", key="catalog_prepare_images_page_zip"):
-            zip_page_bytes, zip_page_stats = build_product_images_zip(
-                conn,
-                [int(x) for x in ids],
-                public_base_url=media_public_base_url,
-            )
-            st.session_state["catalog_page_zip_bytes"] = zip_page_bytes
-            st.session_state["catalog_page_zip_stats"] = zip_page_stats
-            st.session_state["catalog_page_zip_signature"] = page_zip_signature
-            if int(zip_page_stats.get("images_written") or 0) > 0:
-                st.success(
-                    f"ZIP по текущей странице подготовлен. Фото: {int(zip_page_stats.get('images_written') or 0)}, "
-                    f"пропущено: {int(zip_page_stats.get('images_skipped') or 0)}."
-                )
-            else:
-                st.warning("Для текущей страницы не удалось собрать публичные фото в ZIP.")
-        if (
-            st.session_state.get("catalog_page_zip_signature") == page_zip_signature
-            and st.session_state.get("catalog_page_zip_bytes")
-        ):
-            st.download_button(
-                "Скачать фото текущей страницы ZIP",
-                data=st.session_state["catalog_page_zip_bytes"],
-                file_name=f"pim_product_images_page_{int(page)}.zip",
-                mime="application/zip",
-                key="catalog_export_images_page_zip",
-            )
-    with z2:
-        if st.button("Подготовить ZIP фото всей выборки", key="catalog_prepare_images_filtered_zip"):
-            zip_filtered_bytes, zip_filtered_stats = build_product_images_zip(
-                conn,
-                [int(x) for x in all_filtered_candidate_ids],
-                public_base_url=media_public_base_url,
-            )
-            st.session_state["catalog_filtered_zip_bytes"] = zip_filtered_bytes
-            st.session_state["catalog_filtered_zip_stats"] = zip_filtered_stats
-            st.session_state["catalog_filtered_zip_signature"] = filtered_zip_signature
-            if int(zip_filtered_stats.get("images_written") or 0) > 0:
-                st.success(
-                    f"ZIP по всей выборке подготовлен. Фото: {int(zip_filtered_stats.get('images_written') or 0)}, "
-                    f"пропущено: {int(zip_filtered_stats.get('images_skipped') or 0)}."
-                )
-            else:
-                st.warning("Для текущей фильтрации не удалось собрать публичные фото в ZIP.")
-        if (
-            st.session_state.get("catalog_filtered_zip_signature") == filtered_zip_signature
-            and st.session_state.get("catalog_filtered_zip_bytes")
-        ):
-            st.download_button(
-                "Скачать фото всей выборки ZIP",
-                data=st.session_state["catalog_filtered_zip_bytes"],
-                file_name="pim_product_images_filtered.zip",
-                mime="application/zip",
-                key="catalog_export_images_filtered_zip",
-            )
+    with st.expander("Дополнительные и технические операции", expanded=False):
+        cextra1, cextra2 = st.columns(2)
+        with cextra1:
+            if st.button("Автопривязать Ozon категории (текущая страница)", help="Сначала назначить эталонную Ozon категорию для товаров этой страницы"):
+                res = bulk_assign_ozon_categories(conn, [int(x) for x in ids], min_score=OZON_CATEGORY_MIN_SCORE, force=False)
+                materialized = materialize_ozon_attribute_slots_for_products(conn, [int(x) for x in ids])
+                if res.get("message"):
+                    st.info(str(res["message"]))
+                else:
+                    st.success(
+                        f"Ozon автопривязка: обработано {res['processed']}, привязано {res['assigned']}, пропущено {res['skipped']}. "
+                        f"Слотов Ozon-атрибутов создано: {int(materialized.get('slots_created') or 0)}."
+                    )
+                st.rerun()
+        with cextra2:
+            if st.button("Перепривязать Ozon категории (force, текущая страница)", help="Повторный подбор Ozon категории с возможной перезаписью текущей привязки"):
+                res = bulk_assign_ozon_categories(conn, [int(x) for x in ids], min_score=OZON_CATEGORY_MIN_SCORE, force=True)
+                materialized = materialize_ozon_attribute_slots_for_products(conn, [int(x) for x in ids])
+                if res.get("message"):
+                    st.info(str(res["message"]))
+                else:
+                    st.success(
+                        f"Ozon force-привязка: обработано {res['processed']}, привязано {res['assigned']}, пропущено {res['skipped']}. "
+                        f"Слотов Ozon-атрибутов создано: {int(materialized.get('slots_created') or 0)}."
+                    )
+                st.rerun()
 
-    st.dataframe(with_ru_columns(df), use_container_width=True, hide_index=True)
+        oextra1, oextra2 = st.columns(2)
+        with oextra1:
+            if st.button("Подтянуть Ozon-атрибуты (текущая страница)", help="Подготовить category requirements Ozon для товаров текущей страницы, чтобы атрибуты появились в карточках"):
+                seeded = ensure_ozon_requirements_for_products(conn, [int(x) for x in ids])
+                materialized = materialize_ozon_attribute_slots_for_products(conn, [int(x) for x in ids])
+                st.success(
+                    "Готово по текущей странице: "
+                    f"товаров с Ozon-категорией {int(seeded.get('products_with_ozon_category') or 0)} из {int(seeded.get('products_total') or 0)}, "
+                    f"пар категорий {int(seeded.get('category_pairs') or 0)}, "
+                    f"импортировано атрибутов {int(seeded.get('imported_attributes') or 0)}, "
+                    f"создано слотов атрибутов у товаров {int(materialized.get('slots_created') or 0)}."
+                )
+        with oextra2:
+            if st.button("Подтянуть Ozon-атрибуты (вся выборка фильтра)", help="Подготовить category requirements Ozon для всей текущей выборки"):
+                seeded = ensure_ozon_requirements_for_products(conn, [int(x) for x in all_filtered_candidate_ids])
+                materialized = materialize_ozon_attribute_slots_for_products(conn, [int(x) for x in all_filtered_candidate_ids])
+                st.success(
+                    "Готово по всей выборке: "
+                    f"товаров с Ozon-категорией {int(seeded.get('products_with_ozon_category') or 0)} из {int(seeded.get('products_total') or 0)}, "
+                    f"пар категорий {int(seeded.get('category_pairs') or 0)}, "
+                    f"импортировано атрибутов {int(seeded.get('imported_attributes') or 0)}, "
+                    f"создано слотов атрибутов у товаров {int(materialized.get('slots_created') or 0)}."
+                )
+
+        b1, b2, b3 = st.columns(3)
+        with b1:
+            if st.button("Только supplier/web enrichment (страница)", help="Запустить supplier/web enrichment без AI по текущей странице"):
+                run_supplier_enrichment_batch(
+                    candidate_ids=supplier_candidate_ids,
+                    run_limit=int(max_bulk_enrich_page),
+                    run_label="Текущая страница",
+                )
+        with b2:
+            if st.button("Только supplier/web enrichment (фильтр)", help="Запустить supplier/web enrichment без AI по всей выборке фильтров"):
+                run_supplier_enrichment_batch(
+                    candidate_ids=effective_filtered_candidate_ids,
+                    run_limit=int(max_bulk_enrich_filtered),
+                    run_label="Вся выборка фильтра",
+                )
+        with b3:
+            if st.button("Обновить дубли по текущей выборке", help="Пересчитать кандидатов дублей только для товаров на текущей странице"):
+                total = 0
+                progress = st.progress(0)
+                for i, pid in enumerate(ids, start=1):
+                    refresh_duplicates_for_product(conn, int(pid))
+                    total += 1
+                    progress.progress(i / len(ids))
+                st.success(f"Проверка дублей завершена: {total} товаров")
+
+        d1, d2 = st.columns(2)
+        with d1:
+            if st.button("Рассчитать габариты/вес (текущая страница)", help="Заполнить пустые логистические поля товара статистикой похожих товаров и типовыми значениями."):
+                run_dimension_estimation_batch(
+                    candidate_ids=[int(x) for x in ids],
+                    run_limit=int(max_bulk_enrich_page),
+                    run_label="Текущая страница",
+                )
+        with d2:
+            if st.button("Рассчитать габариты/вес (вся выборка фильтра)", help="Массово заполнить пустые логистические поля по всей текущей фильтрации."):
+                run_dimension_estimation_batch(
+                    candidate_ids=[int(x) for x in all_filtered_candidate_ids],
+                    run_limit=int(max_bulk_enrich_filtered),
+                    run_label="Вся выборка фильтра",
+                )
+        z1, z2 = st.columns(2)
+        with z1:
+            if st.button("Подготовить ZIP фото текущей страницы", key="catalog_prepare_images_page_zip"):
+                zip_page_bytes, zip_page_stats = build_product_images_zip(
+                    conn,
+                    [int(x) for x in ids],
+                    public_base_url=media_public_base_url,
+                )
+                st.session_state["catalog_page_zip_bytes"] = zip_page_bytes
+                st.session_state["catalog_page_zip_stats"] = zip_page_stats
+                st.session_state["catalog_page_zip_signature"] = page_zip_signature
+                if int(zip_page_stats.get("images_written") or 0) > 0:
+                    st.success(
+                        f"ZIP по текущей странице подготовлен. Фото: {int(zip_page_stats.get('images_written') or 0)}, "
+                        f"пропущено: {int(zip_page_stats.get('images_skipped') or 0)}."
+                    )
+                else:
+                    st.warning("Для текущей страницы не удалось собрать публичные фото в ZIP.")
+            if (
+                st.session_state.get("catalog_page_zip_signature") == page_zip_signature
+                and st.session_state.get("catalog_page_zip_bytes")
+            ):
+                st.download_button(
+                    "Скачать фото текущей страницы ZIP",
+                    data=st.session_state["catalog_page_zip_bytes"],
+                    file_name=f"pim_product_images_page_{int(page)}.zip",
+                    mime="application/zip",
+                    key="catalog_export_images_page_zip",
+                )
+        with z2:
+            if st.button("Подготовить ZIP фото всей выборки", key="catalog_prepare_images_filtered_zip"):
+                zip_filtered_bytes, zip_filtered_stats = build_product_images_zip(
+                    conn,
+                    [int(x) for x in all_filtered_candidate_ids],
+                    public_base_url=media_public_base_url,
+                )
+                st.session_state["catalog_filtered_zip_bytes"] = zip_filtered_bytes
+                st.session_state["catalog_filtered_zip_stats"] = zip_filtered_stats
+                st.session_state["catalog_filtered_zip_signature"] = filtered_zip_signature
+                if int(zip_filtered_stats.get("images_written") or 0) > 0:
+                    st.success(
+                        f"ZIP по всей выборке подготовлен. Фото: {int(zip_filtered_stats.get('images_written') or 0)}, "
+                        f"пропущено: {int(zip_filtered_stats.get('images_skipped') or 0)}."
+                    )
+                else:
+                    st.warning("Для текущей фильтрации не удалось собрать публичные фото в ZIP.")
+            if (
+                st.session_state.get("catalog_filtered_zip_signature") == filtered_zip_signature
+                and st.session_state.get("catalog_filtered_zip_bytes")
+            ):
+                st.download_button(
+                    "Скачать фото всей выборки ZIP",
+                    data=st.session_state["catalog_filtered_zip_bytes"],
+                    file_name="pim_product_images_filtered.zip",
+                    mime="application/zip",
+                    key="catalog_export_images_filtered_zip",
+                )
+
+    quick_cols = [
+        c
+        for c in [
+            "article",
+            "supplier_article",
+            "name",
+            "supplier_name",
+            "ozon_category_path",
+            "supplier_parse_status",
+            "updated_at",
+        ]
+        if c in df.columns
+    ]
+    if quick_cols:
+        st.markdown("### Быстрый список товаров")
+        st.dataframe(with_ru_columns(df[quick_cols]), use_container_width=True, hide_index=True)
 
     if selected_id:
         st.session_state["selected_product_id"] = int(selected_id)
@@ -4765,7 +4800,7 @@ def show_product_tab():
     media_settings = load_media_settings(conn)
     media_public_base_url = str(media_settings.get("public_base_url") or "").strip()
     st.subheader("Поиск и выбор товара для редактирования")
-    st.caption("Сначала выбери товар через фильтры, затем откроется его карточка для заполнения и обогащения.")
+    st.caption("Работаем от артикула: сначала находишь товар через быстрый список, затем открываешь карточку для точечной доводки.")
     with st.container(border=True):
         fs1, fs2, fs3, fs4, fs5 = st.columns([3, 2, 2, 2, 1])
         with fs1:
@@ -4815,21 +4850,52 @@ def show_product_tab():
         conn.close()
         return
 
+    filtered_products = sorted(filtered_products, key=lambda item: _card_product_sort_key(item, card_search or ""))
     st.caption(f"Найдено товаров по фильтру: {len(filtered_products)}")
+    preview_rows = [
+        {
+            "article": row.get("article") or row.get("supplier_article") or row.get("internal_article"),
+            "name": row.get("name"),
+            "supplier_name": row.get("supplier_name"),
+            "ozon_category": row.get("ozon_category") or row.get("category"),
+            "ozon_subcategory": row.get("ozon_subcategory") or row.get("subcategory"),
+            "supplier_parse_status": row.get("supplier_parse_status"),
+            "updated_at": row.get("updated_at"),
+            "id": row.get("id"),
+        }
+        for row in filtered_products[:80]
+    ]
+    if preview_rows:
+        st.dataframe(with_ru_columns(pd.DataFrame(preview_rows)), use_container_width=True, hide_index=True)
     product_options = [int(r["id"]) for r in filtered_products]
     current_product_id = int(st.session_state.get("selected_product_id") or 0)
     default_product_id = current_product_id if current_product_id in product_options else int(product_options[0])
+    nav_prev_disabled = product_options.index(default_product_id) <= 0 if default_product_id in product_options else True
+    nav_next_disabled = product_options.index(default_product_id) >= (len(product_options) - 1) if default_product_id in product_options else True
+    n1, n2, n3 = st.columns([1, 1, 4])
+    with n1:
+        if st.button("◀ Предыдущий", disabled=nav_prev_disabled, key="card_prev_product_btn"):
+            idx = product_options.index(default_product_id)
+            st.session_state["selected_product_id"] = int(product_options[max(0, idx - 1)])
+            st.rerun()
+    with n2:
+        if st.button("Следующий ▶", disabled=nav_next_disabled, key="card_next_product_btn"):
+            idx = product_options.index(default_product_id)
+            st.session_state["selected_product_id"] = int(product_options[min(len(product_options) - 1, idx + 1)])
+            st.rerun()
+    with n3:
+        st.caption("Выбор товара теперь ориентирован на артикул. Сначала смотри быстрый список выше, затем открывай нужную карточку.")
     selected_product_id = st.selectbox(
-        "Товар",
+        "Товар по артикулу / названию",
         options=product_options,
         index=product_options.index(default_product_id),
         format_func=lambda x: next(
             (
-                f"ID {int(row['id'])} | {str(row.get('article') or row.get('supplier_article') or '-')} | "
+                f"{str(row.get('article') or row.get('supplier_article') or row.get('internal_article') or '-')} | "
                 f"{str(row.get('name') or '-')} | "
                 f"{str(row.get('ozon_category') or row.get('category') or row.get('base_category') or '-')} / "
                 f"{str(row.get('ozon_subcategory') or row.get('subcategory') or '-')} | "
-                f"{str(row.get('supplier_name') or '-')}"
+                f"{str(row.get('supplier_name') or '-')} | ID {int(row['id'])}"
                 for row in filtered_products
                 if int(row["id"]) == int(x)
             ),
@@ -4873,10 +4939,11 @@ def show_product_tab():
         st.markdown(
             """
 - `Поиск товара (артикул/наименование) / Категория Ozon / Подкатегория Ozon / Поставщик`: фильтр выбора товара для редактирования.
+- `Быстрый список`: смотри артикул и открывай нужный товар без долгого поиска по форме.
 - Если у товара уже определена Ozon-категория, её атрибуты автоматически подтягиваются в блок редактирования ниже.
-- `Спарсить поставщика`: аккуратное обогащение карточки с сайта поставщика.
-- `Перезаполнить из поставщика`: force-перезапись полей из supplier page.
-- `Стратегия парсинга для этого товара`: вручную выбрать, где искать данные (только поставщик, Ozon, Яндекс, web, домены).
+- `Заполнить товар по основному пайплайну`: главный режим для одного товара. Делает Ozon -> supplier/web -> AI.
+- `Точечные операции по товару`: ручные supplier/Ozon действия для сложных случаев.
+- `Стратегия парсинга для этого товара`: вручную выбрать сценарий поиска данных (поставщик, web, домены).
 - `Рассчитать габариты/вес (статистика)`: заполнить пустые логистические поля по статистике похожих товаров и типовым значениям.
 - `Галерея фото`: поле для нескольких фото (по одной ссылке в строке), даже если сейчас найдена только одна картинка.
 - `AI-контент`: генерация SEO-описания, AI-подсказки для пустых Ozon-атрибутов и генерация 2 маркетинг-изображений.
@@ -4950,9 +5017,7 @@ def show_product_tab():
         strategy_options = [
             ("auto_full", "Авто: поставщик -> web-поиск -> AI"),
             ("supplier_only", "Только сайт поставщика"),
-            ("supplier_plus_ozon", "Поставщик + web-поиск с упором на Ozon"),
-            ("supplier_plus_yandex", "Поставщик + web-поиск с упором на Яндекс Маркет"),
-            ("web_only", "Только интернет-поиск"),
+            ("web_only", "Только интернет-поиск + AI"),
             ("custom_domains", "Только выбранные домены"),
         ]
         strategy_values = [x[0] for x in strategy_options]
@@ -4990,82 +5055,112 @@ def show_product_tab():
     top3.metric("Категория", product["ozon_category_path"] or product["base_category"] or product["category"] or "-")
     top4.metric("Поставщик", product["supplier_name"] or "-")
 
-    ctop1, ctop2 = st.columns([1, 1])
-    with ctop1:
-        if st.button("Спарсить поставщика", type="primary", help="Обогатить карточку с сайта поставщика без жесткой перезаписи ручных значений"):
-            result = enrich_product_from_supplier(conn, int(product_id), force=False, parser_settings=runtime_parser_settings)
-            if result["ok"]:
-                st.success(result["message"])
-                if result.get("updates"):
-                    st.json(result["updates"])
-                st.rerun()
-            else:
-                st.error(result["message"])
-    with ctop2:
-        if st.button("Перезаполнить из поставщика", help="Жесткая перезапись значений из supplier page (force-режим)"):
-            result = enrich_product_from_supplier(conn, int(product_id), force=True, parser_settings=runtime_parser_settings)
-            if result["ok"]:
-                st.success(result["message"])
-                if result.get("updates"):
-                    st.json(result["updates"])
-                st.rerun()
-            else:
-                st.error(result["message"])
-    ctop3, ctop4, ctop4b = st.columns([1, 1, 1])
-    with ctop3:
-        if st.button("Подобрать Ozon категорию", help="Подобрать эталонную Ozon категорию автоматически"):
-            res = bulk_assign_ozon_categories(conn, [int(product_id)], min_score=OZON_CATEGORY_MIN_SCORE, force=False)
-            refreshed_product = get_product(conn, int(product_id))
-            materialized = {"slots_created": 0}
-            if refreshed_product:
-                materialized = materialize_ozon_attribute_slots_for_product(
-                    conn,
-                    product_id=int(product_id),
-                    description_category_id=int(refreshed_product["ozon_description_category_id"] or 0),
-                    type_id=int(refreshed_product["ozon_type_id"] or 0),
-                )
-            if res.get("message"):
-                st.info(str(res["message"]))
-            else:
-                st.success(
-                    f"Ozon автопривязка: обработано {res['processed']}, привязано {res['assigned']}, пропущено {res['skipped']}. "
-                    f"Создано слотов Ozon-атрибутов: {int(materialized.get('slots_created') or 0)}."
-                )
-            st.rerun()
-    with ctop4:
-        if st.button("Перепривязать Ozon категорию (force)", help="Повторно назначить Ozon категорию с перезаписью текущей привязки"):
-            res = bulk_assign_ozon_categories(conn, [int(product_id)], min_score=OZON_CATEGORY_MIN_SCORE, force=True)
-            refreshed_product = get_product(conn, int(product_id))
-            materialized = {"slots_created": 0}
-            if refreshed_product:
-                materialized = materialize_ozon_attribute_slots_for_product(
-                    conn,
-                    product_id=int(product_id),
-                    description_category_id=int(refreshed_product["ozon_description_category_id"] or 0),
-                    type_id=int(refreshed_product["ozon_type_id"] or 0),
-                )
-            if res.get("message"):
-                st.info(str(res["message"]))
-            else:
-                st.success(
-                    f"Ozon force-привязка: обработано {res['processed']}, привязано {res['assigned']}, пропущено {res['skipped']}. "
-                    f"Создано слотов Ozon-атрибутов: {int(materialized.get('slots_created') or 0)}."
-                )
-            st.rerun()
-    with ctop4b:
-        if st.button("Очистить Ozon-привязку", help="Убрать текущую Ozon категорию, если матчинг был неверным"):
-            save_product(
-                conn,
-                int(product_id),
-                {
-                    "ozon_description_category_id": None,
-                    "ozon_type_id": None,
-                    "ozon_category_path": None,
-                    "ozon_category_confidence": None,
-                },
+    mainc1, mainc2 = st.columns([1, 2])
+    with mainc1:
+        if st.button("Заполнить товар по основному пайплайну", type="primary", help="Ozon категория -> supplier/web -> AI название/описание/атрибуты"):
+            bulk_assign_ozon_categories(conn, [int(product_id)], min_score=OZON_CATEGORY_MIN_SCORE, force=False)
+            enrich_product_from_supplier(conn, int(product_id), force=False, parser_settings=runtime_parser_settings)
+            ai_fill_result = run_ai_enrichment_for_product(
+                conn=conn,
+                product_id=int(product_id),
+                settings=ai_settings,
+                include_title=True,
+                include_description=True,
+                include_attributes=True,
+                force=False,
             )
-            st.success("Ozon-привязка очищена. Ниже можно вручную поправить category/base/subcategory и сохранить карточку.")
-            st.rerun()
+            if ai_fill_result.get("ok"):
+                st.success(
+                    f"Пайплайн завершён: название={'да' if ai_fill_result.get('title_applied') else 'нет'}, "
+                    f"описание={'да' if ai_fill_result.get('description_applied') else 'нет'}, "
+                    f"AI-атрибутов сохранено {int(ai_fill_result.get('attributes_saved') or 0)}."
+                )
+                st.rerun()
+            else:
+                st.error(str(ai_fill_result.get("error") or "Не удалось выполнить AI-пайплайн."))
+    with mainc2:
+        st.caption(
+            "Это основной режим для одного товара. Отдельные supplier/Ozon операции оставлены ниже в дополнительном блоке, "
+            "если нужно вручную перепривязать категорию или сделать точечную диагностику."
+        )
+
+    with st.expander("Точечные операции по товару", expanded=False):
+        ctop1, ctop2 = st.columns([1, 1])
+        with ctop1:
+            if st.button("Спарсить поставщика", help="Обогатить карточку с сайта поставщика без жесткой перезаписи ручных значений"):
+                result = enrich_product_from_supplier(conn, int(product_id), force=False, parser_settings=runtime_parser_settings)
+                if result["ok"]:
+                    st.success(result["message"])
+                    if result.get("updates"):
+                        st.json(result["updates"])
+                    st.rerun()
+                else:
+                    st.error(result["message"])
+        with ctop2:
+            if st.button("Перезаполнить из поставщика", help="Жесткая перезапись значений из supplier page (force-режим)"):
+                result = enrich_product_from_supplier(conn, int(product_id), force=True, parser_settings=runtime_parser_settings)
+                if result["ok"]:
+                    st.success(result["message"])
+                    if result.get("updates"):
+                        st.json(result["updates"])
+                    st.rerun()
+                else:
+                    st.error(result["message"])
+        ctop3, ctop4, ctop4b = st.columns([1, 1, 1])
+        with ctop3:
+            if st.button("Подобрать Ozon категорию", help="Подобрать эталонную Ozon категорию автоматически"):
+                res = bulk_assign_ozon_categories(conn, [int(product_id)], min_score=OZON_CATEGORY_MIN_SCORE, force=False)
+                refreshed_product = get_product(conn, int(product_id))
+                materialized = {"slots_created": 0}
+                if refreshed_product:
+                    materialized = materialize_ozon_attribute_slots_for_product(
+                        conn,
+                        product_id=int(product_id),
+                        description_category_id=int(refreshed_product["ozon_description_category_id"] or 0),
+                        type_id=int(refreshed_product["ozon_type_id"] or 0),
+                    )
+                if res.get("message"):
+                    st.info(str(res["message"]))
+                else:
+                    st.success(
+                        f"Ozon автопривязка: обработано {res['processed']}, привязано {res['assigned']}, пропущено {res['skipped']}. "
+                        f"Создано слотов Ozon-атрибутов: {int(materialized.get('slots_created') or 0)}."
+                    )
+                st.rerun()
+        with ctop4:
+            if st.button("Перепривязать Ozon категорию (force)", help="Повторно назначить Ozon категорию с перезаписью текущей привязки"):
+                res = bulk_assign_ozon_categories(conn, [int(product_id)], min_score=OZON_CATEGORY_MIN_SCORE, force=True)
+                refreshed_product = get_product(conn, int(product_id))
+                materialized = {"slots_created": 0}
+                if refreshed_product:
+                    materialized = materialize_ozon_attribute_slots_for_product(
+                        conn,
+                        product_id=int(product_id),
+                        description_category_id=int(refreshed_product["ozon_description_category_id"] or 0),
+                        type_id=int(refreshed_product["ozon_type_id"] or 0),
+                    )
+                if res.get("message"):
+                    st.info(str(res["message"]))
+                else:
+                    st.success(
+                        f"Ozon force-привязка: обработано {res['processed']}, привязано {res['assigned']}, пропущено {res['skipped']}. "
+                        f"Создано слотов Ozon-атрибутов: {int(materialized.get('slots_created') or 0)}."
+                    )
+                st.rerun()
+        with ctop4b:
+            if st.button("Очистить Ozon-привязку", help="Убрать текущую Ozon категорию, если матчинг был неверным"):
+                save_product(
+                    conn,
+                    int(product_id),
+                    {
+                        "ozon_description_category_id": None,
+                        "ozon_type_id": None,
+                        "ozon_category_path": None,
+                        "ozon_category_confidence": None,
+                    },
+                )
+                st.success("Ozon-привязка очищена. Ниже можно вручную поправить category/base/subcategory и сохранить карточку.")
+                st.rerun()
 
     ctop5, ctop6, ctop7 = st.columns([1, 1, 2])
     with ctop5:
