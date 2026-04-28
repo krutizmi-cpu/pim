@@ -103,6 +103,15 @@ from services.template_matching import auto_match_template_columns, apply_saved_
 from services.template_profiles import save_template_profile, list_template_profiles, get_template_profile_columns
 from services.readiness_service import analyze_template_readiness
 from services.supplier_profiles import list_supplier_profiles, upsert_supplier_profile, ensure_default_supplier_profiles
+from services.persistence_service import (
+    persist_uploaded_file,
+    list_uploaded_files,
+    record_catalog_import_history,
+    list_catalog_import_history,
+    save_ai_connection_profile,
+    list_ai_connection_profiles,
+    get_ai_connection_profile,
+)
 from services.certificate_registry import (
     search_fsa_registry_candidates,
     parse_fsa_document_resource,
@@ -3086,6 +3095,7 @@ def show_import_tab():
     profiles_conn = get_db()
     profiles = list_supplier_profiles(profiles_conn, only_active=True)
     existing_suppliers = list_distinct_values(profiles_conn, "supplier_name")
+    recent_imports = list_catalog_import_history(profiles_conn, limit=12)
     profiles_conn.close()
     profile_map = {p["supplier_name"]: p for p in profiles}
     selected_profile_name = st.selectbox(
@@ -3164,6 +3174,27 @@ def show_import_tab():
         help="После Ozon-автопривязки добавит category requirements, чтобы атрибуты сразу были доступны в карточках.",
         key="import_auto_seed_ozon_attrs",
     )
+    if recent_imports:
+        with st.expander("История импортов каталога", expanded=False):
+            history_df = pd.DataFrame(recent_imports)
+            history_cols = [
+                c
+                for c in [
+                    "created_at",
+                    "original_file_name",
+                    "supplier_name",
+                    "selected_sheet",
+                    "header_row",
+                    "imported_count",
+                    "created_count",
+                    "updated_count",
+                    "duplicates_count",
+                    "stored_rel_path",
+                    "batch_id",
+                ]
+                if c in history_df.columns
+            ]
+            st.dataframe(with_ru_columns(history_df[history_cols] if history_cols else history_df), use_container_width=True, hide_index=True)
 
     if uploaded is not None:
         uploaded_bytes = uploaded.getvalue() if hasattr(uploaded, "getvalue") else uploaded.read()
@@ -3242,6 +3273,35 @@ def show_import_tab():
                         default_supplier_name=default_supplier_name or None,
                         default_supplier_url_template=default_supplier_url_template or None,
                     )
+                uploaded_record = persist_uploaded_file(
+                    conn=conn,
+                    storage_kind="supplier_catalog",
+                    original_file_name=getattr(uploaded, "name", None),
+                    file_bytes=uploaded_bytes,
+                    batch_id=result.batch_id,
+                    metadata={
+                        "import_mode": import_mode,
+                        "selected_sheet": selected_sheet,
+                        "header_row_zero_based": selected_header_row_zero,
+                        "auto_match_ozon_after_import": bool(auto_match_ozon_after_import),
+                        "auto_seed_ozon_attrs_after_import": bool(auto_seed_ozon_attrs_after_import),
+                    },
+                )
+                record_catalog_import_history(
+                    conn=conn,
+                    batch_id=result.batch_id,
+                    uploaded_file_id=int(uploaded_record["id"]),
+                    original_file_name=getattr(uploaded, "name", None),
+                    supplier_name=default_supplier_name or None,
+                    supplier_url_template=default_supplier_url_template or None,
+                    selected_sheet=selected_sheet,
+                    header_row=(int(selected_header_row_zero) + 1) if selected_header_row_zero is not None else None,
+                    imported_count=int(result.imported),
+                    created_count=int(result.created),
+                    updated_count=int(result.updated),
+                    duplicates_count=int(len(result.duplicates)),
+                    notes="Импорт из вкладки Импорт",
+                )
                 if auto_match_ozon_after_import and result.batch_id:
                     batch_rows = conn.execute(
                         "SELECT id FROM products WHERE import_batch_id = ? ORDER BY id DESC LIMIT 20000",
@@ -6211,6 +6271,7 @@ def show_template_tab():
     t1, t2 = st.columns([1, 1])
     with t1:
         channel_code = st.text_input("Код клиента / канала", value="onlinetrade", key="template_channel_code")
+    recent_template_files = list_uploaded_files(conn, storage_kind="client_template", channel_code=channel_code or None, limit=12)
     all_profiles = list_template_profiles(conn, channel_code=None)
     profile_scope_options = ["Текущий канал", "Все каналы"]
     profile_scope_value = st.session_state.get("template_profile_scope", "Текущий канал")
@@ -6270,6 +6331,22 @@ def show_template_tab():
     uploaded = st.file_uploader("Загрузить Excel-шаблон клиента", type=["xlsx", "xls"], key="client_template")
     if uploaded is None:
         st.info("После загрузки файла станет доступна кнопка `Сохранить профиль шаблона (текущая схема)` — система запомнит тип шаблона клиента.")
+    if recent_template_files:
+        with st.expander("Недавно загруженные шаблоны клиента", expanded=False):
+            recent_template_df = pd.DataFrame(recent_template_files)
+            recent_template_cols = [
+                c
+                for c in [
+                    "created_at",
+                    "original_file_name",
+                    "channel_code",
+                    "category_code",
+                    "stored_rel_path",
+                    "file_hash",
+                ]
+                if c in recent_template_df.columns
+            ]
+            st.dataframe(with_ru_columns(recent_template_df[recent_template_cols] if recent_template_cols else recent_template_df), use_container_width=True, hide_index=True)
 
     if uploaded is not None:
         uploaded_bytes = uploaded.getvalue()
@@ -6312,6 +6389,22 @@ def show_template_tab():
 
         template_df = read_client_template_dataframe(safe_uploaded_bytes, sheet_name=template_sheet_name)
         template_signature = hashlib.md5(safe_uploaded_bytes).hexdigest()
+        template_upload_registry_key = f"{channel_code}|{category_code}|{template_sheet_name}|{template_signature}|upload_saved"
+        if st.session_state.get(template_upload_registry_key) != True:
+            persist_uploaded_file(
+                conn=conn,
+                storage_kind="client_template",
+                original_file_name=getattr(uploaded, "name", None),
+                file_bytes=safe_uploaded_bytes,
+                channel_code=channel_code or None,
+                category_code=category_code or None,
+                metadata={
+                    "sheet_name": template_sheet_name,
+                    "data_start_row": int(template_data_start_row),
+                    "template_signature": template_signature,
+                },
+            )
+            st.session_state[template_upload_registry_key] = True
         autoreg_key = f"{channel_code}|{category_code}|{template_sheet_name}|{template_signature}"
         if st.session_state.get("template_autoreg_key") != autoreg_key:
             reg = ensure_template_columns_registered(
@@ -8105,6 +8198,38 @@ def show_channels_tab():
             "Поддерживаются OpenAI/OpenRouter/NVIDIA (OpenAI-compatible API). "
             "Эти настройки используются в Карточке товара для генерации описания, подсказок атрибутов и изображений."
         )
+        ai_profiles = list_ai_connection_profiles(conn)
+        if ai_profiles:
+            profile_options = [None] + [int(item["id"]) for item in ai_profiles]
+            profile_map = {int(item["id"]): item for item in ai_profiles}
+            ap1, ap2, ap3 = st.columns([2, 1, 1])
+            with ap1:
+                selected_ai_profile_id = st.selectbox(
+                    "Сохранённый AI-профиль",
+                    options=profile_options,
+                    format_func=lambda x: "-- выбрать --" if x is None else f"{profile_map[int(x)]['profile_name']} | {profile_map[int(x)].get('provider') or '-'} | {profile_map[int(x)].get('chat_model') or '-'}",
+                    key="ai_profile_select",
+                )
+            with ap2:
+                if st.button("Загрузить профиль", key="ai_profile_load_btn") and selected_ai_profile_id is not None:
+                    loaded = get_ai_connection_profile(conn, int(selected_ai_profile_id))
+                    if loaded:
+                        st.session_state["ai_cfg_provider"] = str(loaded.get("provider") or "openai")
+                        st.session_state["ai_cfg_chat_model"] = str(loaded.get("chat_model") or "")
+                        st.session_state["ai_cfg_image_model"] = str(loaded.get("image_model") or "")
+                        st.session_state["ai_cfg_base_url"] = str(loaded.get("base_url") or "")
+                        st.session_state["ai_cfg_temperature"] = float(loaded.get("temperature") or 0.3)
+                        st.session_state["ai_cfg_max_tokens"] = int(loaded.get("max_tokens") or 1800)
+                        st.session_state["ai_cfg_image_size"] = str(loaded.get("image_size") or "1024x1024")
+                        st.session_state["ai_cfg_use_env_key"] = bool(int(loaded.get("use_env_api_key") or 0))
+                        st.session_state["ai_cfg_enabled"] = True
+                        st.session_state["ai_cfg_api_key"] = str(loaded.get("api_key") or "")
+                        st.session_state["ai_cfg_or_referer"] = str(loaded.get("openrouter_referer") or "")
+                        st.session_state["ai_cfg_or_title"] = str(loaded.get("openrouter_title") or "pim")
+                        st.success("AI-профиль загружен в форму.")
+                        st.rerun()
+            with ap3:
+                st.caption(f"Профилей: {len(ai_profiles)}")
         cfg_ok, cfg_msg = ai_is_configured(ai_settings)
         if cfg_ok:
             st.success(cfg_msg)
@@ -8157,7 +8282,7 @@ def show_channels_tab():
             ai_max_tokens = st.number_input(
                 "Max tokens",
                 min_value=256,
-                max_value=12000,
+                max_value=65536,
                 value=int(ai_settings.get("max_tokens") or 1800),
                 step=64,
                 key="ai_cfg_max_tokens",
@@ -8214,7 +8339,14 @@ def show_channels_tab():
             ai_openrouter_referer = str(ai_settings.get("openrouter_referer") or "")
             ai_openrouter_title = str(ai_settings.get("openrouter_title") or "pim")
 
-        s1, s2 = st.columns([1, 1])
+        ai_profile_name = st.text_input(
+            "Имя профиля AI",
+            value=f"{str(ai_provider).strip()}_{str(ai_chat_model or 'default').strip() or 'default'}",
+            key="ai_profile_name_input",
+            help="Сохрани конфигурацию как профиль, чтобы быстро переключаться между токенами/моделями.",
+        )
+
+        s1, s2, s3 = st.columns([1, 1, 1])
         with s1:
             if st.button("Сохранить AI-настройки", key="ai_cfg_save_btn"):
                 new_settings = {
@@ -8258,6 +8390,27 @@ def show_channels_tab():
                     )
                 else:
                     st.error(f"Ошибка AI-подключения: {check_result.get('error')}")
+        with s3:
+            if st.button("Сохранить как AI-профиль", key="ai_profile_save_btn"):
+                profile_id = save_ai_connection_profile(
+                    conn,
+                    ai_profile_name,
+                    {
+                        "provider": str(ai_provider),
+                        "base_url": str(ai_base_url or "").strip(),
+                        "chat_model": str(ai_chat_model or "").strip(),
+                        "image_model": str(ai_image_model or "").strip(),
+                        "api_key": str(ai_api_key or "").strip(),
+                        "use_env_api_key": bool(ai_use_env_key),
+                        "temperature": float(ai_temperature),
+                        "max_tokens": int(ai_max_tokens),
+                        "image_size": str(ai_image_size),
+                        "openrouter_referer": str(ai_openrouter_referer or "").strip(),
+                        "openrouter_title": str(ai_openrouter_title or "pim").strip(),
+                    },
+                )
+                st.success(f"AI-профиль сохранён: #{profile_id}")
+                st.rerun()
 
     with st.expander("Медиа / фото", expanded=False):
         st.caption(

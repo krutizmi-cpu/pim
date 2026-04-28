@@ -120,7 +120,7 @@ def load_ai_settings(conn: sqlite3.Connection) -> dict[str, Any]:
         "openrouter_title": str(_get_setting(conn, "ai.openrouter_title", AI_SETTINGS_DEFAULTS["openrouter_title"]) or "pim").strip(),
     }
     settings["temperature"] = max(0.0, min(1.5, float(settings["temperature"])))
-    settings["max_tokens"] = max(256, min(12000, int(settings["max_tokens"])))
+    settings["max_tokens"] = max(256, min(65536, int(settings["max_tokens"])))
     if settings["image_size"] not in {"1024x1024", "1536x1024", "1024x1536"}:
         settings["image_size"] = "1024x1024"
     return settings

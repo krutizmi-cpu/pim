@@ -4,11 +4,16 @@ import os
 import sqlite3
 import tempfile
 import shutil
+import json
 from pathlib import Path
 
 DB_PATH = Path("data/catalog.db")
 _ACTIVE_DB_PATH: Path | None = None
-PERSISTENT_DB_PATH = Path.home() / ".pim" / "catalog.db"
+PIM_HOME_DIR = Path.home() / ".pim"
+PERSISTENT_DB_PATH = PIM_HOME_DIR / "catalog.db"
+PERSISTENT_UPLOADS_DIR = PIM_HOME_DIR / "uploads"
+PERSISTENT_IMPORTS_DIR = PERSISTENT_UPLOADS_DIR / "imports"
+PERSISTENT_TEMPLATES_DIR = PERSISTENT_UPLOADS_DIR / "templates"
 
 
 REQUIRED_PRODUCT_COLUMNS: dict[str, str] = {
@@ -74,7 +79,63 @@ def _candidate_db_paths(db_path: Path) -> list[Path]:
             continue
         seen.add(key)
         unique.append(item)
+    for discovered in _discover_additional_catalog_db_paths():
+        key = str(discovered.resolve()) if discovered.exists() else str(discovered)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(discovered)
     return unique
+
+
+def _discover_additional_catalog_db_paths() -> list[Path]:
+    results: list[Path] = []
+    seen: set[str] = set()
+    roots: list[Path] = []
+    cwd = Path.cwd()
+    roots.append(cwd)
+    if cwd.parent != cwd:
+        roots.append(cwd.parent)
+    home = Path.home()
+    for child in home.iterdir() if home.exists() else []:
+        try:
+            if child.is_dir() and child.name.lower().startswith("onedrive"):
+                roots.append(child)
+        except Exception:
+            continue
+
+    for root in roots:
+        try:
+            matches = root.glob("**/pim/data/catalog.db")
+        except Exception:
+            continue
+        for match in matches:
+            try:
+                key = str(match.resolve()) if match.exists() else str(match)
+            except Exception:
+                key = str(match)
+            if key in seen:
+                continue
+            seen.add(key)
+            results.append(match)
+    return results
+
+
+def _value_is_meaningful(value: object) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, (list, dict, tuple, set)):
+        return bool(value)
+    return True
+
+
+def _parse_sortable_ts(value: object) -> tuple[int, str]:
+    text = str(value or "").strip()
+    if not text:
+        return (0, "")
+    return (1, text)
 
 
 def _db_is_readable_with_products(path: Path) -> bool:
@@ -134,6 +195,9 @@ def _db_state_summary(path: Path) -> dict[str, int] | None:
                 "template_profiles": 0,
                 "channel_mapping_rules": 0,
                 "channel_attribute_requirements": 0,
+                "uploaded_files": 0,
+                "catalog_import_history": 0,
+                "ai_connection_profiles": 0,
                 "ozon_category_cache": 0,
                 "ozon_attribute_cache": 0,
                 "ozon_attribute_value_cache": 0,
@@ -148,6 +212,9 @@ def _db_state_summary(path: Path) -> dict[str, int] | None:
             "template_profiles": _safe_count(conn, "template_profiles") if "template_profiles" in tables else 0,
             "channel_mapping_rules": _safe_count(conn, "channel_mapping_rules") if "channel_mapping_rules" in tables else 0,
             "channel_attribute_requirements": _safe_count(conn, "channel_attribute_requirements") if "channel_attribute_requirements" in tables else 0,
+            "uploaded_files": _safe_count(conn, "uploaded_files") if "uploaded_files" in tables else 0,
+            "catalog_import_history": _safe_count(conn, "catalog_import_history") if "catalog_import_history" in tables else 0,
+            "ai_connection_profiles": _safe_count(conn, "ai_connection_profiles") if "ai_connection_profiles" in tables else 0,
             "ozon_category_cache": _safe_count(conn, "ozon_category_cache") if "ozon_category_cache" in tables else 0,
             "ozon_attribute_cache": _safe_count(conn, "ozon_attribute_cache") if "ozon_attribute_cache" in tables else 0,
             "ozon_attribute_value_cache": _safe_count(conn, "ozon_attribute_value_cache") if "ozon_attribute_value_cache" in tables else 0,
@@ -161,6 +228,9 @@ def _db_state_summary(path: Path) -> dict[str, int] | None:
             + summary["template_profiles"] * 200
             + summary["channel_mapping_rules"] * 120
             + summary["channel_attribute_requirements"] * 10
+            + summary["uploaded_files"] * 30
+            + summary["catalog_import_history"] * 45
+            + summary["ai_connection_profiles"] * 25
             + summary["ozon_category_cache"] * 5
             + summary["ozon_attribute_cache"] * 2
             + summary["ozon_attribute_value_cache"]
@@ -208,6 +278,530 @@ def _seed_preferred_db_if_needed(preferred: Path, fallbacks: list[Path]) -> None
         return
 
 
+def _table_exists(conn: sqlite3.Connection, table_name: str) -> bool:
+    row = conn.execute(
+        """
+        SELECT name
+        FROM sqlite_master
+        WHERE type='table' AND name = ?
+        LIMIT 1
+        """,
+        (str(table_name),),
+    ).fetchone()
+    return bool(row)
+
+
+def _insert_row_with_common_columns(
+    target_conn: sqlite3.Connection,
+    table_name: str,
+    row: dict[str, object],
+) -> None:
+    target_cols = _table_columns(target_conn, table_name)
+    payload = {k: v for k, v in row.items() if k in target_cols and k != "id"}
+    if not payload:
+        return
+    fields = list(payload.keys())
+    placeholders = ", ".join(["?"] * len(fields))
+    target_conn.execute(
+        f"INSERT INTO {table_name} ({', '.join(fields)}) VALUES ({placeholders})",
+        tuple(payload[field] for field in fields),
+    )
+
+
+def _merge_upsert_table(
+    target_conn: sqlite3.Connection,
+    source_conn: sqlite3.Connection,
+    table_name: str,
+    key_columns: list[str],
+    prefer_latest_updated_at: bool = False,
+) -> None:
+    if not _table_exists(source_conn, table_name) or not _table_exists(target_conn, table_name):
+        return
+
+    source_rows = source_conn.execute(f"SELECT * FROM {table_name}").fetchall()
+    target_cols = _table_columns(target_conn, table_name)
+    for row_obj in source_rows:
+        row = dict(row_obj)
+        if any(col not in row for col in key_columns):
+            continue
+        key_values = [row.get(col) for col in key_columns]
+        where_sql = " AND ".join([f"IFNULL({col}, '') = IFNULL(?, '')" for col in key_columns])
+        existing = target_conn.execute(
+            f"SELECT * FROM {table_name} WHERE {where_sql} LIMIT 1",
+            tuple(key_values),
+        ).fetchone()
+        if not existing:
+            payload = {k: v for k, v in row.items() if k in target_cols and k != "id"}
+            if not payload:
+                continue
+            fields = list(payload.keys())
+            placeholders = ", ".join(["?"] * len(fields))
+            target_conn.execute(
+                f"INSERT INTO {table_name} ({', '.join(fields)}) VALUES ({placeholders})",
+                tuple(payload[field] for field in fields),
+            )
+            continue
+
+        existing_dict = dict(existing)
+        source_newer = False
+        if prefer_latest_updated_at:
+            source_newer = _parse_sortable_ts(row.get("updated_at")) > _parse_sortable_ts(existing_dict.get("updated_at"))
+        updates: dict[str, object] = {}
+        for col, value in row.items():
+            if col not in target_cols or col == "id" or col in key_columns:
+                continue
+            current = existing_dict.get(col)
+            if _value_is_meaningful(value) and not _value_is_meaningful(current):
+                updates[col] = value
+            elif prefer_latest_updated_at and source_newer and _value_is_meaningful(value):
+                updates[col] = value
+        if not updates:
+            continue
+        set_sql = ", ".join([f"{col} = ?" for col in updates.keys()])
+        target_conn.execute(
+            f"UPDATE {table_name} SET {set_sql} WHERE {where_sql}",
+            tuple(updates.values()) + tuple(key_values),
+        )
+
+
+def _merge_products_table(target_conn: sqlite3.Connection, source_conn: sqlite3.Connection) -> dict[int, int]:
+    product_id_map: dict[int, int] = {}
+    if not _table_exists(source_conn, "products") or not _table_exists(target_conn, "products"):
+        return product_id_map
+
+    source_rows = source_conn.execute("SELECT * FROM products ORDER BY id").fetchall()
+    target_cols = _table_columns(target_conn, "products")
+    for row_obj in source_rows:
+        row = dict(row_obj)
+        article = str(row.get("article") or "").strip()
+        if not article:
+            continue
+        existing = target_conn.execute(
+            "SELECT * FROM products WHERE article = ? LIMIT 1",
+            (article,),
+        ).fetchone()
+        if not existing:
+            payload = {k: v for k, v in row.items() if k in target_cols and k != "id"}
+            fields = list(payload.keys())
+            placeholders = ", ".join(["?"] * len(fields))
+            cur = target_conn.execute(
+                f"INSERT INTO products ({', '.join(fields)}) VALUES ({placeholders})",
+                tuple(payload[field] for field in fields),
+            )
+            product_id_map[int(row.get("id") or 0)] = int(cur.lastrowid)
+            continue
+
+        existing_dict = dict(existing)
+        updates: dict[str, object] = {}
+        source_newer = _parse_sortable_ts(row.get("updated_at")) > _parse_sortable_ts(existing_dict.get("updated_at"))
+        for col, value in row.items():
+            if col not in target_cols or col in {"id", "article"}:
+                continue
+            current = existing_dict.get(col)
+            if _value_is_meaningful(value) and not _value_is_meaningful(current):
+                updates[col] = value
+            elif source_newer and _value_is_meaningful(value) and col in {
+                "name",
+                "brand",
+                "barcode",
+                "category",
+                "base_category",
+                "subcategory",
+                "supplier_name",
+                "supplier_url",
+                "description",
+                "image_url",
+                "ozon_description_category_id",
+                "ozon_type_id",
+                "ozon_category_path",
+                "ozon_category_confidence",
+                "tnved_code",
+                "import_batch_id",
+            }:
+                updates[col] = value
+        if updates:
+            set_sql = ", ".join([f"{col} = ?" for col in updates.keys()])
+            target_conn.execute(
+                f"UPDATE products SET {set_sql} WHERE article = ?",
+                tuple(updates.values()) + (article,),
+            )
+        refreshed = target_conn.execute("SELECT id FROM products WHERE article = ? LIMIT 1", (article,)).fetchone()
+        if refreshed:
+            product_id_map[int(row.get("id") or 0)] = int(refreshed["id"])
+    return product_id_map
+
+
+def _merge_product_attribute_values(
+    target_conn: sqlite3.Connection,
+    source_conn: sqlite3.Connection,
+    product_id_map: dict[int, int],
+) -> None:
+    if not _table_exists(source_conn, "product_attribute_values") or not _table_exists(target_conn, "product_attribute_values"):
+        return
+    source_rows = source_conn.execute("SELECT * FROM product_attribute_values ORDER BY id").fetchall()
+    for row_obj in source_rows:
+        row = dict(row_obj)
+        source_product_id = int(row.get("product_id") or 0)
+        target_product_id = product_id_map.get(source_product_id)
+        if not target_product_id:
+            continue
+        key_params = (
+            target_product_id,
+            row.get("attribute_code"),
+            row.get("channel_code"),
+            row.get("locale"),
+        )
+        existing = target_conn.execute(
+            """
+            SELECT *
+            FROM product_attribute_values
+            WHERE product_id = ?
+              AND attribute_code = ?
+              AND IFNULL(channel_code, '') = IFNULL(?, '')
+              AND IFNULL(locale, '') = IFNULL(?, '')
+            LIMIT 1
+            """,
+            key_params,
+        ).fetchone()
+        if not existing:
+            target_conn.execute(
+                """
+                INSERT INTO product_attribute_values (
+                    product_id,
+                    attribute_code,
+                    value_text,
+                    value_number,
+                    value_boolean,
+                    value_json,
+                    locale,
+                    channel_code,
+                    created_at,
+                    updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    target_product_id,
+                    row.get("attribute_code"),
+                    row.get("value_text"),
+                    row.get("value_number"),
+                    row.get("value_boolean"),
+                    row.get("value_json"),
+                    row.get("locale"),
+                    row.get("channel_code"),
+                    row.get("created_at"),
+                    row.get("updated_at"),
+                ),
+            )
+            continue
+
+        existing_dict = dict(existing)
+        updates: dict[str, object] = {}
+        for value_col in ("value_text", "value_number", "value_boolean", "value_json"):
+            if _value_is_meaningful(row.get(value_col)) and not _value_is_meaningful(existing_dict.get(value_col)):
+                updates[value_col] = row.get(value_col)
+        if _parse_sortable_ts(row.get("updated_at")) > _parse_sortable_ts(existing_dict.get("updated_at")):
+            for value_col in ("value_text", "value_number", "value_boolean", "value_json"):
+                if _value_is_meaningful(row.get(value_col)):
+                    updates[value_col] = row.get(value_col)
+            if _value_is_meaningful(row.get("updated_at")):
+                updates["updated_at"] = row.get("updated_at")
+        if updates:
+            set_sql = ", ".join([f"{col} = ?" for col in updates.keys()])
+            target_conn.execute(
+                f"""
+                UPDATE product_attribute_values
+                SET {set_sql}
+                WHERE product_id = ?
+                  AND attribute_code = ?
+                  AND IFNULL(channel_code, '') = IFNULL(?, '')
+                  AND IFNULL(locale, '') = IFNULL(?, '')
+                """,
+                tuple(updates.values()) + key_params,
+            )
+
+
+def _merge_template_profiles(target_conn: sqlite3.Connection, source_conn: sqlite3.Connection) -> None:
+    if not _table_exists(source_conn, "template_profiles") or not _table_exists(target_conn, "template_profiles"):
+        return
+    profile_rows = source_conn.execute("SELECT * FROM template_profiles ORDER BY id").fetchall()
+    for profile_row_obj in profile_rows:
+        profile_row = dict(profile_row_obj)
+        profile_name = str(profile_row.get("profile_name") or "").strip()
+        channel_code = str(profile_row.get("channel_code") or "").strip()
+        category_code = profile_row.get("category_code")
+        if not profile_name or not channel_code:
+            continue
+        existing = target_conn.execute(
+            """
+            SELECT *
+            FROM template_profiles
+            WHERE profile_name = ?
+              AND channel_code = ?
+              AND IFNULL(category_code, '') = IFNULL(?, '')
+            LIMIT 1
+            """,
+            (profile_name, channel_code, category_code),
+        ).fetchone()
+        if not existing:
+            cur = target_conn.execute(
+                """
+                INSERT INTO template_profiles (
+                    profile_name,
+                    channel_code,
+                    category_code,
+                    file_name,
+                    created_at,
+                    updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    profile_name,
+                    channel_code,
+                    category_code,
+                    profile_row.get("file_name"),
+                    profile_row.get("created_at"),
+                    profile_row.get("updated_at"),
+                ),
+            )
+            target_profile_id = int(cur.lastrowid)
+        else:
+            existing_dict = dict(existing)
+            target_profile_id = int(existing_dict["id"])
+            updates: dict[str, object] = {}
+            if _value_is_meaningful(profile_row.get("file_name")) and not _value_is_meaningful(existing_dict.get("file_name")):
+                updates["file_name"] = profile_row.get("file_name")
+            if _parse_sortable_ts(profile_row.get("updated_at")) > _parse_sortable_ts(existing_dict.get("updated_at")):
+                updates["updated_at"] = profile_row.get("updated_at")
+            if updates:
+                set_sql = ", ".join([f"{col} = ?" for col in updates.keys()])
+                target_conn.execute(
+                    f"UPDATE template_profiles SET {set_sql} WHERE id = ?",
+                    tuple(updates.values()) + (target_profile_id,),
+                )
+
+        if not _table_exists(source_conn, "template_profile_columns") or not _table_exists(target_conn, "template_profile_columns"):
+            continue
+        source_columns = source_conn.execute(
+            "SELECT * FROM template_profile_columns WHERE profile_id = ? ORDER BY sort_order, id",
+            (int(profile_row.get("id") or 0),),
+        ).fetchall()
+        for col_row_obj in source_columns:
+            col_row = dict(col_row_obj)
+            existing_col = target_conn.execute(
+                """
+                SELECT *
+                FROM template_profile_columns
+                WHERE profile_id = ?
+                  AND template_column = ?
+                LIMIT 1
+                """,
+                (target_profile_id, col_row.get("template_column")),
+            ).fetchone()
+            if not existing_col:
+                target_conn.execute(
+                    """
+                    INSERT INTO template_profile_columns (
+                        profile_id,
+                        template_column,
+                        source_type,
+                        source_name,
+                        matched_by,
+                        transform_rule,
+                        sort_order,
+                        created_at,
+                        updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        target_profile_id,
+                        col_row.get("template_column"),
+                        col_row.get("source_type"),
+                        col_row.get("source_name"),
+                        col_row.get("matched_by"),
+                        col_row.get("transform_rule"),
+                        col_row.get("sort_order"),
+                        col_row.get("created_at"),
+                        col_row.get("updated_at"),
+                    ),
+                )
+                continue
+            existing_col_dict = dict(existing_col)
+            updates: dict[str, object] = {}
+            for key in ("source_type", "source_name", "matched_by", "transform_rule", "sort_order", "updated_at"):
+                if _value_is_meaningful(col_row.get(key)) and (
+                    not _value_is_meaningful(existing_col_dict.get(key))
+                    or _parse_sortable_ts(col_row.get("updated_at")) > _parse_sortable_ts(existing_col_dict.get("updated_at"))
+                ):
+                    updates[key] = col_row.get(key)
+            if updates:
+                set_sql = ", ".join([f"{col} = ?" for col in updates.keys()])
+                target_conn.execute(
+                    f"UPDATE template_profile_columns SET {set_sql} WHERE id = ?",
+                    tuple(updates.values()) + (int(existing_col_dict["id"]),),
+                )
+
+
+def _merge_ozon_caches(target_conn: sqlite3.Connection, source_conn: sqlite3.Connection) -> None:
+    cache_specs = [
+        (
+            "ozon_category_cache",
+            ["description_category_id", "type_id", "full_path"],
+        ),
+        (
+            "ozon_attribute_cache",
+            ["description_category_id", "type_id", "attribute_id"],
+        ),
+        (
+            "ozon_attribute_value_cache",
+            ["description_category_id", "type_id", "attribute_id", "value_id"],
+        ),
+        (
+            "ozon_dictionary_overrides",
+            ["description_category_id", "type_id", "attribute_id", "normalized_raw_value"],
+        ),
+        (
+            "ozon_update_jobs",
+            ["id"],
+        ),
+        (
+            "ozon_update_job_items",
+            ["job_id", "offer_id", "product_id"],
+        ),
+        (
+            "ozon_catalog_mapping_memory",
+            ["mapping_key"],
+        ),
+    ]
+    for table_name, key_columns in cache_specs:
+        _merge_upsert_table(
+            target_conn=target_conn,
+            source_conn=source_conn,
+            table_name=table_name,
+            key_columns=key_columns,
+            prefer_latest_updated_at=True,
+        )
+
+
+def _merge_product_linked_tables(
+    target_conn: sqlite3.Connection,
+    source_conn: sqlite3.Connection,
+    product_id_map: dict[int, int],
+) -> None:
+    if _table_exists(source_conn, "product_registry_documents") and _table_exists(target_conn, "product_registry_documents"):
+        rows = source_conn.execute("SELECT * FROM product_registry_documents ORDER BY id").fetchall()
+        for row_obj in rows:
+            row = dict(row_obj)
+            target_product_id = product_id_map.get(int(row.get("product_id") or 0))
+            if not target_product_id:
+                continue
+            existing = target_conn.execute(
+                """
+                SELECT *
+                FROM product_registry_documents
+                WHERE product_id = ?
+                  AND IFNULL(doc_kind, '') = IFNULL(?, '')
+                  AND IFNULL(doc_number, '') = IFNULL(?, '')
+                LIMIT 1
+                """,
+                (
+                    target_product_id,
+                    row.get("doc_kind"),
+                    row.get("doc_number"),
+                ),
+            ).fetchone()
+            if not existing:
+                target_conn.execute(
+                    """
+                    INSERT INTO product_registry_documents (
+                        product_id,
+                        doc_kind,
+                        doc_number,
+                        valid_from,
+                        valid_to,
+                        authority_name,
+                        applicant_name,
+                        tnved_code,
+                        source_url,
+                        pdf_url,
+                        local_file_path,
+                        raw_payload,
+                        created_at,
+                        updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        target_product_id,
+                        row.get("doc_kind"),
+                        row.get("doc_number"),
+                        row.get("valid_from"),
+                        row.get("valid_to"),
+                        row.get("authority_name"),
+                        row.get("applicant_name"),
+                        row.get("tnved_code"),
+                        row.get("source_url"),
+                        row.get("pdf_url"),
+                        row.get("local_file_path"),
+                        row.get("raw_payload"),
+                        row.get("created_at"),
+                        row.get("updated_at"),
+                    ),
+                )
+
+
+def _merge_db_into_preferred(preferred: Path, source: Path) -> None:
+    if not source.exists() or not source.is_file():
+        return
+    if preferred.resolve() == source.resolve():
+        return
+
+    target_conn: sqlite3.Connection | None = None
+    source_conn: sqlite3.Connection | None = None
+    try:
+        preferred.parent.mkdir(parents=True, exist_ok=True)
+        target_conn = sqlite3.connect(preferred, timeout=30.0)
+        target_conn.row_factory = sqlite3.Row
+        init_db(target_conn)
+
+        source_conn = sqlite3.connect(source, timeout=30.0)
+        source_conn.row_factory = sqlite3.Row
+
+        _merge_upsert_table(target_conn, source_conn, "attribute_definitions", ["code"], prefer_latest_updated_at=True)
+        _merge_upsert_table(target_conn, source_conn, "channel_profiles", ["channel_code"], prefer_latest_updated_at=True)
+        _merge_upsert_table(target_conn, source_conn, "channel_attribute_requirements", ["channel_code", "category_code", "attribute_code"], prefer_latest_updated_at=True)
+        _merge_upsert_table(target_conn, source_conn, "channel_mapping_rules", ["channel_code", "category_code", "target_field"], prefer_latest_updated_at=True)
+        _merge_upsert_table(target_conn, source_conn, "system_settings", ["key"], prefer_latest_updated_at=True)
+        _merge_upsert_table(target_conn, source_conn, "supplier_profiles", ["supplier_name"], prefer_latest_updated_at=True)
+        _merge_upsert_table(target_conn, source_conn, "uploaded_files", ["storage_kind", "file_hash"], prefer_latest_updated_at=True)
+        _merge_upsert_table(target_conn, source_conn, "catalog_import_history", ["batch_id"], prefer_latest_updated_at=True)
+        _merge_upsert_table(target_conn, source_conn, "ai_connection_profiles", ["profile_name"], prefer_latest_updated_at=True)
+        _merge_template_profiles(target_conn, source_conn)
+        product_id_map = _merge_products_table(target_conn, source_conn)
+        _merge_product_attribute_values(target_conn, source_conn, product_id_map)
+        _merge_product_linked_tables(target_conn, source_conn, product_id_map)
+        _merge_ozon_caches(target_conn, source_conn)
+        target_conn.commit()
+    except Exception:
+        if target_conn is not None:
+            target_conn.rollback()
+    finally:
+        if source_conn is not None:
+            source_conn.close()
+        if target_conn is not None:
+            target_conn.close()
+
+
+def _merge_candidate_dbs(preferred: Path, fallbacks: list[Path]) -> None:
+    for source in fallbacks:
+        try:
+            _merge_db_into_preferred(preferred, source)
+        except Exception:
+            continue
+
+
 def get_connection(db_path: Path = DB_PATH) -> sqlite3.Connection:
     global _ACTIVE_DB_PATH
 
@@ -220,6 +814,7 @@ def get_connection(db_path: Path = DB_PATH) -> sqlite3.Connection:
     candidates = _candidate_db_paths(Path(db_path))
     if candidates:
         _seed_preferred_db_if_needed(candidates[0], candidates[1:])
+        _merge_candidate_dbs(candidates[0], candidates[1:])
 
     last_error: Exception | None = None
     for candidate in candidates:
@@ -560,6 +1155,88 @@ def _ensure_template_profile_tables(conn: sqlite3.Connection) -> None:
         """
     )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_tpc_profile_id ON template_profile_columns(profile_id)")
+
+
+def _ensure_uploaded_files_tables(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS uploaded_files (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            storage_kind TEXT NOT NULL,
+            file_hash TEXT NOT NULL,
+            original_file_name TEXT,
+            stored_rel_path TEXT NOT NULL,
+            channel_code TEXT,
+            category_code TEXT,
+            batch_id TEXT,
+            metadata_json TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_uploaded_files_unique
+        ON uploaded_files(storage_kind, file_hash)
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_uploaded_files_kind ON uploaded_files(storage_kind)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_uploaded_files_channel ON uploaded_files(channel_code)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_uploaded_files_batch ON uploaded_files(batch_id)")
+
+
+def _ensure_catalog_import_history_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS catalog_import_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            batch_id TEXT NOT NULL,
+            uploaded_file_id INTEGER,
+            original_file_name TEXT,
+            supplier_name TEXT,
+            supplier_url_template TEXT,
+            selected_sheet TEXT,
+            header_row INTEGER,
+            imported_count INTEGER DEFAULT 0,
+            created_count INTEGER DEFAULT 0,
+            updated_count INTEGER DEFAULT 0,
+            duplicates_count INTEGER DEFAULT 0,
+            notes TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT
+        )
+        """
+    )
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_catalog_import_batch_unique ON catalog_import_history(batch_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_catalog_import_created ON catalog_import_history(created_at)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_catalog_import_supplier ON catalog_import_history(supplier_name)")
+
+
+def _ensure_ai_connection_profiles_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS ai_connection_profiles (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            profile_name TEXT NOT NULL,
+            provider TEXT NOT NULL,
+            base_url TEXT,
+            chat_model TEXT,
+            image_model TEXT,
+            api_key TEXT,
+            use_env_api_key INTEGER DEFAULT 1,
+            temperature REAL DEFAULT 0.3,
+            max_tokens INTEGER DEFAULT 1800,
+            image_size TEXT,
+            openrouter_referer TEXT,
+            openrouter_title TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT
+        )
+        """
+    )
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_ai_profiles_name_unique ON ai_connection_profiles(profile_name)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_ai_profiles_provider ON ai_connection_profiles(provider)")
 
 
 def _ensure_supplier_profiles_table(conn: sqlite3.Connection) -> None:
@@ -1012,6 +1689,9 @@ def init_db(conn: sqlite3.Connection) -> None:
     _ensure_product_data_sources_table(conn)
     _ensure_system_settings_table(conn)
     _ensure_template_profile_tables(conn)
+    _ensure_uploaded_files_tables(conn)
+    _ensure_catalog_import_history_table(conn)
+    _ensure_ai_connection_profiles_table(conn)
     _ensure_supplier_profiles_table(conn)
     _ensure_product_registry_documents_table(conn)
     _ensure_ozon_tables(conn)
