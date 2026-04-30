@@ -66,8 +66,23 @@ def save_template_profile(
     return profile_id
 
 
-def list_template_profiles(conn: sqlite3.Connection, channel_code: str | None = None) -> list[dict]:
-    if channel_code:
+def list_template_profiles(
+    conn: sqlite3.Connection,
+    channel_code: str | None = None,
+    category_code: str | None = None,
+) -> list[dict]:
+    if channel_code and category_code is not None:
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM template_profiles
+            WHERE channel_code = ?
+              AND IFNULL(category_code, '') = IFNULL(?, '')
+            ORDER BY updated_at DESC, id DESC
+            """,
+            (channel_code, category_code),
+        ).fetchall()
+    elif channel_code:
         rows = conn.execute(
             "SELECT * FROM template_profiles WHERE channel_code = ? ORDER BY updated_at DESC, id DESC",
             (channel_code,),

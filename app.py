@@ -101,11 +101,14 @@ def is_likely_blocked_supplier_domain(url: str | None) -> bool:
     return False
 from services.template_matching import auto_match_template_columns, apply_saved_mapping_rules, fill_template_dataframe, apply_client_validated_values, fill_template_workbook_bytes, dataframe_to_excel_bytes, detect_template_data_start_row, sanitize_template_xlsx_bytes, read_client_template_dataframe
 from services.template_profiles import save_template_profile, list_template_profiles, get_template_profile_columns
+from services.client_registry import list_client_channels, upsert_client_channel
 from services.readiness_service import analyze_template_readiness
 from services.supplier_profiles import list_supplier_profiles, upsert_supplier_profile, ensure_default_supplier_profiles
 from services.persistence_service import (
     persist_uploaded_file,
     list_uploaded_files,
+    get_uploaded_file_metadata,
+    read_uploaded_file_bytes,
     record_catalog_import_history,
     list_catalog_import_history,
     save_ai_connection_profile,
@@ -6585,10 +6588,63 @@ def show_template_tab():
     conn = get_db()
     product_df = load_products(conn, limit=5000)
 
+    client_entries = list_client_channels(conn)
+    client_map = {str(item.get("client_code") or "").strip(): item for item in client_entries if str(item.get("client_code") or "").strip()}
+    client_codes = sorted(client_map.keys(), key=lambda x: (str(client_map.get(x, {}).get("client_name") or x).lower(), x.lower()))
+
+    def _client_label(code: str) -> str:
+        item = client_map.get(str(code or "").strip(), {})
+        client_name = str(item.get("client_name") or "").strip()
+        if client_name:
+            return f"{client_name} ({code})"
+        if item.get("is_inferred"):
+            return f"{code} [из памяти]"
+        return str(code)
+
     t1, t2 = st.columns([1, 1])
     with t1:
-        channel_code = st.text_input("Код клиента / канала", value="onlinetrade", key="template_channel_code")
-    recent_template_files = list_uploaded_files(conn, storage_kind="client_template", channel_code=channel_code or None, limit=12)
+        selected_client_code = str(st.session_state.get("template_client_code") or "").strip()
+        default_client_option = selected_client_code if selected_client_code in client_codes else None
+        client_selector_options = [None] + client_codes + ["__new__"]
+        client_selector = st.selectbox(
+            "Клиент / канал",
+            options=client_selector_options,
+            index=client_selector_options.index(default_client_option) if default_client_option in client_selector_options else 0,
+            format_func=lambda value: (
+                "-- выбери клиента --"
+                if value is None
+                else "➕ Создать нового клиента"
+                if value == "__new__"
+                else _client_label(str(value))
+            ),
+            key="template_client_selector",
+        )
+
+        new_client_name = ""
+        if client_selector == "__new__":
+            new_client_code = st.text_input("Код нового клиента", value=str(st.session_state.get("template_new_client_code") or "").strip(), key="template_new_client_code")
+            new_client_name = st.text_input("Название клиента", value=str(st.session_state.get("template_new_client_name") or "").strip(), key="template_new_client_name")
+            if st.button("Сохранить клиента в базу", key="template_save_new_client"):
+                normalized_new_code = str(new_client_code or "").strip()
+                if not normalized_new_code:
+                    st.error("Укажи код клиента.")
+                else:
+                    upsert_client_channel(
+                        conn,
+                        client_code=normalized_new_code,
+                        client_name=str(new_client_name or "").strip() or None,
+                    )
+                    st.session_state["template_client_code"] = normalized_new_code
+                    st.session_state["template_client_selector"] = normalized_new_code
+                    st.success(f"Клиент `{normalized_new_code}` сохранён.")
+                    st.rerun()
+            channel_code = str(new_client_code or "").strip()
+        else:
+            channel_code = str(client_selector or "").strip()
+            if channel_code:
+                st.session_state["template_client_code"] = channel_code
+                st.caption(f"Выбран клиент: {_client_label(channel_code)}")
+
     all_profiles = list_template_profiles(conn, channel_code=None)
     profile_scope_options = ["Текущий канал", "Все каналы"]
     profile_scope_value = st.session_state.get("template_profile_scope", "Текущий канал")
@@ -6602,7 +6658,7 @@ def show_template_tab():
     )
     existing_profiles = (
         [p for p in all_profiles if str(p.get("channel_code") or "").strip() == str(channel_code or "").strip()]
-        if profile_scope == "Текущий канал"
+        if profile_scope == "Текущий канал" and channel_code
         else all_profiles
     )
     category_options, category_labels = _build_ozon_template_category_options(conn, channel_code=channel_code, limit=5000)
@@ -6615,18 +6671,32 @@ def show_template_tab():
             key="template_category_select",
         )
 
+    recent_template_files = list_uploaded_files(
+        conn,
+        storage_kind="client_template",
+        channel_code=channel_code or None,
+        category_code=category_code or None,
+        limit=20,
+    )
+    category_profiles = (
+        [p for p in existing_profiles if str(p.get("category_code") or "").strip() == str(category_code or "").strip()]
+        if category_code
+        else existing_profiles
+    )
+
     p1, p2 = st.columns([1, 1])
     with p1:
-        profile_name = st.text_input("Имя профиля шаблона", value=f"{channel_code}_default")
+        category_suffix = re.sub(r"[^a-z0-9]+", "_", str(category_code or "default").lower()).strip("_") or "default"
+        profile_name = st.text_input("Имя профиля шаблона", value=f"{(channel_code or 'client')}_{category_suffix}")
     with p2:
-        profile_options = [None] + [p["id"] for p in existing_profiles]
+        profile_options = [None] + [p["id"] for p in category_profiles]
         selected_profile_id = st.selectbox(
             "Загрузить сохранённый профиль",
             options=profile_options,
             format_func=lambda x: "-- нет --" if x is None else next(
                 (
                     f"{p['profile_name']} | канал={p.get('channel_code') or '-'} | категория={p.get('category_code') or '-'} (#{p['id']})"
-                    for p in existing_profiles
+                    for p in category_profiles
                     if p["id"] == x
                 ),
                 str(x),
@@ -6634,9 +6704,11 @@ def show_template_tab():
         )
 
     st.caption("Категория профиля берётся из Ozon-эталона (`ozon:description_category_id:type_id`).")
+    if not client_codes and not channel_code:
+        st.info("В базе пока нет клиентов. Создай первого клиента и привяжи к нему шаблон.")
     if not all_profiles:
         st.warning("В текущей БД пока нет сохранённых профилей шаблонов.")
-    elif not existing_profiles and profile_scope == "Текущий канал":
+    elif channel_code and not existing_profiles and profile_scope == "Текущий канал":
         channels = sorted(set([str(p.get("channel_code") or "") for p in all_profiles if str(p.get("channel_code") or "").strip()]))
         channels_text = ", ".join(channels[:8]) if channels else "-"
         st.info(
@@ -6644,10 +6716,51 @@ def show_template_tab():
             f"Есть профили в других каналах: {channels_text}. "
             f"Переключи `Показывать профили` на `Все каналы`."
         )
+    if not channel_code:
+        st.info("Сначала выбери клиента из базы или создай нового. После этого можно выбирать категорию и шаблон.")
+        conn.close()
+        return
 
-    uploaded = st.file_uploader("Загрузить Excel-шаблон клиента", type=["xlsx", "xls"], key="client_template")
-    if uploaded is None:
-        st.info("После загрузки файла станет доступна кнопка `Сохранить профиль шаблона (текущая схема)` — система запомнит тип шаблона клиента.")
+    saved_template_options = [None] + [int(row["id"]) for row in recent_template_files]
+    selected_saved_template_id = st.selectbox(
+        "Открыть сохранённый Excel-шаблон",
+        options=saved_template_options,
+        format_func=lambda value: "-- нет --" if value is None else next(
+            (
+                f"{row.get('original_file_name') or Path(str(row.get('stored_rel_path') or '')).name} | "
+                f"{row.get('category_code') or '-'} | #{row['id']}"
+                for row in recent_template_files
+                if int(row["id"]) == int(value)
+            ),
+            str(value),
+        ),
+        key="template_saved_file_id",
+    )
+
+    uploaded = st.file_uploader("Загрузить новый Excel-шаблон клиента", type=["xlsx", "xls"], key="client_template")
+    active_template_bytes = None
+    active_template_file_name = None
+    saved_template_row = next((row for row in recent_template_files if int(row["id"]) == int(selected_saved_template_id)), None) if selected_saved_template_id else None
+    saved_template_metadata = get_uploaded_file_metadata(saved_template_row)
+    if uploaded is not None:
+        active_template_bytes = uploaded.getvalue()
+        active_template_file_name = getattr(uploaded, "name", None)
+    elif selected_saved_template_id:
+        active_template_bytes = read_uploaded_file_bytes(conn, int(selected_saved_template_id))
+        if saved_template_row:
+            active_template_file_name = (
+                str(saved_template_row.get("original_file_name") or "").strip()
+                or Path(str(saved_template_row.get("stored_rel_path") or "")).name
+            )
+        else:
+            active_template_file_name = "client_template.xlsx"
+        if active_template_bytes:
+            st.success(f"Используется сохранённый шаблон: `{active_template_file_name}`.")
+        else:
+            st.error("Не удалось прочитать сохранённый шаблон из памяти. Выбери другой или загрузи файл заново.")
+
+    if active_template_bytes is None:
+        st.info("Выбери сохранённый шаблон или загрузи новый Excel-файл клиента.")
     if recent_template_files:
         with st.expander("Недавно загруженные шаблоны клиента", expanded=False):
             recent_template_df = pd.DataFrame(recent_template_files)
@@ -6665,17 +6778,22 @@ def show_template_tab():
             ]
             st.dataframe(with_ru_columns(recent_template_df[recent_template_cols] if recent_template_cols else recent_template_df), use_container_width=True, hide_index=True)
 
-    if uploaded is not None:
-        uploaded_bytes = uploaded.getvalue()
-        safe_uploaded_bytes = sanitize_template_xlsx_bytes(uploaded_bytes)
+    if active_template_bytes is not None:
+        safe_uploaded_bytes = sanitize_template_xlsx_bytes(active_template_bytes)
         workbook = load_workbook(BytesIO(safe_uploaded_bytes), read_only=True, data_only=False)
         template_sheet_options = workbook.sheetnames
         workbook.close()
 
+        default_template_sheet_name = str(saved_template_metadata.get("sheet_name") or "").strip() if saved_template_metadata else ""
+        if default_template_sheet_name not in template_sheet_options:
+            default_template_sheet_name = ""
         template_sheet_name = st.selectbox(
             "Лист шаблона",
             options=template_sheet_options,
             index=(
+                template_sheet_options.index(default_template_sheet_name)
+                if default_template_sheet_name and default_template_sheet_name in template_sheet_options
+                else
                 template_sheet_options.index("Товары")
                 if "Товары" in template_sheet_options
                 else template_sheet_options.index("Шаблон для заполнения")
@@ -6684,7 +6802,9 @@ def show_template_tab():
             ),
             key="template_sheet_name",
         )
-        suggested_data_start_row = detect_template_data_start_row(safe_uploaded_bytes, sheet_name=template_sheet_name)
+        suggested_data_start_row = int(saved_template_metadata.get("data_start_row") or 0) if saved_template_metadata else 0
+        if suggested_data_start_row <= 0:
+            suggested_data_start_row = detect_template_data_start_row(safe_uploaded_bytes, sheet_name=template_sheet_name)
 
         tcfg1, tcfg2 = st.columns(2)
         with tcfg1:
@@ -6707,11 +6827,17 @@ def show_template_tab():
         template_df = read_client_template_dataframe(safe_uploaded_bytes, sheet_name=template_sheet_name)
         template_signature = hashlib.md5(safe_uploaded_bytes).hexdigest()
         template_upload_registry_key = f"{channel_code}|{category_code}|{template_sheet_name}|{template_signature}|upload_saved"
-        if st.session_state.get(template_upload_registry_key) != True:
+        if uploaded is not None and st.session_state.get(template_upload_registry_key) != True:
+            if channel_code:
+                upsert_client_channel(
+                    conn,
+                    client_code=channel_code,
+                    client_name=str(client_map.get(channel_code, {}).get("client_name") or "").strip() or None,
+                )
             persist_uploaded_file(
                 conn=conn,
                 storage_kind="client_template",
-                original_file_name=getattr(uploaded, "name", None),
+                original_file_name=active_template_file_name,
                 file_bytes=safe_uploaded_bytes,
                 channel_code=channel_code or None,
                 category_code=category_code or None,
@@ -6825,12 +6951,18 @@ def show_template_tab():
         save_col1, save_col2 = st.columns([1, 3])
         with save_col1:
             if st.button("Сохранить профиль шаблона (текущая схема)", key="template_save_profile_top", type="primary"):
+                if channel_code:
+                    upsert_client_channel(
+                        conn,
+                        client_code=channel_code,
+                        client_name=str(client_map.get(channel_code, {}).get("client_name") or new_client_name or "").strip() or None,
+                    )
                 profile_id = save_template_profile(
                     conn=conn,
                     profile_name=profile_name,
                     channel_code=channel_code,
                     category_code=category_code or None,
-                    file_name=getattr(uploaded, "name", None),
+                    file_name=active_template_file_name,
                     columns=save_ready_rows,
                 )
                 st.success(f"Профиль шаблона сохранён: #{profile_id}")
@@ -6960,12 +7092,18 @@ def show_template_tab():
                     st.success(f"Сохранено mapping rules: {saved}")
             with s2:
                 if st.button("Сохранить профиль шаблона"):
+                    if channel_code:
+                        upsert_client_channel(
+                            conn,
+                            client_code=channel_code,
+                            client_name=str(client_map.get(channel_code, {}).get("client_name") or new_client_name or "").strip() or None,
+                        )
                     profile_id = save_template_profile(
                         conn=conn,
                         profile_name=profile_name,
                         channel_code=channel_code,
                         category_code=category_code or None,
-                        file_name=getattr(uploaded, 'name', None),
+                        file_name=active_template_file_name,
                         columns=manual_rows,
                     )
                     st.success(f"Профиль шаблона сохранён: #{profile_id}")
@@ -7059,7 +7197,7 @@ def show_template_tab():
                         st.download_button(
                             "Скачать заполненный шаблон",
                             data=export_bytes,
-                            file_name=f"filled_{Path(getattr(uploaded, 'name', 'client_template.xlsx')).name}",
+                            file_name=f"filled_{Path(str(active_template_file_name or 'client_template.xlsx')).name}",
                             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                         )
 

@@ -211,6 +211,7 @@ def list_uploaded_files(
     *,
     storage_kind: str | None = None,
     channel_code: str | None = None,
+    category_code: str | None = None,
     limit: int = 50,
 ) -> list[dict[str, Any]]:
     _ensure_upload_tables(conn)
@@ -222,6 +223,9 @@ def list_uploaded_files(
     if channel_code:
         where.append("channel_code = ?")
         params.append(str(channel_code))
+    if category_code is not None:
+        where.append("IFNULL(category_code, '') = IFNULL(?, '')")
+        params.append(str(category_code))
     sql = "SELECT * FROM uploaded_files"
     if where:
         sql += " WHERE " + " AND ".join(where)
@@ -229,6 +233,38 @@ def list_uploaded_files(
     params.append(int(limit))
     rows = conn.execute(sql, tuple(params)).fetchall()
     return [dict(r) for r in rows]
+
+
+def get_uploaded_file(conn: sqlite3.Connection, file_id: int) -> dict[str, Any] | None:
+    _ensure_upload_tables(conn)
+    row = conn.execute("SELECT * FROM uploaded_files WHERE id = ? LIMIT 1", (int(file_id),)).fetchone()
+    return dict(row) if row else None
+
+
+def get_uploaded_file_metadata(uploaded_file_row: dict[str, Any] | None) -> dict[str, Any]:
+    if not uploaded_file_row:
+        return {}
+    raw = uploaded_file_row.get("metadata_json")
+    if raw in (None, ""):
+        return {}
+    try:
+        payload = json.loads(raw)
+    except Exception:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def read_uploaded_file_bytes(conn: sqlite3.Connection, file_id: int) -> bytes | None:
+    row = get_uploaded_file(conn, file_id)
+    if not row:
+        return None
+    stored_path = Path(str(row.get("stored_rel_path") or "").strip())
+    if not stored_path.exists() or not stored_path.is_file():
+        return None
+    try:
+        return stored_path.read_bytes()
+    except Exception:
+        return None
 
 
 def record_catalog_import_history(

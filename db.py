@@ -192,6 +192,7 @@ def _db_state_summary(path: Path) -> dict[str, int] | None:
             return {
                 "products": 0,
                 "product_attribute_values": 0,
+                "client_channels": 0,
                 "template_profiles": 0,
                 "channel_mapping_rules": 0,
                 "channel_attribute_requirements": 0,
@@ -209,6 +210,7 @@ def _db_state_summary(path: Path) -> dict[str, int] | None:
         summary = {
             "products": _safe_count(conn, "products") if "products" in tables else 0,
             "product_attribute_values": _safe_count(conn, "product_attribute_values") if "product_attribute_values" in tables else 0,
+            "client_channels": _safe_count(conn, "client_channels") if "client_channels" in tables else 0,
             "template_profiles": _safe_count(conn, "template_profiles") if "template_profiles" in tables else 0,
             "channel_mapping_rules": _safe_count(conn, "channel_mapping_rules") if "channel_mapping_rules" in tables else 0,
             "channel_attribute_requirements": _safe_count(conn, "channel_attribute_requirements") if "channel_attribute_requirements" in tables else 0,
@@ -225,6 +227,7 @@ def _db_state_summary(path: Path) -> dict[str, int] | None:
         summary["score"] = (
             summary["products"] * 1000
             + summary["product_attribute_values"] * 30
+            + summary["client_channels"] * 60
             + summary["template_profiles"] * 200
             + summary["channel_mapping_rules"] * 120
             + summary["channel_attribute_requirements"] * 10
@@ -770,6 +773,7 @@ def _merge_db_into_preferred(preferred: Path, source: Path) -> None:
         source_conn.row_factory = sqlite3.Row
 
         _merge_upsert_table(target_conn, source_conn, "attribute_definitions", ["code"], prefer_latest_updated_at=True)
+        _merge_upsert_table(target_conn, source_conn, "client_channels", ["client_code"], prefer_latest_updated_at=True)
         _merge_upsert_table(target_conn, source_conn, "channel_profiles", ["channel_code"], prefer_latest_updated_at=True)
         _merge_upsert_table(target_conn, source_conn, "channel_attribute_requirements", ["channel_code", "category_code", "attribute_code"], prefer_latest_updated_at=True)
         _merge_upsert_table(target_conn, source_conn, "channel_mapping_rules", ["channel_code", "category_code", "target_field"], prefer_latest_updated_at=True)
@@ -1239,6 +1243,24 @@ def _ensure_ai_connection_profiles_table(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_ai_profiles_provider ON ai_connection_profiles(provider)")
 
 
+def _ensure_client_channels_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS client_channels (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            client_code TEXT NOT NULL,
+            client_name TEXT,
+            is_active INTEGER DEFAULT 1,
+            notes TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT
+        )
+        """
+    )
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_client_channels_code_unique ON client_channels(client_code)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_client_channels_active ON client_channels(is_active)")
+
+
 def _ensure_supplier_profiles_table(conn: sqlite3.Connection) -> None:
     conn.execute(
         """
@@ -1688,6 +1710,7 @@ def init_db(conn: sqlite3.Connection) -> None:
     _ensure_attribute_tables(conn)
     _ensure_product_data_sources_table(conn)
     _ensure_system_settings_table(conn)
+    _ensure_client_channels_table(conn)
     _ensure_template_profile_tables(conn)
     _ensure_uploaded_files_tables(conn)
     _ensure_catalog_import_history_table(conn)
