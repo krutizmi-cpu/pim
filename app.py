@@ -912,6 +912,83 @@ def humanize_attribute_code(code: str | None) -> str:
     return " ".join(text.replace("_", " ").split()).capitalize()
 
 
+def _short_text(value: object, max_len: int = 88) -> str:
+    text = str(value or "").strip()
+    if len(text) <= int(max_len):
+        return text
+    return text[: max(0, int(max_len) - 1)].rstrip() + "…"
+
+
+def _parse_status_label(status: object) -> str:
+    value = str(status or "").strip().lower()
+    if value == "success":
+        return "Успех"
+    if value == "error":
+        return "Ошибка"
+    return "Не запускался"
+
+
+def _product_core_fill_stats(product_row) -> tuple[int, int]:
+    fields = [
+        "name",
+        "brand",
+        "description",
+        "image_url",
+        "weight",
+        "length",
+        "width",
+        "height",
+        "tnved_code",
+    ]
+    filled = 0
+    for field_name in fields:
+        value = product_row.get(field_name) if hasattr(product_row, "get") else None
+        if value not in (None, "", 0, 0.0):
+            filled += 1
+    return filled, len(fields)
+
+
+def _product_stage_label(product_row) -> str:
+    has_ozon = bool(
+        int(product_row.get("ozon_description_category_id") or 0) > 0
+        and int(product_row.get("ozon_type_id") or 0) > 0
+    ) if hasattr(product_row, "get") else False
+    parse_status = str(product_row.get("supplier_parse_status") or "").strip().lower() if hasattr(product_row, "get") else ""
+    filled, total = _product_core_fill_stats(product_row)
+    if not has_ozon:
+        return "Нужна Ozon-категория"
+    if parse_status == "success" and filled >= max(6, total - 1):
+        return "Почти готова"
+    if parse_status == "success":
+        return "Нужно добить атрибуты"
+    if parse_status == "error":
+        return "Нужна ручная проверка"
+    return "Готова к заполнению"
+
+
+def build_catalog_operational_view(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+    rows: list[dict[str, object]] = []
+    for _, row in df.iterrows():
+        row_dict = row.to_dict()
+        filled, total = _product_core_fill_stats(row_dict)
+        rows.append(
+            {
+                "article": row_dict.get("article") or row_dict.get("supplier_article") or row_dict.get("internal_article"),
+                "name": _short_text(row_dict.get("name"), 72),
+                "supplier_name": row_dict.get("supplier_name"),
+                "ozon_category_path": _short_text(row_dict.get("ozon_category_path") or row_dict.get("category"), 68),
+                "stage": _product_stage_label(row_dict),
+                "supplier_parse_status": _parse_status_label(row_dict.get("supplier_parse_status")),
+                "photo_status": "Есть" if str(row_dict.get("image_url") or "").strip() else "Нет",
+                "fill_score": f"{filled}/{total}",
+                "updated_at": row_dict.get("updated_at"),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
 def format_source_name_ui(
     source_name: str | None,
     source_type: str | None = None,
@@ -3936,21 +4013,46 @@ def show_catalog_tab():
     media_public_base_url = str(media_settings.get("public_base_url") or "").strip()
 
     ids = df["id"].tolist()
-    selected_id = st.selectbox(
-        "Открыть карточку товара",
-        ids,
-        format_func=lambda x: next(
-            (
-                f"{str(row.get('article') or row.get('supplier_article') or row.get('internal_article') or '-')} | "
-                f"{str(row.get('name') or '-')} | "
-                f"{str(row.get('supplier_name') or '-')} | "
-                f"{str(row.get('ozon_category_path') or row.get('category') or '-')}"
-                for _, row in df.iterrows()
-                if int(row["id"]) == int(x)
-            ),
-            f"ID {x}",
-        ),
-    )
+    with st.container(border=True):
+        st.markdown("### Операционный фокус страницы")
+        focus1, focus2 = st.columns([3, 2])
+        with focus1:
+            selected_id = st.selectbox(
+                "Открыть карточку товара",
+                ids,
+                format_func=lambda x: next(
+                    (
+                        f"{str(row.get('article') or row.get('supplier_article') or row.get('internal_article') or '-')} | "
+                        f"{str(row.get('name') or '-')} | "
+                        f"{str(row.get('supplier_name') or '-')} | "
+                        f"{str(row.get('ozon_category_path') or row.get('category') or '-')}"
+                        for _, row in df.iterrows()
+                        if int(row["id"]) == int(x)
+                    ),
+                    f"ID {x}",
+                ),
+            )
+        with focus2:
+            st.markdown("<br>", unsafe_allow_html=True)
+            if st.button("Открыть выбранный товар в Карточке", type="primary", key="catalog_open_selected_in_card"):
+                st.session_state["selected_product_id"] = int(selected_id)
+                st.session_state["workspace_nav_label"] = "🧾 Карточка"
+                st.rerun()
+
+        selected_row = next((row for _, row in df.iterrows() if int(row["id"]) == int(selected_id)), None)
+        if selected_row is not None:
+            selected_row_dict = selected_row.to_dict()
+            filled_core, total_core = _product_core_fill_stats(selected_row_dict)
+            sf1, sf2, sf3, sf4 = st.columns(4)
+            sf1.metric("Артикул", str(selected_row_dict.get("article") or selected_row_dict.get("supplier_article") or selected_row_dict.get("internal_article") or "-"))
+            sf2.metric("Статус карточки", _product_stage_label(selected_row_dict))
+            sf3.metric("Парсинг", _parse_status_label(selected_row_dict.get("supplier_parse_status")))
+            sf4.metric("Заполнено ядро", f"{filled_core}/{total_core}")
+            st.caption(
+                f"Поставщик: {selected_row_dict.get('supplier_name') or '-'} | "
+                f"Ozon: {selected_row_dict.get('ozon_category_path') or selected_row_dict.get('category') or '-'} | "
+                f"Фото: {'есть' if str(selected_row_dict.get('image_url') or '').strip() else 'нет'}"
+            )
     supplier_candidate_ids = [
         int(row["id"])
         for _, row in df.iterrows()
@@ -4418,22 +4520,37 @@ def show_catalog_tab():
                     key="catalog_export_images_filtered_zip",
                 )
 
-    quick_cols = [
-        c
-        for c in [
-            "article",
-            "supplier_article",
-            "name",
-            "supplier_name",
-            "ozon_category_path",
-            "supplier_parse_status",
-            "updated_at",
-        ]
-        if c in df.columns
-    ]
-    if quick_cols:
+    operational_df = build_catalog_operational_view(df)
+    if operational_df is not None and not operational_df.empty:
         st.markdown("### Быстрый список товаров")
-        st.dataframe(with_ru_columns(df[quick_cols]), use_container_width=True, hide_index=True)
+        st.caption("Список стал короче и ближе к реальной работе: артикул, текущий этап, парсинг, фото и обновление.")
+        op_cols = [
+            c
+            for c in [
+                "article",
+                "name",
+                "supplier_name",
+                "ozon_category_path",
+                "stage",
+                "supplier_parse_status",
+                "photo_status",
+                "fill_score",
+                "updated_at",
+            ]
+            if c in operational_df.columns
+        ]
+        st.dataframe(
+            with_ru_columns(
+                operational_df[op_cols],
+                extra_map={
+                    "stage": "Этап карточки",
+                    "photo_status": "Фото",
+                    "fill_score": "Ядро",
+                },
+            ),
+            use_container_width=True,
+            hide_index=True,
+        )
 
     if selected_id:
         st.session_state["selected_product_id"] = int(selected_id)
@@ -5155,11 +5272,13 @@ def show_product_tab():
     preview_rows = [
         {
             "article": row.get("article") or row.get("supplier_article") or row.get("internal_article"),
-            "name": row.get("name"),
+            "name": _short_text(row.get("name"), 68),
             "supplier_name": row.get("supplier_name"),
             "ozon_category": row.get("ozon_category") or row.get("category"),
             "ozon_subcategory": row.get("ozon_subcategory") or row.get("subcategory"),
-            "supplier_parse_status": row.get("supplier_parse_status"),
+            "stage": _product_stage_label(row),
+            "supplier_parse_status": _parse_status_label(row.get("supplier_parse_status")),
+            "photo_status": "Есть" if str(row.get("image_url") or "").strip() else "Нет",
             "updated_at": row.get("updated_at"),
             "id": row.get("id"),
         }
@@ -5212,7 +5331,30 @@ def show_product_tab():
         conn.close()
         return
 
+    current_gallery_urls = _collect_product_gallery_urls(
+        conn,
+        int(product_id),
+        fallback_image_url=str(product["image_url"] or ""),
+        public_base_url=media_public_base_url,
+    )
+    product_core_filled, product_core_total = _product_core_fill_stats(dict(product))
+
     st.subheader(f"Карточка товара #{product['id']}")
+    navc1, navc2 = st.columns([1, 5])
+    with navc1:
+        if st.button("← В каталог", key=f"product_back_to_catalog_{int(product_id)}"):
+            st.session_state["workspace_nav_label"] = "📚 Каталог"
+            st.rerun()
+    with navc2:
+        st.caption("Если товар найден в каталоге, можно быстро вернуться назад, не теряя текущий выбор по артикулу.")
+
+    ps1, ps2, ps3, ps4, ps5 = st.columns(5)
+    ps1.metric("Артикул", str(product["article"] or product["supplier_article"] or product["internal_article"] or "-"))
+    ps2.metric("Этап", _product_stage_label(dict(product)))
+    ps3.metric("Парсинг", _parse_status_label(product["supplier_parse_status"] if "supplier_parse_status" in product.keys() else None))
+    ps4.metric("Фото", int(len(current_gallery_urls)))
+    ps5.metric("Ядро", f"{int(product_core_filled)}/{int(product_core_total)}")
+
     with st.expander("Текущие настройки парсинга", expanded=False):
         st.caption(
             "Порядок fallback: supplier_url -> Ozon -> Яндекс Маркет -> web -> category stats/defaults. "
@@ -6239,12 +6381,6 @@ def show_product_tab():
     else:
         st.info("Каналы пока не настроены. Добавь канал во вкладке Каналы, затем загрузи клиентский шаблон.")
 
-    current_gallery_urls = _collect_product_gallery_urls(
-        conn,
-        int(product_id),
-        fallback_image_url=str(product["image_url"] or ""),
-        public_base_url=media_public_base_url,
-    )
     if current_gallery_urls:
         st.markdown("### Фото товара")
         st.caption(
@@ -6268,90 +6404,102 @@ def show_product_tab():
     )
 
     with st.form("product_form"):
-        c1, c2, c3 = st.columns(3)
+        supplier_options = [""] + sorted(set(supplier_values + ([str(product["supplier_name"])] if product["supplier_name"] else [])))
+        supplier_default = str(product["supplier_name"] or "")
+        supplier_idx = supplier_options.index(supplier_default) if supplier_default in supplier_options else 0
 
-        with c1:
-            article = st.text_input("Артикул", value=product["article"] or "")
-            internal_article = st.text_input("Внутренний артикул", value=product["internal_article"] or "")
-            supplier_article = st.text_input("Артикул поставщика", value=product["supplier_article"] or "")
-            name = st.text_input("Название", value=product["name"] or "")
-            brand = st.text_input("Бренд", value=product["brand"] or "")
-            supplier_options = [""] + sorted(set(supplier_values + ([str(product["supplier_name"])] if product["supplier_name"] else [])))
-            supplier_default = str(product["supplier_name"] or "")
-            supplier_idx = supplier_options.index(supplier_default) if supplier_default in supplier_options else 0
-            supplier_name = st.selectbox("Поставщик (из базы)", options=supplier_options, index=supplier_idx)
-            barcode = st.text_input("Штрихкод", value=product["barcode"] or "")
-            barcode_source = st.text_input("Источник штрихкода", value=product["barcode_source"] or "")
+        with st.expander("1. Идентификация товара", expanded=True):
+            id1, id2 = st.columns(2)
+            with id1:
+                article = st.text_input("Артикул", value=product["article"] or "")
+                internal_article = st.text_input("Внутренний артикул", value=product["internal_article"] or "")
+                supplier_article = st.text_input("Артикул поставщика", value=product["supplier_article"] or "")
+                name = st.text_input("Название", value=product["name"] or "")
+            with id2:
+                brand = st.text_input("Бренд", value=product["brand"] or "")
+                supplier_name = st.selectbox("Поставщик (из базы)", options=supplier_options, index=supplier_idx)
+                barcode = st.text_input("Штрихкод", value=product["barcode"] or "")
+                barcode_source = st.text_input("Источник штрихкода", value=product["barcode_source"] or "")
+                uom = st.text_input("Ед. изм.", value=product["uom"] or "")
 
-        with c2:
+        with st.expander("2. Категория и Ozon-эталон", expanded=True):
             st.caption(
                 "Если Ozon подобрал каталог неточно, эти поля можно скорректировать вручную. "
                 "Ручное значение сохраняется как `manual` и не должно затираться обычной автопривязкой без force."
             )
             if product["ozon_category_path"]:
                 st.caption(f"Ozon path сейчас: {product['ozon_category_path']}")
-            category = st.text_input(
-                "Категория (ручная корректировка)",
-                value=str(product["category"] or ""),
-                help="Можно ввести своё значение, даже если его ещё нет в списках PIM.",
-            )
-            base_category = st.text_input(
-                "Базовая категория (ручная корректировка)",
-                value=str(product["base_category"] or ""),
-            )
-            subcategory = st.text_input(
-                "Подкатегория (ручная корректировка)",
-                value=str(product["subcategory"] or ""),
-            )
+            cat1, cat2 = st.columns(2)
+            with cat1:
+                category = st.text_input(
+                    "Категория (ручная корректировка)",
+                    value=str(product["category"] or ""),
+                    help="Можно ввести своё значение, даже если его ещё нет в списках PIM.",
+                )
+                base_category = st.text_input(
+                    "Базовая категория (ручная корректировка)",
+                    value=str(product["base_category"] or ""),
+                )
+                subcategory = st.text_input(
+                    "Подкатегория (ручная корректировка)",
+                    value=str(product["subcategory"] or ""),
+                )
+                wheel_diameter_inch = st.number_input(
+                    "Диаметр колеса, inch",
+                    value=float(product["wheel_diameter_inch"] or 0.0),
+                    step=0.5,
+                )
+                tnved_code = st.text_input("ТН ВЭД", value=product["tnved_code"] or "")
+            with cat2:
+                supplier_url = st.text_input("URL поставщика", value=product["supplier_url"] or "")
+                ozon_description_category_id = st.number_input(
+                    "Ozon description_category_id",
+                    min_value=0,
+                    value=int(product["ozon_description_category_id"] or 0),
+                    step=1,
+                )
+                ozon_type_id = st.number_input(
+                    "Ozon type_id",
+                    min_value=0,
+                    value=int(product["ozon_type_id"] or 0),
+                    step=1,
+                )
+                ozon_category_path = st.text_input("Ozon категория (path)", value=product["ozon_category_path"] or "")
+                ozon_category_confidence = st.number_input(
+                    "Уверенность Ozon категории (0..1)",
+                    min_value=0.0,
+                    max_value=1.0,
+                    value=float(product["ozon_category_confidence"] or 0.0),
+                    step=0.01,
+                )
             with st.expander("Подсказки по существующим категориям", expanded=False):
                 st.write(sorted(category_values)[:300] if category_values else ["Справочник категорий пока пуст"])
-            wheel_diameter_inch = st.number_input(
-                "Диаметр колеса, inch",
-                value=float(product["wheel_diameter_inch"] or 0.0),
-                step=0.5,
-            )
-            uom = st.text_input("Ед. изм.", value=product["uom"] or "")
-            supplier_url = st.text_input("URL поставщика", value=product["supplier_url"] or "")
-            ozon_description_category_id = st.number_input(
-                "Ozon description_category_id",
-                min_value=0,
-                value=int(product["ozon_description_category_id"] or 0),
-                step=1,
-            )
-            ozon_type_id = st.number_input(
-                "Ozon type_id",
-                min_value=0,
-                value=int(product["ozon_type_id"] or 0),
-                step=1,
-            )
-            ozon_category_path = st.text_input("Ozon категория (path)", value=product["ozon_category_path"] or "")
-            ozon_category_confidence = st.number_input(
-                "Уверенность Ozon категории (0..1)",
-                min_value=0.0,
-                max_value=1.0,
-                value=float(product["ozon_category_confidence"] or 0.0),
-                step=0.01,
-            )
-            tnved_code = st.text_input("ТН ВЭД", value=product["tnved_code"] or "")
 
-        with c3:
-            weight = st.number_input("Вес, кг", value=float(product["weight"] or 0.0), step=0.1)
-            length = st.number_input("Длина, см", value=float(product["length"] or 0.0), step=1.0)
-            width = st.number_input("Ширина, см", value=float(product["width"] or 0.0), step=1.0)
-            height = st.number_input("Высота, см", value=float(product["height"] or 0.0), step=1.0)
-            package_length = st.number_input("Длина упаковки", value=float(product["package_length"] or 0.0), step=1.0)
-            package_width = st.number_input("Ширина упаковки", value=float(product["package_width"] or 0.0), step=1.0)
-            package_height = st.number_input("Высота упаковки", value=float(product["package_height"] or 0.0), step=1.0)
-            gross_weight = st.number_input("Вес брутто", value=float(product["gross_weight"] or 0.0), step=0.1)
+        with st.expander("3. Логистика и упаковка", expanded=False):
+            lg1, lg2 = st.columns(2)
+            with lg1:
+                weight = st.number_input("Вес, кг", value=float(product["weight"] or 0.0), step=0.1)
+                length = st.number_input("Длина, см", value=float(product["length"] or 0.0), step=1.0)
+                width = st.number_input("Ширина, см", value=float(product["width"] or 0.0), step=1.0)
+                height = st.number_input("Высота, см", value=float(product["height"] or 0.0), step=1.0)
+            with lg2:
+                package_length = st.number_input("Длина упаковки", value=float(product["package_length"] or 0.0), step=1.0)
+                package_width = st.number_input("Ширина упаковки", value=float(product["package_width"] or 0.0), step=1.0)
+                package_height = st.number_input("Высота упаковки", value=float(product["package_height"] or 0.0), step=1.0)
+                gross_weight = st.number_input("Вес брутто", value=float(product["gross_weight"] or 0.0), step=0.1)
 
-        image_url = st.text_input("Фото (основное)", value=normalize_media_reference(product["image_url"] or "", public_base_url=media_public_base_url) or (product["image_url"] or ""))
-        gallery_text = st.text_area(
-            "Галерея фото (по одной ссылке в строке)",
-            value="\n".join(current_gallery_urls),
-            height=130,
-            help="Можно указать 1+ ссылок. Лучше использовать публичные http/https ссылки на .jpg/.jpeg/.png. Если настроен public media URL, локальные пути будут конвертированы в веб-ссылки.",
-        )
-        description = st.text_area("Описание", value=description_initial_value, height=180)
+        with st.expander("4. Фото и описание", expanded=True):
+            image_url = st.text_input(
+                "Фото (основное)",
+                value=normalize_media_reference(product["image_url"] or "", public_base_url=media_public_base_url) or (product["image_url"] or ""),
+            )
+            gallery_text = st.text_area(
+                "Галерея фото (по одной ссылке в строке)",
+                value="\n".join(current_gallery_urls),
+                height=130,
+                help="Можно указать 1+ ссылок. Лучше использовать публичные http/https ссылки на .jpg/.jpeg/.png. Если настроен public media URL, локальные пути будут конвертированы в веб-ссылки.",
+            )
+            description = st.text_area("Описание", value=description_initial_value, height=180)
 
         submitted = st.form_submit_button("Сохранить карточку", type="primary")
 
@@ -6420,7 +6568,10 @@ def show_product_tab():
                 is_manual=True,
             )
             refresh_duplicates_for_product(conn, int(product_id))
+            backup_result = backup_database_file(reason="product_card_manual_save")
             st.success("Сохранено")
+            if backup_result.get("ok"):
+                st.caption(f"Карточка зафиксирована в backup: `{Path(str(backup_result['path'])).name}`")
             st.rerun()
 
     if current_gallery_urls:
