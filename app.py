@@ -99,7 +99,7 @@ def is_likely_blocked_supplier_domain(url: str | None) -> bool:
         except Exception:
             return False
     return False
-from services.template_matching import auto_match_template_columns, apply_saved_mapping_rules, fill_template_dataframe, apply_client_validated_values, fill_template_workbook_bytes, dataframe_to_excel_bytes, detect_template_data_start_row, sanitize_template_xlsx_bytes, read_client_template_dataframe
+from services.template_matching import auto_match_template_columns, apply_saved_mapping_rules, fill_template_dataframe, apply_client_validated_values, fill_template_workbook_bytes, dataframe_to_excel_bytes, detect_template_data_start_row, sanitize_template_xlsx_bytes, read_client_template_dataframe, build_product_value_map
 from services.template_profiles import save_template_profile, list_template_profiles, get_template_profile_columns
 from services.client_registry import list_client_channels, upsert_client_channel
 from services.readiness_service import analyze_template_readiness
@@ -964,6 +964,110 @@ def _product_stage_label(product_row) -> str:
     if parse_status == "error":
         return "Нужна ручная проверка"
     return "Готова к заполнению"
+
+
+def _readiness_value_present(value: object) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, (list, tuple, set, dict)):
+        return bool(value)
+    return value not in (0, 0.0)
+
+
+def compute_quick_ozon_readiness(conn, product_row) -> dict[str, object]:
+    product_id = int(product_row.get("id") or 0) if hasattr(product_row, "get") else 0
+    desc_id = int(product_row.get("ozon_description_category_id") or 0) if hasattr(product_row, "get") else 0
+    type_id = int(product_row.get("ozon_type_id") or 0) if hasattr(product_row, "get") else 0
+    if product_id <= 0 or desc_id <= 0 or type_id <= 0:
+        return {"status": "no_category", "required_total": 0, "required_filled": 0, "readiness_pct": 0, "missing": 0}
+
+    category_code = f"ozon:{desc_id}:{type_id}"
+    req_rows = conn.execute(
+        """
+        SELECT attribute_code, is_required
+        FROM channel_attribute_requirements
+        WHERE channel_code = 'ozon'
+          AND category_code = ?
+        """,
+        (category_code,),
+    ).fetchall()
+    required_codes = [str(row["attribute_code"]) for row in req_rows if int(row["is_required"] or 0) == 1 and str(row["attribute_code"] or "").strip()]
+    if not required_codes:
+        return {"status": "no_requirements", "required_total": 0, "required_filled": 0, "readiness_pct": 0, "missing": 0}
+
+    value_map = build_product_value_map(conn, product_id)
+    filled = 0
+    for code in required_codes:
+        if _readiness_value_present(value_map.get(code)):
+            filled += 1
+    required_total = int(len(required_codes))
+    readiness_pct = round((filled / required_total) * 100) if required_total else 0
+    return {
+        "status": "ok",
+        "required_total": required_total,
+        "required_filled": int(filled),
+        "readiness_pct": int(readiness_pct),
+        "missing": int(required_total - filled),
+    }
+
+
+def compute_best_template_profile_readiness(conn, product_row, limit_profiles: int = 40) -> dict[str, object]:
+    product_id = int(product_row.get("id") or 0) if hasattr(product_row, "get") else 0
+    if product_id <= 0:
+        return {"profiles_total": 0, "best_readiness_pct": 0}
+
+    category_code = ""
+    desc_id = int(product_row.get("ozon_description_category_id") or 0) if hasattr(product_row, "get") else 0
+    type_id = int(product_row.get("ozon_type_id") or 0) if hasattr(product_row, "get") else 0
+    if desc_id > 0 and type_id > 0:
+        category_code = f"ozon:{desc_id}:{type_id}"
+
+    all_profiles = list_template_profiles(conn, channel_code=None)
+    candidate_profiles = [
+        profile
+        for profile in all_profiles
+        if str(profile.get("category_code") or "").strip() == str(category_code or "").strip()
+    ] if category_code else all_profiles
+    candidate_profiles = candidate_profiles[: max(1, int(limit_profiles))]
+    if not candidate_profiles:
+        return {"profiles_total": 0, "best_readiness_pct": 0}
+
+    value_map = build_product_value_map(conn, product_id)
+    best: dict[str, object] | None = None
+    for profile in candidate_profiles:
+        columns = get_template_profile_columns(conn, int(profile["id"]))
+        matched_columns = [
+            col
+            for col in columns
+            if str(col.get("source_type") or "").strip() in {"column", "attribute"}
+            and str(col.get("source_name") or "").strip()
+        ]
+        if not matched_columns:
+            continue
+        filled = 0
+        for col in matched_columns:
+            if _readiness_value_present(value_map.get(str(col.get("source_name") or "").strip())):
+                filled += 1
+        matched_total = int(len(matched_columns))
+        readiness_pct = round((filled / matched_total) * 100) if matched_total else 0
+        row = {
+            "profile_id": int(profile["id"]),
+            "profile_name": str(profile.get("profile_name") or ""),
+            "channel_code": str(profile.get("channel_code") or ""),
+            "matched_columns": matched_total,
+            "filled_columns": int(filled),
+            "missing_columns": int(matched_total - filled),
+            "readiness_pct": int(readiness_pct),
+            "profiles_total": int(len(candidate_profiles)),
+        }
+        if best is None or (int(row["readiness_pct"]), int(row["filled_columns"])) > (int(best["readiness_pct"]), int(best["filled_columns"])):
+            best = row
+
+    if not best:
+        return {"profiles_total": int(len(candidate_profiles)), "best_readiness_pct": 0}
+    return best
 
 
 def build_catalog_operational_view(df: pd.DataFrame) -> pd.DataFrame:
@@ -4013,6 +4117,23 @@ def show_catalog_tab():
     media_public_base_url = str(media_settings.get("public_base_url") or "").strip()
 
     ids = df["id"].tolist()
+    page_selector_options = [int(x) for x in ids]
+    selected_page_ids = st.multiselect(
+        "Выбранные товары на этой странице",
+        options=page_selector_options,
+        default=[int(st.session_state.get("selected_product_id"))] if int(st.session_state.get("selected_product_id") or 0) in page_selector_options else [],
+        format_func=lambda x: next(
+            (
+                f"{str(row.get('article') or row.get('supplier_article') or row.get('internal_article') or '-')} | "
+                f"{_short_text(row.get('name'), 54)}"
+                for _, row in df.iterrows()
+                if int(row["id"]) == int(x)
+            ),
+            f"ID {x}",
+        ),
+        key="catalog_selected_page_ids",
+        help="Используй этот список, если нужно запустить массовое действие только по shortlist, а не по всей странице или всему фильтру.",
+    )
     with st.container(border=True):
         st.markdown("### Операционный фокус страницы")
         focus1, focus2 = st.columns([3, 2])
@@ -4042,17 +4163,43 @@ def show_catalog_tab():
         selected_row = next((row for _, row in df.iterrows() if int(row["id"]) == int(selected_id)), None)
         if selected_row is not None:
             selected_row_dict = selected_row.to_dict()
+            quick_ozon_ready = compute_quick_ozon_readiness(conn, selected_row_dict)
+            quick_template_ready = compute_best_template_profile_readiness(conn, selected_row_dict)
             filled_core, total_core = _product_core_fill_stats(selected_row_dict)
-            sf1, sf2, sf3, sf4 = st.columns(4)
+            sf1, sf2, sf3, sf4, sf5, sf6 = st.columns(6)
             sf1.metric("Артикул", str(selected_row_dict.get("article") or selected_row_dict.get("supplier_article") or selected_row_dict.get("internal_article") or "-"))
             sf2.metric("Статус карточки", _product_stage_label(selected_row_dict))
             sf3.metric("Парсинг", _parse_status_label(selected_row_dict.get("supplier_parse_status")))
             sf4.metric("Заполнено ядро", f"{filled_core}/{total_core}")
+            sf5.metric("Ozon ready", f"{int(quick_ozon_ready.get('readiness_pct') or 0)}%")
+            sf6.metric("Шаблон ready", f"{int(quick_template_ready.get('readiness_pct') or 0)}%")
             st.caption(
                 f"Поставщик: {selected_row_dict.get('supplier_name') or '-'} | "
                 f"Ozon: {selected_row_dict.get('ozon_category_path') or selected_row_dict.get('category') or '-'} | "
                 f"Фото: {'есть' if str(selected_row_dict.get('image_url') or '').strip() else 'нет'}"
             )
+            if int(quick_ozon_ready.get("required_total") or 0) > 0:
+                st.caption(
+                    f"Ozon: заполнено {int(quick_ozon_ready.get('required_filled') or 0)} из {int(quick_ozon_ready.get('required_total') or 0)} обязательных."
+                )
+            if int(quick_template_ready.get("profiles_total") or 0) > 0:
+                st.caption(
+                    f"Лучший клиентский профиль: {quick_template_ready.get('channel_code') or '-'} / "
+                    f"{quick_template_ready.get('profile_name') or '-'} "
+                    f"({int(quick_template_ready.get('filled_columns') or 0)}/{int(quick_template_ready.get('matched_columns') or 0)})."
+                )
+            selected_gallery_urls = _collect_product_gallery_urls(
+                conn,
+                int(selected_row_dict["id"]),
+                fallback_image_url=str(selected_row_dict.get("image_url") or ""),
+                public_base_url=media_public_base_url,
+            )
+            if selected_gallery_urls:
+                gallery_preview = selected_gallery_urls[:4]
+                preview_cols = st.columns(len(gallery_preview))
+                for idx, img_url in enumerate(gallery_preview):
+                    with preview_cols[idx]:
+                        st.image(str(img_url), caption=f"Фото {idx + 1}", use_container_width=True)
     supplier_candidate_ids = [
         int(row["id"])
         for _, row in df.iterrows()
@@ -4084,8 +4231,10 @@ def show_catalog_tab():
         if include_without_url
         else [int(x) for x in filtered_supplier_candidate_ids]
     )
+    selected_shortlist_ids = [int(x) for x in selected_page_ids]
     page_zip_signature = f"page:{int(page)}:{hashlib.sha1(','.join([str(int(x)) for x in ids]).encode('utf-8')).hexdigest()}"
     filtered_zip_signature = f"filtered:{hashlib.sha1(','.join([str(int(x)) for x in all_filtered_candidate_ids]).encode('utf-8')).hexdigest()}"
+    selected_zip_signature = f"selected:{hashlib.sha1(','.join([str(int(x)) for x in selected_shortlist_ids]).encode('utf-8')).hexdigest()}" if selected_shortlist_ids else "selected:none"
     bc1, bc2, bc3 = st.columns(3)
     with bc1:
         max_bulk_enrich_page = st.number_input(
@@ -4125,6 +4274,7 @@ def show_catalog_tab():
     )
     st.caption(
         f"Кандидатов: страница {len(supplier_candidate_ids)}, вся выборка {len(filtered_supplier_candidate_ids)}. "
+        f"выбрано вручную: {len(selected_shortlist_ids)}. "
         f"включая без supplier_url: {len(all_filtered_candidate_ids)}. "
         f"Лимиты: страница {int(max_bulk_enrich_page)}, выборка {int(max_bulk_enrich_filtered)}. "
         f"Ozon перед обогащением: {'вкл' if bool(pre_ozon_before_enrich) else 'выкл'}."
@@ -4355,7 +4505,7 @@ def show_catalog_tab():
             f"источники {source_text}, отложено по лимиту {skipped_by_limit}."
         )
 
-    ai1, ai2 = st.columns(2)
+    ai1, ai2, ai3 = st.columns(3)
     with ai1:
         if st.button("Заполнить текущую страницу", type="primary", help="Основной поток: Ozon категория -> supplier/web -> AI название/описание/атрибуты"):
             run_ai_enrichment_batch(
@@ -4370,9 +4520,16 @@ def show_catalog_tab():
                 run_limit=int(max_bulk_enrich_filtered),
                 run_label="AI / Вся выборка фильтра",
             )
+    with ai3:
+        if st.button("Заполнить выбранные товары", type="primary", help="Запустить основной поток только по отмеченным товарам на этой странице"):
+            run_ai_enrichment_batch(
+                candidate_ids=[int(x) for x in selected_shortlist_ids],
+                run_limit=max(len(selected_shortlist_ids), 1),
+                run_label="AI / Выбранные товары",
+            )
 
     with st.expander("Дополнительные и технические операции", expanded=False):
-        cextra1, cextra2 = st.columns(2)
+        cextra1, cextra2, cextra3 = st.columns(3)
         with cextra1:
             if st.button("Автопривязать Ozon категории (текущая страница)", help="Сначала назначить эталонную Ozon категорию для товаров этой страницы"):
                 res = bulk_assign_ozon_categories(conn, [int(x) for x in ids], min_score=OZON_CATEGORY_MIN_SCORE, force=False)
@@ -4397,8 +4554,20 @@ def show_catalog_tab():
                         f"Слотов Ozon-атрибутов создано: {int(materialized.get('slots_created') or 0)}."
                     )
                 st.rerun()
+        with cextra3:
+            if st.button("Автопривязать Ozon категории (выбранные)", help="Назначить Ozon категорию только отмеченным товарам"):
+                res = bulk_assign_ozon_categories(conn, [int(x) for x in selected_shortlist_ids], min_score=OZON_CATEGORY_MIN_SCORE, force=False)
+                materialized = materialize_ozon_attribute_slots_for_products(conn, [int(x) for x in selected_shortlist_ids])
+                if res.get("message"):
+                    st.info(str(res["message"]))
+                else:
+                    st.success(
+                        f"Ozon автопривязка по выбранным: обработано {res['processed']}, привязано {res['assigned']}, пропущено {res['skipped']}. "
+                        f"Слотов создано: {int(materialized.get('slots_created') or 0)}."
+                    )
+                st.rerun()
 
-        oextra1, oextra2 = st.columns(2)
+        oextra1, oextra2, oextra3 = st.columns(3)
         with oextra1:
             if st.button("Подтянуть Ozon-атрибуты (текущая страница)", help="Подготовить category requirements Ozon для товаров текущей страницы, чтобы атрибуты появились в карточках"):
                 seeded = ensure_ozon_requirements_for_products(conn, [int(x) for x in ids])
@@ -4421,8 +4590,19 @@ def show_catalog_tab():
                     f"импортировано атрибутов {int(seeded.get('imported_attributes') or 0)}, "
                     f"создано слотов атрибутов у товаров {int(materialized.get('slots_created') or 0)}."
                 )
+        with oextra3:
+            if st.button("Подтянуть Ozon-атрибуты (выбранные)", help="Подготовить Ozon-атрибуты только для отмеченных товаров"):
+                seeded = ensure_ozon_requirements_for_products(conn, [int(x) for x in selected_shortlist_ids])
+                materialized = materialize_ozon_attribute_slots_for_products(conn, [int(x) for x in selected_shortlist_ids])
+                st.success(
+                    "Готово по выбранным: "
+                    f"товаров с Ozon-категорией {int(seeded.get('products_with_ozon_category') or 0)} из {int(seeded.get('products_total') or 0)}, "
+                    f"пар категорий {int(seeded.get('category_pairs') or 0)}, "
+                    f"импортировано атрибутов {int(seeded.get('imported_attributes') or 0)}, "
+                    f"создано слотов {int(materialized.get('slots_created') or 0)}."
+                )
 
-        b1, b2, b3 = st.columns(3)
+        b1, b2, b3, b4 = st.columns(4)
         with b1:
             if st.button("Только supplier/web enrichment (страница)", help="Запустить supplier/web enrichment без AI по текущей странице"):
                 run_supplier_enrichment_batch(
@@ -4446,8 +4626,15 @@ def show_catalog_tab():
                     total += 1
                     progress.progress(i / len(ids))
                 st.success(f"Проверка дублей завершена: {total} товаров")
+        with b4:
+            if st.button("Только supplier/web enrichment (выбранные)", help="Запустить supplier/web enrichment без AI только по отмеченным товарам"):
+                run_supplier_enrichment_batch(
+                    candidate_ids=[int(x) for x in selected_shortlist_ids],
+                    run_limit=max(len(selected_shortlist_ids), 1),
+                    run_label="Выбранные товары",
+                )
 
-        d1, d2 = st.columns(2)
+        d1, d2, d3 = st.columns(3)
         with d1:
             if st.button("Рассчитать габариты/вес (текущая страница)", help="Заполнить пустые логистические поля товара статистикой похожих товаров и типовыми значениями."):
                 run_dimension_estimation_batch(
@@ -4462,7 +4649,14 @@ def show_catalog_tab():
                     run_limit=int(max_bulk_enrich_filtered),
                     run_label="Вся выборка фильтра",
                 )
-        z1, z2 = st.columns(2)
+        with d3:
+            if st.button("Рассчитать габариты/вес (выбранные)", help="Рассчитать логистику только по отмеченным товарам"):
+                run_dimension_estimation_batch(
+                    candidate_ids=[int(x) for x in selected_shortlist_ids],
+                    run_limit=max(len(selected_shortlist_ids), 1),
+                    run_label="Выбранные товары",
+                )
+        z1, z2, z3 = st.columns(3)
         with z1:
             if st.button("Подготовить ZIP фото текущей страницы", key="catalog_prepare_images_page_zip"):
                 zip_page_bytes, zip_page_stats = build_product_images_zip(
@@ -4519,6 +4713,34 @@ def show_catalog_tab():
                     mime="application/zip",
                     key="catalog_export_images_filtered_zip",
                 )
+        with z3:
+            if st.button("Подготовить ZIP фото выбранных", key="catalog_prepare_images_selected_zip"):
+                zip_selected_bytes, zip_selected_stats = build_product_images_zip(
+                    conn,
+                    [int(x) for x in selected_shortlist_ids],
+                    public_base_url=media_public_base_url,
+                )
+                st.session_state["catalog_selected_zip_bytes"] = zip_selected_bytes
+                st.session_state["catalog_selected_zip_stats"] = zip_selected_stats
+                st.session_state["catalog_selected_zip_signature"] = selected_zip_signature
+                if int(zip_selected_stats.get("images_written") or 0) > 0:
+                    st.success(
+                        f"ZIP по выбранным подготовлен. Фото: {int(zip_selected_stats.get('images_written') or 0)}, "
+                        f"пропущено: {int(zip_selected_stats.get('images_skipped') or 0)}."
+                    )
+                else:
+                    st.warning("Для выбранных товаров не удалось собрать публичные фото в ZIP.")
+            if (
+                st.session_state.get("catalog_selected_zip_signature") == selected_zip_signature
+                and st.session_state.get("catalog_selected_zip_bytes")
+            ):
+                st.download_button(
+                    "Скачать фото выбранных ZIP",
+                    data=st.session_state["catalog_selected_zip_bytes"],
+                    file_name="pim_product_images_selected.zip",
+                    mime="application/zip",
+                    key="catalog_export_images_selected_zip",
+                )
 
     operational_df = build_catalog_operational_view(df)
     if operational_df is not None and not operational_df.empty:
@@ -4561,9 +4783,9 @@ def show_catalog_tab():
         with mm1:
             scope = st.selectbox(
                 "Область применения",
-                options=["Текущая страница", "Вся выборка по фильтру"],
+                options=["Выбранные товары", "Текущая страница", "Вся выборка по фильтру"],
                 key="mass_edit_scope",
-                help="Текущая страница: только видимые товары. Вся выборка: все товары по текущим фильтрам.",
+                help="Выбранные товары: только shortlist на этой странице. Текущая страница: только видимые товары. Вся выборка: все товары по текущим фильтрам.",
             )
             only_empty = st.checkbox(
                 "Заполнять только пустые поля",
@@ -4625,7 +4847,9 @@ def show_catalog_tab():
             key="mass_edit_apply_btn",
         )
         if apply_mass:
-            if scope == "Текущая страница":
+            if scope == "Выбранные товары":
+                target_ids = [int(x) for x in selected_shortlist_ids]
+            elif scope == "Текущая страница":
                 target_ids = [int(x) for x in ids]
             else:
                 target_ids = load_product_ids(
@@ -5496,6 +5720,20 @@ def show_product_tab():
     top2.metric("Бренд", product["brand"] or "-")
     top3.metric("Категория", product["ozon_category_path"] or product["base_category"] or product["category"] or "-")
     top4.metric("Поставщик", product["supplier_name"] or "-")
+
+    exact_ozon_ready = compute_quick_ozon_readiness(conn, dict(product))
+    best_template_ready = compute_best_template_profile_readiness(conn, dict(product))
+    ready1, ready2, ready3, ready4 = st.columns(4)
+    ready1.metric("Ozon ready", f"{int(exact_ozon_ready.get('readiness_pct') or 0)}%")
+    ready2.metric("Ozon обязательные", f"{int(exact_ozon_ready.get('required_filled') or 0)}/{int(exact_ozon_ready.get('required_total') or 0)}")
+    ready3.metric("Лучший шаблон", f"{int(best_template_ready.get('readiness_pct') or 0)}%")
+    ready4.metric("Профилей по категории", int(best_template_ready.get("profiles_total") or 0))
+    if int(best_template_ready.get("profiles_total") or 0) > 0:
+        st.caption(
+            f"Лучший клиентский профиль сейчас: {best_template_ready.get('channel_code') or '-'} / "
+            f"{best_template_ready.get('profile_name') or '-'} "
+            f"({int(best_template_ready.get('filled_columns') or 0)}/{int(best_template_ready.get('matched_columns') or 0)})."
+        )
 
     mainc1, mainc2 = st.columns([1, 2])
     with mainc1:
@@ -6387,13 +6625,19 @@ def show_product_tab():
             f"Найдено фото: {len(current_gallery_urls)}. "
             "Ниже быстрый просмотр того, что сейчас лежит в карточке и галерее."
         )
-        preview_urls = current_gallery_urls[:8]
-        preview_cols = st.columns(min(4, max(1, len(preview_urls))))
-        for idx, img_url in enumerate(preview_urls):
-            with preview_cols[idx % len(preview_cols)]:
-                st.image(str(img_url), caption=f"Фото {idx + 1}", use_container_width=True)
+        hero_img, thumb_wrap = st.columns([1.2, 1.8])
+        with hero_img:
+            st.image(str(current_gallery_urls[0]), caption="Главное фото", use_container_width=True)
+        with thumb_wrap:
+            preview_urls = current_gallery_urls[:8]
+            preview_cols = st.columns(min(4, max(1, len(preview_urls))))
+            for idx, img_url in enumerate(preview_urls):
+                with preview_cols[idx % len(preview_cols)]:
+                    st.image(str(img_url), caption=f"Фото {idx + 1}", use_container_width=True)
         if len(current_gallery_urls) > len(preview_urls):
             st.caption(f"Показаны первые {len(preview_urls)} из {len(current_gallery_urls)} фото.")
+        with st.expander("Ссылки на фото", expanded=False):
+            st.code("\n".join([str(url) for url in current_gallery_urls]), language="text")
     else:
         st.info("Фото в карточке пока нет. После supplier/web/AI обогащения тут появится быстрый просмотр.")
     prefill_description = st.session_state.pop(f"ai_description_prefill_{int(product_id)}", None)
