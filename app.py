@@ -448,6 +448,11 @@ def render_sidebar_navigation(summary: dict[str, object]) -> str:
     return nav_map[selected_label]
 
 
+def request_workspace_navigation(nav_label: str) -> None:
+    st.session_state["workspace_nav_target"] = str(nav_label)
+    st.rerun()
+
+
 def render_workspace_hero(section_key: str, summary: dict[str, object]) -> None:
     section_meta = {
         "import": ("Поступление и фиксация памяти", "Загрузи прайс, зафиксируй поставщика, сохрани импорт в каталог и сразу закрепи память в БД."),
@@ -4158,8 +4163,7 @@ def show_catalog_tab():
             st.markdown("<br>", unsafe_allow_html=True)
             if st.button("Открыть выбранный товар в Карточке", type="primary", key="catalog_open_selected_in_card"):
                 st.session_state["selected_product_id"] = int(selected_id)
-                st.session_state["workspace_nav_label"] = "🧾 Карточка"
-                st.rerun()
+                request_workspace_navigation("🧾 Карточка")
 
         selected_row = next((row for _, row in df.iterrows() if int(row["id"]) == int(selected_id)), None)
         if selected_row is not None:
@@ -5568,8 +5572,7 @@ def show_product_tab():
     navc1, navc2 = st.columns([1, 5])
     with navc1:
         if st.button("← В каталог", key=f"product_back_to_catalog_{int(product_id)}"):
-            st.session_state["workspace_nav_label"] = "📚 Каталог"
-            st.rerun()
+            request_workspace_navigation("📚 Каталог")
     with navc2:
         st.caption("Если товар найден в каталоге, можно быстро вернуться назад, не теряя текущий выбор по артикулу.")
 
@@ -8050,8 +8053,7 @@ def show_template_tab():
                     with a2:
                         if st.button("Открыть товар в карточке", key="gap_open_product"):
                             st.session_state["selected_product_id"] = int(action_product_id)
-                            st.session_state["workspace_nav_label"] = "🧾 Карточка"
-                            st.rerun()
+                            request_workspace_navigation("🧾 Карточка")
 
     conn.close()
 
@@ -9836,6 +9838,9 @@ def show_channels_tab():
 
 def main():
     apply_app_theme()
+    pending_nav_target = st.session_state.pop("workspace_nav_target", None)
+    if pending_nav_target:
+        st.session_state["workspace_nav_label"] = str(pending_nav_target)
     shell_conn = get_db()
     summary = build_workspace_summary(shell_conn)
     shell_conn.close()
