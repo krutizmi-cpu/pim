@@ -90,6 +90,12 @@ PIM-система для контент-отдела, где:
   - менеджер не должен вручную вспоминать и вводить код клиента каждый раз;
   - список клиентов должен браться из БД, с возможностью создать нового клиента прямо в UI;
   - сценарий `Клиентский шаблон` должен позволять открыть уже сохранённый Excel по связке `клиент + категория` без повторной загрузки файла.
+- Detmir как клиентский overlay, а не второй canonical core:
+  - правило проекта сохраняется: `Ozon = эталон категорий и атрибутов`;
+  - `Детский Мир` подключается как клиент с собственными category requirements и карточками, но не как новый master-источник товаров;
+  - для Detmir теперь есть read-only API-sync в `Каналы`: дерево категорий, категории с атрибутами, значения справочников и кэш карточек товаров;
+  - Detmir schema и content-card snapshots должны сохраняться в постоянной БД и переживать рестарт/деплой так же, как Ozon cache и клиентские шаблоны;
+  - импорт Detmir category requirements в PIM должен идти в overlay-слой (`channel_attribute_requirements`, `channel_mapping_rules`) без смены Ozon-ядра.
 - AI-провайдеры:
   - базовые AI-настройки по-прежнему хранятся в `system_settings`;
   - дополнительно нужны именованные `ai_connection_profiles`, потому что у NVIDIA/OpenRouter/OpenAI-compatible сценариев токены и модели могут часто меняться.
@@ -181,6 +187,12 @@ PIM-система для контент-отдела, где:
 - `ozon_attribute_value_cache`
 - `ozon_update_jobs`, `ozon_update_job_items` (если используется отправка)
 
+### Detmir кэш
+- `detmir_category_cache`
+- `detmir_attribute_cache`
+- `detmir_attribute_value_cache`
+- `detmir_product_cache`
+
 ### Системные настройки
 - `system_settings` (в т.ч. parser config)
 
@@ -269,6 +281,10 @@ PIM-система для контент-отдела, где:
 9. После каждого изменения:
    - `python -m py_compile app.py services/*.py`
    - commit + push.
+10. Для Detmir API:
+   - не тащить Detmir в роль второго PIM-ядра;
+   - использовать его как источник клиентской схемы и read-only снимков карточек;
+   - если позже появится запись обратно в Detmir API, делать её отдельным слоем publish/export.
 
 ## 9) Быстрый smoke-check перед релизом
 

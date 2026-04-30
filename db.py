@@ -205,6 +205,10 @@ def _db_state_summary(path: Path) -> dict[str, int] | None:
                 "ozon_category_cache": 0,
                 "ozon_attribute_cache": 0,
                 "ozon_attribute_value_cache": 0,
+                "detmir_category_cache": 0,
+                "detmir_attribute_cache": 0,
+                "detmir_attribute_value_cache": 0,
+                "detmir_product_cache": 0,
                 "supplier_profiles": 0,
                 "product_registry_documents": 0,
                 "score": 0,
@@ -223,6 +227,10 @@ def _db_state_summary(path: Path) -> dict[str, int] | None:
             "ozon_category_cache": _safe_count(conn, "ozon_category_cache") if "ozon_category_cache" in tables else 0,
             "ozon_attribute_cache": _safe_count(conn, "ozon_attribute_cache") if "ozon_attribute_cache" in tables else 0,
             "ozon_attribute_value_cache": _safe_count(conn, "ozon_attribute_value_cache") if "ozon_attribute_value_cache" in tables else 0,
+            "detmir_category_cache": _safe_count(conn, "detmir_category_cache") if "detmir_category_cache" in tables else 0,
+            "detmir_attribute_cache": _safe_count(conn, "detmir_attribute_cache") if "detmir_attribute_cache" in tables else 0,
+            "detmir_attribute_value_cache": _safe_count(conn, "detmir_attribute_value_cache") if "detmir_attribute_value_cache" in tables else 0,
+            "detmir_product_cache": _safe_count(conn, "detmir_product_cache") if "detmir_product_cache" in tables else 0,
             "supplier_profiles": _safe_count(conn, "supplier_profiles") if "supplier_profiles" in tables else 0,
             "product_registry_documents": _safe_count(conn, "product_registry_documents") if "product_registry_documents" in tables else 0,
         }
@@ -240,6 +248,10 @@ def _db_state_summary(path: Path) -> dict[str, int] | None:
             + summary["ozon_category_cache"] * 5
             + summary["ozon_attribute_cache"] * 2
             + summary["ozon_attribute_value_cache"]
+            + summary["detmir_category_cache"] * 5
+            + summary["detmir_attribute_cache"] * 2
+            + summary["detmir_attribute_value_cache"]
+            + summary["detmir_product_cache"] * 3
             + summary["supplier_profiles"] * 20
             + summary["product_registry_documents"] * 25
         )
@@ -691,6 +703,35 @@ def _merge_ozon_caches(target_conn: sqlite3.Connection, source_conn: sqlite3.Con
         )
 
 
+def _merge_detmir_caches(target_conn: sqlite3.Connection, source_conn: sqlite3.Connection) -> None:
+    cache_specs = [
+        (
+            "detmir_category_cache",
+            ["category_id"],
+        ),
+        (
+            "detmir_attribute_cache",
+            ["category_id", "attribute_id", "is_variant_attribute"],
+        ),
+        (
+            "detmir_attribute_value_cache",
+            ["attribute_key", "value_key"],
+        ),
+        (
+            "detmir_product_cache",
+            ["product_id"],
+        ),
+    ]
+    for table_name, key_columns in cache_specs:
+        _merge_upsert_table(
+            target_conn=target_conn,
+            source_conn=source_conn,
+            table_name=table_name,
+            key_columns=key_columns,
+            prefer_latest_updated_at=True,
+        )
+
+
 def _merge_product_linked_tables(
     target_conn: sqlite3.Connection,
     source_conn: sqlite3.Connection,
@@ -790,6 +831,7 @@ def _merge_db_into_preferred(preferred: Path, source: Path) -> None:
         _merge_product_attribute_values(target_conn, source_conn, product_id_map)
         _merge_product_linked_tables(target_conn, source_conn, product_id_map)
         _merge_ozon_caches(target_conn, source_conn)
+        _merge_detmir_caches(target_conn, source_conn)
         target_conn.commit()
     except Exception:
         if target_conn is not None:
@@ -1508,6 +1550,145 @@ def _ensure_ozon_catalog_mapping_memory_table(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_ocmm_supplier ON ozon_catalog_mapping_memory(supplier_name)")
 
 
+def _ensure_detmir_tables(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS detmir_category_cache (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            category_id INTEGER NOT NULL UNIQUE,
+            name TEXT,
+            full_path TEXT,
+            parent_id INTEGER,
+            level INTEGER,
+            published INTEGER DEFAULT 0,
+            product_type_name TEXT,
+            dimension_type TEXT,
+            is_dimensional INTEGER DEFAULT 0,
+            is_non_dimensional INTEGER DEFAULT 0,
+            children_count INTEGER DEFAULT 0,
+            is_leaf INTEGER DEFAULT 0,
+            updated_remote_at TEXT,
+            attributes_count INTEGER DEFAULT 0,
+            variant_attributes_count INTEGER DEFAULT 0,
+            blocks_count INTEGER DEFAULT 0,
+            site_name_data_json TEXT,
+            raw_json TEXT,
+            fetched_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_detmir_cat_parent ON detmir_category_cache(parent_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_detmir_cat_path ON detmir_category_cache(full_path)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_detmir_cat_leaf ON detmir_category_cache(is_leaf)")
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS detmir_attribute_cache (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            category_id INTEGER NOT NULL,
+            attribute_id INTEGER NOT NULL,
+            attribute_key TEXT NOT NULL,
+            attribute_name TEXT,
+            vendor_description TEXT,
+            data_type TEXT,
+            is_required INTEGER DEFAULT 0,
+            min_value REAL,
+            max_value REAL,
+            min_length INTEGER,
+            max_length INTEGER,
+            decimal_places INTEGER,
+            could_be_negative INTEGER DEFAULT 0,
+            regexp_json TEXT,
+            restriction_type TEXT,
+            restriction_keys_json TEXT,
+            feature_type TEXT,
+            available_for_union INTEGER DEFAULT 0,
+            transitive INTEGER DEFAULT 0,
+            auto_moderation INTEGER DEFAULT 0,
+            is_variant_attribute INTEGER DEFAULT 0,
+            block_names_json TEXT,
+            visibility_rule_json TEXT,
+            raw_json TEXT,
+            fetched_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_detmir_attr_unique
+        ON detmir_attribute_cache(category_id, attribute_id, is_variant_attribute)
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_detmir_attr_cat ON detmir_attribute_cache(category_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_detmir_attr_key ON detmir_attribute_cache(attribute_key)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_detmir_attr_required ON detmir_attribute_cache(is_required)")
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS detmir_attribute_value_cache (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            attribute_key TEXT NOT NULL,
+            value_key TEXT NOT NULL,
+            value_label TEXT,
+            raw_json TEXT,
+            fetched_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_detmir_attr_value_unique
+        ON detmir_attribute_value_cache(attribute_key, value_key)
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_detmir_attr_value_attr ON detmir_attribute_value_cache(attribute_key)")
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS detmir_product_cache (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            product_id INTEGER NOT NULL UNIQUE,
+            mastercard_id TEXT,
+            sku_id TEXT,
+            product_code TEXT,
+            contract_number TEXT,
+            category_id INTEGER,
+            commission_category_code TEXT,
+            commission_category_full_name TEXT,
+            title TEXT,
+            site_name TEXT,
+            barcodes_json TEXT,
+            attributes_json TEXT,
+            sizes_json TEXT,
+            prices_json TEXT,
+            photos_json TEXT,
+            photo_session_status TEXT,
+            certificates_json TEXT,
+            sales_scheme_json TEXT,
+            status TEXT,
+            rejection_info_json TEXT,
+            archive INTEGER DEFAULT 0,
+            blocked_json TEXT,
+            fbo_stock_level INTEGER,
+            fbs_stock_level INTEGER,
+            reviews_count INTEGER,
+            created_remote_at TEXT,
+            updated_remote_at TEXT,
+            marking INTEGER DEFAULT 0,
+            raw_json TEXT,
+            fetched_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_detmir_product_cat ON detmir_product_cache(category_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_detmir_product_status ON detmir_product_cache(status)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_detmir_product_code ON detmir_product_cache(product_code)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_detmir_product_updated ON detmir_product_cache(updated_remote_at)")
+
 
 def _ensure_channel_tables(conn: sqlite3.Connection) -> None:
     conn.execute(
@@ -1722,6 +1903,7 @@ def init_db(conn: sqlite3.Connection) -> None:
     _ensure_product_registry_documents_table(conn)
     _ensure_ozon_tables(conn)
     _ensure_ozon_catalog_mapping_memory_table(conn)
+    _ensure_detmir_tables(conn)
     _ensure_channel_tables(conn)
 
     _seed_category_defaults(conn)

@@ -55,6 +55,12 @@
   - после критичных операций (`Импорт`, сохранение клиентского профиля/мэппинга, ключевые Ozon sync/restore) PIM фиксирует SQLite backup в `~/.pim/backups/db/`;
   - snapshot Ozon сохраняется не только на скачивание, но и во внутреннюю память сервиса в `~/.pim/backups/ozon/`;
   - сохранённые Ozon snapshot можно повторно открыть и восстановить без повторной загрузки файла с компьютера.
+- Detmir API как клиентский overlay:
+  - в `Каналы` появился read-only блок `Детский Мир API`;
+  - можно сохранить `client_id/api_key`, проверить соединение и синхронизировать Detmir schema и карточки;
+  - в память PIM сохраняются кэши `detmir_category_cache`, `detmir_attribute_cache`, `detmir_attribute_value_cache`, `detmir_product_cache`;
+  - Detmir не становится вторым master-ядром: его категории и атрибуты подтягиваются как клиентские требования поверх Ozon-эталона;
+  - для выбранной Detmir-категории можно импортировать channel requirements и стартовые mapping rules в PIM.
 
 ## Инструкция по разделам
 
@@ -121,6 +127,10 @@
 7. `Каналы`
 - Поддержка channel requirements и mapping rules.
 - Повторное использование правил при новых выгрузках.
+- Detmir API:
+  - сохранение `client_id/api_key` в системных настройках или чтение key из env;
+  - read-only sync дерева категорий, категорий с атрибутами, справочных значений и карточек товаров;
+  - импорт Detmir category requirements в overlay-слой PIM (`channel_attribute_requirements` + стартовые `mapping rules`).
 - AI-настройки:
   - выбор провайдера/модели;
   - API key (из UI или env);

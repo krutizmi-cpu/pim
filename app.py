@@ -130,6 +130,23 @@ from services.certificate_registry import (
 )
 from services.ozon_api_service import is_configured, sync_category_tree, list_cached_categories, list_cached_category_pairs, get_ozon_cache_stats, get_ozon_sync_coverage, sync_missing_category_attributes, sync_category_attributes, list_cached_attributes, sync_attribute_dictionary_values, sync_all_category_dictionary_values, list_cached_attribute_values, import_cached_attributes_to_pim, import_all_cached_attributes_to_pim, suggest_mappings_for_cached_attributes, save_suggested_mappings, analyze_product_ozon_coverage, ensure_ozon_master_attributes, build_product_ozon_payload, materialize_product_ozon_attributes, preview_product_ozon_dictionary_gaps, build_product_ozon_api_attributes, build_bulk_ozon_api_payloads, build_ozon_attributes_update_request, submit_ozon_attributes_update, list_ozon_update_jobs, get_ozon_update_job, retry_ozon_update_job, list_ozon_update_job_items, save_dictionary_override, list_dictionary_overrides, delete_dictionary_override, sync_all_categories_and_attributes
 from services.ozon_category_match import bulk_assign_ozon_categories
+from services.detmir_api_service import (
+    load_detmir_settings,
+    save_detmir_settings,
+    is_configured as detmir_is_configured,
+    check_connection as check_detmir_connection,
+    sync_category_tree as sync_detmir_category_tree,
+    sync_categories_with_attributes,
+    sync_attribute_values as sync_detmir_attribute_values,
+    sync_all_attribute_values as sync_all_detmir_attribute_values,
+    sync_products as sync_detmir_products,
+    list_cached_categories as list_detmir_cached_categories,
+    list_cached_attributes as list_detmir_cached_attributes,
+    list_cached_attribute_values as list_detmir_cached_attribute_values,
+    list_cached_products as list_detmir_cached_products,
+    get_detmir_cache_stats,
+    import_category_requirements_to_pim as import_detmir_category_requirements_to_pim,
+)
 from services.dimension_fallback import infer_category_fields, infer_dimensions_from_catalog, infer_dimensions_from_category_defaults, is_dimension_payload_suspicious
 from services.ai_content_service import (
     load_ai_settings,
@@ -387,6 +404,7 @@ code, pre, .pim-mono {
 
 def build_workspace_summary(conn) -> dict[str, object]:
     stats = get_ozon_cache_stats(conn)
+    detmir_stats = get_detmir_cache_stats(conn)
     products_total = int(conn.execute("SELECT COUNT(*) AS total FROM products").fetchone()["total"] or 0)
     imports_total = int(conn.execute("SELECT COUNT(*) AS total FROM catalog_import_history").fetchone()["total"] or 0)
     template_profiles_total = int(conn.execute("SELECT COUNT(*) AS total FROM template_profiles").fetchone()["total"] or 0)
@@ -407,6 +425,8 @@ def build_workspace_summary(conn) -> dict[str, object]:
         "ozon_pairs_total": int(stats.get("category_pairs") or 0),
         "ozon_attributes_total": int(stats.get("attributes_total") or 0),
         "ozon_backups_total": ozon_backups_total,
+        "detmir_categories_total": int(detmir_stats.get("detmir_category_cache") or 0),
+        "detmir_products_total": int(detmir_stats.get("detmir_product_cache") or 0),
         "active_db_path": str(_get_active_db_path() or Path("data/catalog.db")),
     }
 
@@ -9737,6 +9757,426 @@ def show_channels_tab():
             )
             st.success("Настройки фото сохранены.")
             st.rerun()
+
+    with st.expander("Детский Мир API: схема клиента и карточки", expanded=False):
+        st.caption(
+            "Детский Мир для PIM остаётся клиентским overlay поверх Ozon-ядра. "
+            "Здесь мы read-only подтягиваем схему клиента: категории, атрибуты, значения справочников и текущие карточки товаров."
+        )
+        detmir_settings = load_detmir_settings(conn)
+        detmir_stats = get_detmir_cache_stats(conn)
+        det1, det2, det3, det4 = st.columns(4)
+        with det1:
+            detmir_client_id = st.text_input(
+                "Detmir Client ID",
+                value=str(detmir_settings.get("client_id") or ""),
+                key="detmir_client_id_input",
+            )
+        with det2:
+            detmir_api_key = st.text_input(
+                "Detmir API key",
+                value=str(detmir_settings.get("api_key") or ""),
+                type="password",
+                key="detmir_api_key_input",
+            )
+        with det3:
+            detmir_use_env = st.checkbox(
+                "Брать key из env",
+                value=bool(detmir_settings.get("use_env_api_key", True)),
+                key="detmir_use_env_api_key",
+            )
+        with det4:
+            if detmir_is_configured(
+                conn=conn,
+                client_id=str(detmir_client_id or "").strip() or None,
+                api_key=str(detmir_api_key or "").strip() or None,
+                use_env_api_key=bool(detmir_use_env),
+            ):
+                st.success("Detmir API готов")
+            else:
+                st.warning("Нужны client_id и api_key")
+
+        dact1, dact2, dact3 = st.columns([1, 1, 2])
+        with dact1:
+            if st.button("Сохранить Detmir-настройки", key="detmir_save_settings_btn"):
+                save_detmir_settings(
+                    conn,
+                    {
+                        "client_id": str(detmir_client_id or "").strip(),
+                        "api_key": str(detmir_api_key or "").strip(),
+                        "use_env_api_key": bool(detmir_use_env),
+                    },
+                )
+                st.success("Detmir-настройки сохранены.")
+                st.rerun()
+        with dact2:
+            if st.button("Проверить Detmir API", key="detmir_check_btn"):
+                result = check_detmir_connection(
+                    conn=conn,
+                    client_id=str(detmir_client_id or "").strip() or None,
+                    api_key=str(detmir_api_key or "").strip() or None,
+                    use_env_api_key=bool(detmir_use_env),
+                )
+                if result.get("ok"):
+                    st.success(f"Detmir API отвечает. Корневых категорий: {int(result.get('categories_root') or 0)}.")
+                else:
+                    st.error(result.get("error") or "Не удалось подключиться к Detmir API.")
+        with dact3:
+            st.caption(
+                f"В памяти: категорий {int(detmir_stats.get('detmir_category_cache') or 0)}, "
+                f"атрибутов {int(detmir_stats.get('detmir_attribute_cache') or 0)}, "
+                f"значений {int(detmir_stats.get('detmir_attribute_value_cache') or 0)}, "
+                f"карточек {int(detmir_stats.get('detmir_product_cache') or 0)}."
+            )
+            if detmir_stats.get("last_schema_sync_at") or detmir_stats.get("last_product_sync_at"):
+                st.caption(
+                    f"Последний schema sync: {detmir_stats.get('last_schema_sync_at') or '-'} | "
+                    f"Последний product sync: {detmir_stats.get('last_product_sync_at') or '-'}"
+                )
+
+        sync_col1, sync_col2, sync_col3, sync_col4 = st.columns([1.2, 1.4, 1.5, 1.6])
+        with sync_col1:
+            if st.button("Синхронизировать дерево категорий", key="detmir_sync_tree_btn"):
+                with st.spinner("Синхронизирую дерево категорий Детского Мира..."):
+                    result = sync_detmir_category_tree(
+                        conn,
+                        client_id=str(detmir_client_id or "").strip() or None,
+                        api_key=str(detmir_api_key or "").strip() or None,
+                        use_env_api_key=bool(detmir_use_env),
+                    )
+                st.success(f"Дерево категорий обновлено: {int(result.get('categories') or 0)} узлов.")
+                backup_result = backup_database_file(reason="detmir_category_tree_sync")
+                if backup_result.get("ok"):
+                    st.caption(f"Память Detmir зафиксирована: `{Path(str(backup_result['path'])).name}`")
+                st.rerun()
+        with sync_col2:
+            detmir_schema_pages = st.number_input(
+                "Max pages schema",
+                min_value=1,
+                max_value=500,
+                value=10,
+                step=1,
+                key="detmir_schema_pages_limit",
+                help="Ограничь число страниц, если нужен быстрый тестовый sync.",
+            )
+            if st.button("Синхронизировать категории и атрибуты", key="detmir_sync_schema_btn"):
+                with st.spinner("Синхронизирую категории и атрибуты Детского Мира..."):
+                    result = sync_categories_with_attributes(
+                        conn,
+                        client_id=str(detmir_client_id or "").strip() or None,
+                        api_key=str(detmir_api_key or "").strip() or None,
+                        use_env_api_key=bool(detmir_use_env),
+                        max_pages=int(detmir_schema_pages),
+                    )
+                st.success(
+                    f"Schema sync завершён: категорий {int(result.get('categories') or 0)}, "
+                    f"атрибутов {int(result.get('attributes') or 0)}, variant {int(result.get('variant_attributes') or 0)}."
+                )
+                backup_result = backup_database_file(reason="detmir_schema_sync")
+                if backup_result.get("ok"):
+                    st.caption(f"Память Detmir зафиксирована: `{Path(str(backup_result['path'])).name}`")
+                st.rerun()
+        with sync_col3:
+            detmir_value_attrs = st.number_input(
+                "Max attrs values",
+                min_value=1,
+                max_value=5000,
+                value=40,
+                step=1,
+                key="detmir_values_attr_limit",
+                help="Сколько attribute keys брать в пакетный sync значений справочников.",
+            )
+            if st.button("Синхронизировать значения атрибутов", key="detmir_sync_values_btn"):
+                with st.spinner("Синхронизирую значения справочников Детского Мира..."):
+                    result = sync_all_detmir_attribute_values(
+                        conn,
+                        client_id=str(detmir_client_id or "").strip() or None,
+                        api_key=str(detmir_api_key or "").strip() or None,
+                        use_env_api_key=bool(detmir_use_env),
+                        max_attributes=int(detmir_value_attrs),
+                        dictionary_only=True,
+                    )
+                st.success(
+                    f"Values sync завершён: атрибутов {int(result.get('attributes') or 0)}, "
+                    f"значений {int(result.get('values') or 0)}."
+                )
+                if result.get("errors"):
+                    st.dataframe(pd.DataFrame([{"error": item} for item in result.get("errors") or []]), use_container_width=True, hide_index=True)
+                backup_result = backup_database_file(reason="detmir_attribute_values_sync")
+                if backup_result.get("ok"):
+                    st.caption(f"Память Detmir зафиксирована: `{Path(str(backup_result['path'])).name}`")
+                st.rerun()
+        with sync_col4:
+            detmir_product_pages = st.number_input(
+                "Max pages products",
+                min_value=1,
+                max_value=500,
+                value=5,
+                step=1,
+                key="detmir_products_pages_limit",
+                help="Сколько страниц карточек товаров читать за один пакетный sync.",
+            )
+            if st.button("Синхронизировать карточки товаров", key="detmir_sync_products_btn"):
+                with st.spinner("Синхронизирую карточки товаров Детского Мира..."):
+                    result = sync_detmir_products(
+                        conn,
+                        client_id=str(detmir_client_id or "").strip() or None,
+                        api_key=str(detmir_api_key or "").strip() or None,
+                        use_env_api_key=bool(detmir_use_env),
+                        max_pages=int(detmir_product_pages),
+                    )
+                st.success(
+                    f"Синк карточек завершён: товаров {int(result.get('products') or 0)}, "
+                    f"страниц {int(result.get('pages') or 0)}."
+                )
+                backup_result = backup_database_file(reason="detmir_products_sync")
+                if backup_result.get("ok"):
+                    st.caption(f"Память Detmir зафиксирована: `{Path(str(backup_result['path'])).name}`")
+                st.rerun()
+
+        st.markdown("### Категории Детского Мира")
+        cat_f1, cat_f2 = st.columns([2, 1])
+        with cat_f1:
+            detmir_category_search = st.text_input(
+                "Поиск категории Detmir",
+                value="",
+                placeholder="Например: велосипед, самокат, беговел",
+                key="detmir_category_search",
+            )
+        with cat_f2:
+            detmir_only_leaf = st.checkbox("Только листовые", value=True, key="detmir_only_leaf")
+        detmir_categories = list_detmir_cached_categories(
+            conn,
+            search=detmir_category_search or None,
+            only_leaf=bool(detmir_only_leaf),
+            limit=500,
+        )
+        detmir_categories_with_schema = [
+            row
+            for row in detmir_categories
+            if int(row.get("attributes_count") or 0) > 0 or int(row.get("variant_attributes_count") or 0) > 0
+        ]
+        if detmir_categories_with_schema:
+            detmir_categories = detmir_categories_with_schema
+        if detmir_categories:
+            detmir_category_options = [int(row["category_id"]) for row in detmir_categories]
+            detmir_category_map = {int(row["category_id"]): row for row in detmir_categories}
+            selected_detmir_category_id = st.selectbox(
+                "Категория Detmir",
+                options=detmir_category_options,
+                format_func=lambda cid: (
+                    f"{detmir_category_map[int(cid)].get('full_path') or detmir_category_map[int(cid)].get('name')} "
+                    f"| cat={cid} | attrs={int(detmir_category_map[int(cid)].get('attributes_count') or 0)}"
+                ),
+                key="detmir_selected_category_id",
+            )
+            selected_detmir_category = detmir_category_map[int(selected_detmir_category_id)]
+            cat_info_df = pd.DataFrame(
+                [
+                    {
+                        "category_id": int(selected_detmir_category.get("category_id") or 0),
+                        "path": selected_detmir_category.get("full_path"),
+                        "product_type": selected_detmir_category.get("product_type_name"),
+                        "dimension_type": selected_detmir_category.get("dimension_type"),
+                        "published": bool(selected_detmir_category.get("published")),
+                        "attrs": int(selected_detmir_category.get("attributes_count") or 0),
+                        "variant_attrs": int(selected_detmir_category.get("variant_attributes_count") or 0),
+                        "updated_remote_at": selected_detmir_category.get("updated_remote_at"),
+                    }
+                ]
+            )
+            st.dataframe(cat_info_df, use_container_width=True, hide_index=True)
+
+            detmir_attrs = list_detmir_cached_attributes(
+                conn,
+                category_id=int(selected_detmir_category_id),
+                include_variant=True,
+                limit=10000,
+            )
+            act1, act2 = st.columns([1, 1])
+            with act1:
+                if st.button("Импортировать требования категории Detmir в PIM", key="detmir_import_requirements_btn"):
+                    result = import_detmir_category_requirements_to_pim(
+                        conn,
+                        category_id=int(selected_detmir_category_id),
+                        create_mapping_rules=True,
+                    )
+                    st.success(
+                        f"В PIM импортировано {int(result.get('imported') or 0)} требований, "
+                        f"обязательных {int(result.get('required') or 0)}, "
+                        f"mapping rules {int(result.get('mapping_saved') or 0)}."
+                    )
+                    backup_result = backup_database_file(reason="detmir_import_requirements")
+                    if backup_result.get("ok"):
+                        st.caption(f"Overlay Detmir зафиксирован: `{Path(str(backup_result['path'])).name}`")
+                    st.rerun()
+            with act2:
+                if st.button("Синхронизировать значения только для этой категории", key="detmir_sync_selected_values_btn"):
+                    attr_keys = sorted(
+                        {
+                            str(row.get("attribute_key") or "").strip()
+                            for row in detmir_attrs
+                            if str(row.get("data_type") or "").strip().upper() in {"SELECT", "SELECT_MULTIPLE", "EXTENDED_DICTIONARY"}
+                            and str(row.get("attribute_key") or "").strip()
+                        }
+                    )
+                    synced_attr_total = 0
+                    synced_values_total = 0
+                    sync_errors: list[str] = []
+                    for attr_key in attr_keys:
+                        try:
+                            one_result = sync_detmir_attribute_values(
+                                conn,
+                                attribute_key=str(attr_key),
+                                client_id=str(detmir_client_id or "").strip() or None,
+                                api_key=str(detmir_api_key or "").strip() or None,
+                                use_env_api_key=bool(detmir_use_env),
+                            )
+                            synced_attr_total += 1
+                            synced_values_total += int(one_result.get("values") or 0)
+                        except Exception as e:
+                            sync_errors.append(f"{attr_key}: {e}")
+                    st.success(
+                        f"По категории синхронизированы значения: атрибутов {synced_attr_total}, "
+                        f"значений {synced_values_total}."
+                    )
+                    if sync_errors:
+                        st.dataframe(pd.DataFrame([{"error": item} for item in sync_errors]), use_container_width=True, hide_index=True)
+                    st.rerun()
+
+            if detmir_attrs:
+                attr_df = pd.DataFrame(detmir_attrs)
+                show_cols = [
+                    c
+                    for c in [
+                        "attribute_key",
+                        "attribute_name",
+                        "data_type",
+                        "is_required",
+                        "is_variant_attribute",
+                        "restriction_type",
+                        "feature_type",
+                    ]
+                    if c in attr_df.columns
+                ]
+                st.dataframe(attr_df[show_cols], use_container_width=True, hide_index=True)
+                dict_attr_options = [
+                    str(row.get("attribute_key"))
+                    for row in detmir_attrs
+                    if str(row.get("data_type") or "").strip().upper() in {"SELECT", "SELECT_MULTIPLE", "EXTENDED_DICTIONARY"}
+                ]
+                if dict_attr_options:
+                    selected_detmir_attr_key = st.selectbox(
+                        "Справочный атрибут категории",
+                        options=dict_attr_options,
+                        key="detmir_selected_attr_key",
+                    )
+                    val_a1, val_a2 = st.columns([1, 2])
+                    with val_a1:
+                        if st.button("Синхронизировать значения выбранного атрибута", key="detmir_sync_one_attr_values_btn"):
+                            result = sync_detmir_attribute_values(
+                                conn,
+                                attribute_key=str(selected_detmir_attr_key),
+                                client_id=str(detmir_client_id or "").strip() or None,
+                                api_key=str(detmir_api_key or "").strip() or None,
+                                use_env_api_key=bool(detmir_use_env),
+                            )
+                            st.success(
+                                f"Значения атрибута `{selected_detmir_attr_key}` синхронизированы: {int(result.get('values') or 0)}."
+                            )
+                            st.rerun()
+                    with val_a2:
+                        detmir_attr_values = list_detmir_cached_attribute_values(
+                            conn,
+                            attribute_key=str(selected_detmir_attr_key),
+                            limit=400,
+                        )
+                        if detmir_attr_values:
+                            st.dataframe(pd.DataFrame(detmir_attr_values), use_container_width=True, hide_index=True)
+                        else:
+                            st.info("Для выбранного атрибута значения пока не синхронизировались.")
+            else:
+                st.info("По выбранной категории атрибуты пока не синхронизированы.")
+        else:
+            st.info("Кэш категорий Detmir пока пуст. Сначала выполни sync дерева или schema sync.")
+
+        st.markdown("### Карточки товаров Детского Мира")
+        p1, p2, p3 = st.columns([2, 1, 1])
+        with p1:
+            detmir_product_search = st.text_input(
+                "Поиск по карточкам Detmir",
+                value="",
+                placeholder="title, siteName, productCode, mastercardId",
+                key="detmir_product_search",
+            )
+        with p2:
+            detmir_status_filter = st.text_input("Статус", value="", placeholder="ACCEPTED / DRAFT / ...", key="detmir_status_filter")
+        with p3:
+            detmir_products_limit = st.number_input("Лимит карточек", min_value=10, max_value=500, value=50, step=10, key="detmir_products_limit")
+        detmir_products = list_detmir_cached_products(
+            conn,
+            search=detmir_product_search or None,
+            status=(detmir_status_filter or None),
+            limit=int(detmir_products_limit),
+        )
+        if detmir_products:
+            detmir_products_df = pd.DataFrame(detmir_products)
+            visible_cols = [
+                c
+                for c in [
+                    "product_id",
+                    "product_code",
+                    "mastercard_id",
+                    "category_id",
+                    "title",
+                    "site_name",
+                    "status",
+                    "fbo_stock_level",
+                    "fbs_stock_level",
+                    "updated_remote_at",
+                ]
+                if c in detmir_products_df.columns
+            ]
+            st.dataframe(detmir_products_df[visible_cols], use_container_width=True, hide_index=True)
+            detmir_product_options = [int(row["product_id"]) for row in detmir_products]
+            detmir_product_map = {int(row["product_id"]): row for row in detmir_products}
+            selected_detmir_product_id = st.selectbox(
+                "Карточка товара Detmir",
+                options=detmir_product_options,
+                format_func=lambda pid: (
+                    f"{detmir_product_map[int(pid)].get('product_code') or '-'} | "
+                    f"{detmir_product_map[int(pid)].get('title') or '-'}"
+                ),
+                key="detmir_selected_product_id",
+            )
+            selected_detmir_product = detmir_product_map[int(selected_detmir_product_id)]
+            detail_df = pd.DataFrame(
+                [
+                    {
+                        "product_id": int(selected_detmir_product.get("product_id") or 0),
+                        "product_code": selected_detmir_product.get("product_code"),
+                        "mastercard_id": selected_detmir_product.get("mastercard_id"),
+                        "category_id": selected_detmir_product.get("category_id"),
+                        "title": selected_detmir_product.get("title"),
+                        "site_name": selected_detmir_product.get("site_name"),
+                        "status": selected_detmir_product.get("status"),
+                        "photos": len(json.loads(selected_detmir_product.get("photos_json") or "[]")),
+                        "attributes": len(json.loads(selected_detmir_product.get("attributes_json") or "[]")),
+                        "updated_remote_at": selected_detmir_product.get("updated_remote_at"),
+                    }
+                ]
+            )
+            st.dataframe(detail_df, use_container_width=True, hide_index=True)
+            product_raw_json = str(selected_detmir_product.get("raw_json") or "{}")
+            st.download_button(
+                "Скачать raw JSON выбранной карточки Detmir",
+                data=product_raw_json.encode("utf-8"),
+                file_name=f"detmir_product_{int(selected_detmir_product_id)}.json",
+                mime="application/json",
+                key="detmir_product_raw_download_btn",
+            )
+        else:
+            st.info("Карточки Detmir пока не синхронизированы или не подходят под текущий фильтр.")
 
     channels = conn.execute(
         "SELECT channel_code, channel_name, is_active FROM channel_profiles ORDER BY channel_name"
