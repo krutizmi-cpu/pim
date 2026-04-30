@@ -115,6 +115,12 @@ from services.persistence_service import (
     list_ai_connection_profiles,
     get_ai_connection_profile,
 )
+from services.backup_service import (
+    backup_database_file,
+    backup_ozon_snapshot_bytes,
+    list_ozon_snapshot_backups,
+    read_backup_bytes,
+)
 from services.certificate_registry import (
     search_fsa_registry_candidates,
     parse_fsa_document_resource,
@@ -184,6 +190,294 @@ def get_db():
     init_db(conn)
     ensure_default_supplier_profiles(conn)
     return conn
+
+
+def apply_app_theme() -> None:
+    st.markdown(
+        """
+<style>
+@import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;700&family=IBM+Plex+Mono:wght@400;500&display=swap');
+
+:root {
+  --pim-bg: #f3f4f6;
+  --pim-bg-soft: #eef2f7;
+  --pim-surface: rgba(255, 255, 255, 0.86);
+  --pim-surface-strong: #ffffff;
+  --pim-line: rgba(15, 23, 42, 0.08);
+  --pim-text: #111827;
+  --pim-sub: #667085;
+  --pim-accent: #0f172a;
+  --pim-accent-soft: #dbeafe;
+  --pim-success: #0f766e;
+}
+
+html, body, [class*="css"], [data-testid="stAppViewContainer"] {
+  font-family: 'DM Sans', sans-serif;
+  color: var(--pim-text);
+}
+
+[data-testid="stAppViewContainer"] {
+  background:
+    radial-gradient(circle at top left, rgba(191, 219, 254, 0.45), transparent 28%),
+    radial-gradient(circle at top right, rgba(226, 232, 240, 0.55), transparent 24%),
+    linear-gradient(180deg, #f8fafc 0%, #f3f4f6 54%, #eef2f7 100%);
+}
+
+[data-testid="stHeader"] {
+  background: rgba(248, 250, 252, 0.78);
+  backdrop-filter: blur(16px);
+}
+
+[data-testid="stSidebar"] {
+  background: linear-gradient(180deg, rgba(255,255,255,0.96) 0%, rgba(244,246,248,0.98) 100%);
+  border-right: 1px solid var(--pim-line);
+}
+
+[data-testid="stSidebar"] [data-testid="stMarkdownContainer"] p,
+[data-testid="stSidebar"] label {
+  color: var(--pim-text);
+}
+
+.pim-shell {
+  padding-top: 0.2rem;
+}
+
+.pim-hero {
+  background: linear-gradient(135deg, rgba(255,255,255,0.94) 0%, rgba(255,255,255,0.76) 100%);
+  border: 1px solid rgba(15, 23, 42, 0.08);
+  border-radius: 28px;
+  padding: 1.4rem 1.5rem 1.15rem 1.5rem;
+  box-shadow: 0 24px 60px rgba(15, 23, 42, 0.08);
+  margin-bottom: 1.1rem;
+}
+
+.pim-hero-title {
+  font-size: 2.15rem;
+  font-weight: 700;
+  line-height: 1.05;
+  letter-spacing: -0.03em;
+  margin: 0 0 0.45rem 0;
+}
+
+.pim-hero-sub {
+  color: var(--pim-sub);
+  font-size: 0.98rem;
+  margin-bottom: 0.9rem;
+}
+
+.pim-chip-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.55rem;
+}
+
+.pim-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  padding: 0.45rem 0.72rem;
+  border-radius: 999px;
+  background: rgba(15, 23, 42, 0.04);
+  border: 1px solid rgba(15, 23, 42, 0.06);
+  color: var(--pim-text);
+  font-size: 0.83rem;
+}
+
+.pim-chip strong {
+  font-weight: 700;
+}
+
+.pim-side-card {
+  background: rgba(255,255,255,0.84);
+  border: 1px solid rgba(15, 23, 42, 0.08);
+  border-radius: 22px;
+  padding: 1rem 1rem 0.9rem 1rem;
+  box-shadow: 0 14px 32px rgba(15, 23, 42, 0.05);
+  margin-bottom: 0.9rem;
+}
+
+.pim-side-kicker {
+  color: var(--pim-sub);
+  font-size: 0.78rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  margin-bottom: 0.28rem;
+}
+
+.pim-side-title {
+  font-size: 1.18rem;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  margin-bottom: 0.35rem;
+}
+
+.pim-side-note {
+  color: var(--pim-sub);
+  font-size: 0.86rem;
+}
+
+div[data-testid="stMetric"] {
+  background: rgba(255,255,255,0.82);
+  border: 1px solid rgba(15, 23, 42, 0.08);
+  border-radius: 20px;
+  padding: 0.8rem 0.9rem;
+  box-shadow: 0 12px 28px rgba(15, 23, 42, 0.04);
+}
+
+div[data-testid="stMetricLabel"] {
+  color: var(--pim-sub);
+}
+
+div[data-testid="stMetricValue"] {
+  font-weight: 700;
+  letter-spacing: -0.03em;
+}
+
+div.stButton > button,
+div.stDownloadButton > button {
+  border-radius: 16px;
+  border: 1px solid rgba(15, 23, 42, 0.08);
+  min-height: 2.7rem;
+  box-shadow: 0 8px 18px rgba(15, 23, 42, 0.04);
+}
+
+div.stButton > button[kind="primary"] {
+  background: linear-gradient(180deg, #111827 0%, #0f172a 100%);
+  color: #ffffff;
+  border-color: rgba(15, 23, 42, 0.25);
+}
+
+div[data-testid="stExpander"] {
+  border: 1px solid rgba(15, 23, 42, 0.08);
+  border-radius: 20px;
+  background: rgba(255,255,255,0.7);
+}
+
+.stTabs [data-baseweb="tab-list"] {
+  gap: 0.45rem;
+  background: rgba(255,255,255,0.56);
+  border: 1px solid rgba(15, 23, 42, 0.06);
+  border-radius: 18px;
+  padding: 0.3rem;
+}
+
+.stTabs [data-baseweb="tab"] {
+  border-radius: 14px;
+  padding: 0.55rem 0.9rem;
+}
+
+.stTabs [aria-selected="true"] {
+  background: rgba(15, 23, 42, 0.08);
+}
+
+div[data-testid="stDataFrame"], div[data-testid="stTable"] {
+  border-radius: 18px;
+  overflow: hidden;
+  border: 1px solid rgba(15, 23, 42, 0.08);
+}
+
+code, pre, .pim-mono {
+  font-family: 'IBM Plex Mono', monospace;
+}
+</style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def build_workspace_summary(conn) -> dict[str, object]:
+    stats = get_ozon_cache_stats(conn)
+    products_total = int(conn.execute("SELECT COUNT(*) AS total FROM products").fetchone()["total"] or 0)
+    imports_total = int(conn.execute("SELECT COUNT(*) AS total FROM catalog_import_history").fetchone()["total"] or 0)
+    template_profiles_total = int(conn.execute("SELECT COUNT(*) AS total FROM template_profiles").fetchone()["total"] or 0)
+    uploaded_templates_total = int(
+        conn.execute(
+            "SELECT COUNT(*) AS total FROM uploaded_files WHERE storage_kind = 'client_template'"
+        ).fetchone()["total"]
+        or 0
+    )
+    clients_total = int(len(list_client_channels(conn)))
+    ozon_backups_total = int(len(list_ozon_snapshot_backups(limit=50)))
+    return {
+        "products_total": products_total,
+        "imports_total": imports_total,
+        "template_profiles_total": template_profiles_total,
+        "uploaded_templates_total": uploaded_templates_total,
+        "clients_total": clients_total,
+        "ozon_pairs_total": int(stats.get("category_pairs") or 0),
+        "ozon_attributes_total": int(stats.get("attributes_total") or 0),
+        "ozon_backups_total": ozon_backups_total,
+        "active_db_path": str(_get_active_db_path() or Path("data/catalog.db")),
+    }
+
+
+def render_sidebar_navigation(summary: dict[str, object]) -> str:
+    nav_options = [
+        ("📥 Импорт", "import"),
+        ("📚 Каталог", "catalog"),
+        ("🧾 Карточка", "product"),
+        ("🧠 Клиентский шаблон", "template"),
+        ("🛒 Ozon", "ozon"),
+        ("🧩 Атрибуты", "attributes"),
+        ("⚙️ Каналы", "channels"),
+    ]
+    nav_labels = [label for label, _ in nav_options]
+    nav_map = {label: value for label, value in nav_options}
+    with st.sidebar:
+        st.markdown(
+            f"""
+<div class="pim-side-card">
+  <div class="pim-side-kicker">PIM Workspace</div>
+  <div class="pim-side-title">Galvanize Product Memory</div>
+  <div class="pim-side-note">Товары, шаблоны клиентов, Ozon-структура и экспорт в одной постоянной рабочей зоне.</div>
+</div>
+<div class="pim-side-card">
+  <div class="pim-side-kicker">Память</div>
+  <div class="pim-side-note">Товаров: <strong>{int(summary.get('products_total') or 0)}</strong><br/>Клиентов: <strong>{int(summary.get('clients_total') or 0)}</strong><br/>Шаблонов: <strong>{int(summary.get('uploaded_templates_total') or 0)}</strong><br/>Ozon backup: <strong>{int(summary.get('ozon_backups_total') or 0)}</strong></div>
+</div>
+            """,
+            unsafe_allow_html=True,
+        )
+        selected_label = st.radio(
+            "Раздел работы",
+            options=nav_labels,
+            index=1 if "workspace_nav_label" not in st.session_state else nav_labels.index(st.session_state["workspace_nav_label"]) if st.session_state["workspace_nav_label"] in nav_labels else 1,
+            key="workspace_nav_label",
+        )
+        st.caption(f"База: `{summary.get('active_db_path')}`")
+    return nav_map[selected_label]
+
+
+def render_workspace_hero(section_key: str, summary: dict[str, object]) -> None:
+    section_meta = {
+        "import": ("Поступление и фиксация памяти", "Загрузи прайс, зафиксируй поставщика, сохрани импорт в каталог и сразу закрепи память в БД."),
+        "catalog": ("Каталог для массовой работы", "Работай по фильтрам, дозаполняй товары пакетно и быстро переходи в точечную карточку по артикулу."),
+        "product": ("Карточка товара", "Финальная доводка master-карточки: категории, атрибуты, фото, AI и контроль источников."),
+        "template": ("Клиентские шаблоны", "Выбор клиента из базы, повторное открытие сохранённого шаблона и стабильный экспорт без новой ручной настройки."),
+        "ozon": ("Эталон Ozon и кэш памяти", "Категории, атрибуты и справочники Ozon живут как локальный эталон и должны переживать синки и перезапуски."),
+        "attributes": ("Справочник атрибутов", "Поддерживай мастер-слой и клиентские поля без путаницы и дублирования."),
+        "channels": ("Правила каналов и AI", "Настраивай mapping rules, требования и AI-провайдеры как служебный контур системы."),
+    }
+    title, caption = section_meta.get(section_key, ("PIM", "Рабочая зона PIM."))
+    st.markdown(
+        f"""
+<div class="pim-shell">
+  <div class="pim-hero">
+    <div class="pim-hero-title">{title}</div>
+    <div class="pim-hero-sub">{caption}</div>
+    <div class="pim-chip-row">
+      <span class="pim-chip">Товаров <strong>{int(summary.get('products_total') or 0)}</strong></span>
+      <span class="pim-chip">Импортов <strong>{int(summary.get('imports_total') or 0)}</strong></span>
+      <span class="pim-chip">Клиентов <strong>{int(summary.get('clients_total') or 0)}</strong></span>
+      <span class="pim-chip">Профилей шаблонов <strong>{int(summary.get('template_profiles_total') or 0)}</strong></span>
+      <span class="pim-chip">Ozon cat/type <strong>{int(summary.get('ozon_pairs_total') or 0)}</strong></span>
+      <span class="pim-chip">Ozon атрибутов <strong>{int(summary.get('ozon_attributes_total') or 0)}</strong></span>
+    </div>
+  </div>
+</div>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 def _now_iso() -> str:
@@ -3377,10 +3671,13 @@ def show_import_tab():
                 st.error(f"Ошибка импорта: {e}")
                 return
             conn.close()
+            backup_result = backup_database_file(reason="catalog_import")
             st.session_state["last_import_batch_id"] = result.batch_id
             st.success(
                 f"Импорт завершён. Всего: {result.imported}, создано: {result.created}, обновлено: {result.updated}, дублей: {len(result.duplicates)}"
             )
+            if backup_result.get("ok"):
+                st.caption(f"Память каталога зафиксирована в backup: `{Path(str(backup_result['path'])).name}`")
             if int(missing_supplier_count or 0) > 0:
                 st.warning(
                     f"У {int(missing_supplier_count)} товаров в этой партии не назначен поставщик. "
@@ -6966,6 +7263,9 @@ def show_template_tab():
                     columns=save_ready_rows,
                 )
                 st.success(f"Профиль шаблона сохранён: #{profile_id}")
+                backup_result = backup_database_file(reason="template_profile")
+                if backup_result.get("ok"):
+                    st.caption(f"Профиль и память шаблона зафиксированы: `{Path(str(backup_result['path'])).name}`")
         with save_col2:
             st.caption("Эта кнопка сохраняет тип шаблона клиента для повторного использования без повторной ручной настройки.")
 
@@ -7090,6 +7390,10 @@ def show_template_tab():
                 if st.button("Сохранить mapping rules", type="primary"):
                     saved = _persist_template_mapping_rules(manual_rows)
                     st.success(f"Сохранено mapping rules: {saved}")
+                    if saved:
+                        backup_result = backup_database_file(reason="template_mapping_rules")
+                        if backup_result.get("ok"):
+                            st.caption(f"Mapping rules зафиксированы: `{Path(str(backup_result['path'])).name}`")
             with s2:
                 if st.button("Сохранить профиль шаблона"):
                     if channel_code:
@@ -7107,6 +7411,9 @@ def show_template_tab():
                         columns=manual_rows,
                     )
                     st.success(f"Профиль шаблона сохранён: #{profile_id}")
+                    backup_result = backup_database_file(reason="template_profile")
+                    if backup_result.get("ok"):
+                        st.caption(f"Профиль и память шаблона зафиксированы: `{Path(str(backup_result['path'])).name}`")
             with s3:
                 if st.button("Добавить несматченные в master-атрибуты"):
                     created = 0
@@ -7374,6 +7681,11 @@ def show_ozon_tab():
                         "generated_at": _now_iso(),
                         "include_values": bool(snapshot_include_values),
                     }
+                    st.session_state["ozon_snapshot_backup_result"] = backup_ozon_snapshot_bytes(
+                        st.session_state["ozon_snapshot_bytes"],
+                        include_value_cache=bool(snapshot_include_values),
+                        source="ui_snapshot",
+                    )
                 st.success("Snapshot подготовлен. Ниже появилась кнопка скачивания.")
         with snap_c3:
             snapshot_bytes = st.session_state.get("ozon_snapshot_bytes")
@@ -7384,6 +7696,9 @@ def show_ozon_tab():
                     f"справочники: {'да' if snapshot_meta.get('include_values') else 'нет'}"
                 )
                 st.caption(meta_text)
+                snapshot_backup_result = st.session_state.get("ozon_snapshot_backup_result") or {}
+                if snapshot_backup_result.get("ok"):
+                    st.caption(f"Копия snapshot уже сохранена в памяти сервиса: `{Path(str(snapshot_backup_result['path'])).name}`")
                 st.download_button(
                     "Скачать snapshot кэша Ozon (Excel)",
                     data=snapshot_bytes,
@@ -7414,16 +7729,73 @@ def show_ozon_tab():
                     if bool(restore_result.get("has_values")):
                         msg += f", значений справочников {int(restore_result.get('values') or 0)}"
                     st.success(msg)
+                    backup_result = backup_database_file(reason="ozon_restore_snapshot")
+                    if backup_result.get("ok"):
+                        st.caption(f"Состояние Ozon-кэша зафиксировано в backup БД: `{Path(str(backup_result['path'])).name}`")
                     st.info("Далее нажми `Импортировать все атрибуты Ozon из кэша в PIM`, чтобы восстановить master-атрибуты.")
                     st.rerun()
                 else:
                     st.error(str(restore_result.get("message") or "Не удалось восстановить snapshot Ozon."))
+
+        recent_snapshots = list_ozon_snapshot_backups(limit=12)
+        if recent_snapshots:
+            st.markdown("#### Последние snapshot-копии Ozon в памяти сервиса")
+            snapshot_options = [None] + [row["file_path"] for row in recent_snapshots]
+            selected_snapshot_path = st.selectbox(
+                "Открыть сохранённый snapshot сервиса",
+                options=snapshot_options,
+                format_func=lambda value: "-- нет --" if value is None else next(
+                    (
+                        f"{row['file_name']} | {row.get('created_at') or '-'} | "
+                        f"values={'да' if row.get('include_value_cache') else 'нет'}"
+                        for row in recent_snapshots
+                        if row["file_path"] == value
+                    ),
+                    str(value),
+                ),
+                key="ozon_saved_snapshot_path",
+            )
+            if selected_snapshot_path:
+                selected_snapshot_row = next((row for row in recent_snapshots if row["file_path"] == selected_snapshot_path), None)
+                selected_snapshot_bytes = read_backup_bytes(selected_snapshot_path)
+                ss1, ss2 = st.columns([1, 1])
+                with ss1:
+                    if selected_snapshot_bytes:
+                        st.download_button(
+                            "Скачать snapshot из памяти сервиса",
+                            data=selected_snapshot_bytes,
+                            file_name=str(selected_snapshot_row.get("file_name") if selected_snapshot_row else Path(str(selected_snapshot_path)).name),
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            key="ozon_saved_snapshot_download_btn",
+                        )
+                with ss2:
+                    if st.button("Восстановить выбранный snapshot из памяти сервиса", key="ozon_restore_saved_snapshot_btn"):
+                        if not selected_snapshot_bytes:
+                            st.error("Не удалось прочитать snapshot из памяти сервиса.")
+                        else:
+                            with st.spinner("Восстанавливаю snapshot Ozon из серверной памяти..."):
+                                restore_result = restore_ozon_cache_snapshot_excel(conn, selected_snapshot_bytes)
+                            if bool(restore_result.get("ok")):
+                                st.success(
+                                    "Snapshot из памяти сервиса восстановлен: "
+                                    f"категорий {int(restore_result.get('categories') or 0)}, "
+                                    f"атрибутов {int(restore_result.get('attributes') or 0)}."
+                                )
+                                backup_result = backup_database_file(reason="ozon_restore_saved_snapshot")
+                                if backup_result.get("ok"):
+                                    st.caption(f"Состояние БД после restore сохранено: `{Path(str(backup_result['path'])).name}`")
+                                st.rerun()
+                            else:
+                                st.error(str(restore_result.get("message") or "Не удалось восстановить snapshot из памяти сервиса."))
 
     top1, top2, top3, top4 = st.columns(4)
     with top1:
         if st.button("Синхронизировать дерево категорий Ozon", type="primary", disabled=not configured, help="Обновить локальный кэш дерева категорий Ozon"):
             result = sync_category_tree(conn, client_id=client_id or None, api_key=api_key or None)
             st.success(f"Дерево категорий обновлено, записей: {result['total']}")
+            backup_result = backup_database_file(reason="ozon_category_tree_sync")
+            if backup_result.get("ok"):
+                st.caption(f"Кэш категорий сохранён в backup БД: `{Path(str(backup_result['path'])).name}`")
             st.rerun()
     with top2:
         if st.button("Запустить полную синхронизацию Ozon в фоне", disabled=not configured, help="Фоновая загрузка атрибутов по категориям Ozon"):
@@ -7444,6 +7816,9 @@ def show_ozon_tab():
             )
             if result.get("errors"):
                 st.warning(f"Ошибок при массовом импорте: {len(result['errors'])}.")
+            backup_result = backup_database_file(reason="ozon_import_all_cached_attributes")
+            if backup_result.get("ok"):
+                st.caption(f"Master-атрибуты после импорта сохранены: `{Path(str(backup_result['path'])).name}`")
             st.rerun()
 
     bg_state = _get_ozon_bg_state()
@@ -7464,6 +7839,12 @@ def show_ozon_tab():
         )
         if r.get("errors"):
             st.warning(f"Ошибок в фоновой синхронизации: {len(r['errors'])}.")
+        bg_result_signature = str(bg_state.get("finished_at") or bg_state.get("started_at") or "")
+        if bg_result_signature and st.session_state.get("ozon_bg_result_backup_signature") != bg_result_signature:
+            backup_result = backup_database_file(reason="ozon_background_full_sync")
+            if backup_result.get("ok"):
+                st.caption(f"Результат фоновой синхронизации зафиксирован: `{Path(str(backup_result['path'])).name}`")
+            st.session_state["ozon_bg_result_backup_signature"] = bg_result_signature
     st.caption("Полная синхронизация Ozon теперь запускается в фоне и не блокирует работу с остальными разделами.")
 
     stats = get_ozon_cache_stats(conn)
@@ -7520,6 +7901,9 @@ def show_ozon_tab():
             )
             if miss_result.get("errors"):
                 st.warning(f"Ошибок при досинхронизации: {len(miss_result['errors'])}.")
+            backup_result = backup_database_file(reason="ozon_missing_categories_sync")
+            if backup_result.get("ok"):
+                st.caption(f"Досинхронизированный Ozon-кэш сохранён: `{Path(str(backup_result['path'])).name}`")
             st.rerun()
 
     coverage = get_ozon_sync_coverage(
@@ -7585,6 +7969,9 @@ def show_ozon_tab():
                         api_key=api_key or None,
                     )
                     st.success(f"Атрибуты обновлены: всего {result['total']}, обязательных {result['required']}")
+                    backup_result = backup_database_file(reason="ozon_selected_category_sync")
+                    if backup_result.get("ok"):
+                        st.caption(f"Категория и её атрибуты сохранены в backup БД: `{Path(str(backup_result['path'])).name}`")
                     st.rerun()
             with a2:
                 attr_limit = st.number_input("Сколько атрибутов показать", min_value=50, max_value=2000, value=300, step=50)
@@ -8989,10 +9376,13 @@ def show_channels_tab():
 
 
 def main():
-    st.title("📦 PIM")
-    st.caption("PIM для контент-отдела: мастер-карточка, обогащение от поставщика, клиентские шаблоны и экспорт без лишнего ручного труда.")
-    active_db = _get_active_db_path() or str(Path("data/catalog.db"))
-    st.caption(f"Текущая база данных: `{active_db}`")
+    apply_app_theme()
+    shell_conn = get_db()
+    summary = build_workspace_summary(shell_conn)
+    shell_conn.close()
+    selected_section = render_sidebar_navigation(summary)
+    render_workspace_hero(selected_section, summary)
+    active_db = summary.get("active_db_path") or str(Path("data/catalog.db"))
     low_db = str(active_db).lower()
     if "\\temp\\pim\\catalog.db" in low_db or "/tmp/pim/catalog.db" in low_db:
         st.warning("Сейчас используется временная БД. Чтобы каталог не пропадал, задай постоянный путь через переменную окружения `PIM_DB_PATH`.")
@@ -9016,30 +9406,19 @@ def main():
             """
         )
     render_section_help()
-
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(
-        ["📥 Импорт", "📚 Каталог", "🧾 Карточка", "🧩 Атрибуты", "🧠 Клиентский шаблон", "🛒 Ozon", "⚙️ Каналы"]
-    )
-
-    with tab1:
+    if selected_section == "import":
         show_import_tab()
-
-    with tab2:
+    elif selected_section == "catalog":
         show_catalog_tab()
-
-    with tab3:
+    elif selected_section == "product":
         show_product_tab()
-
-    with tab4:
+    elif selected_section == "attributes":
         show_attributes_tab()
-
-    with tab5:
+    elif selected_section == "template":
         show_template_tab()
-
-    with tab6:
+    elif selected_section == "ozon":
         show_ozon_tab()
-
-    with tab7:
+    else:
         show_channels_tab()
 
 

@@ -126,38 +126,42 @@ def sync_category_tree(
     payload = {"language": language}
     response = _post("/v1/description-category/tree", payload, client_id=client_id, api_key=api_key)
     rows = _flatten_tree(response.get("result") or [])
-
-    conn.execute("DELETE FROM ozon_category_cache")
     inserted = 0
-    for row in rows:
-        conn.execute(
-            """
-            INSERT INTO ozon_category_cache (
-                description_category_id,
-                category_name,
-                full_path,
-                type_id,
-                type_name,
-                disabled,
-                children_count,
-                raw_json,
-                fetched_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-            """,
-            (
-                row["description_category_id"],
-                row["category_name"],
-                row["path"],
-                row["type_id"],
-                row["type_name"],
-                row["disabled"],
-                row["children_count"],
-                row["raw_json"],
-            ),
-        )
-        inserted += 1
-    conn.commit()
-    return {"inserted": inserted, "total": inserted}
+    try:
+        conn.execute("BEGIN")
+        conn.execute("DELETE FROM ozon_category_cache")
+        for row in rows:
+            conn.execute(
+                """
+                INSERT INTO ozon_category_cache (
+                    description_category_id,
+                    category_name,
+                    full_path,
+                    type_id,
+                    type_name,
+                    disabled,
+                    children_count,
+                    raw_json,
+                    fetched_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                """,
+                (
+                    row["description_category_id"],
+                    row["category_name"],
+                    row["path"],
+                    row["type_id"],
+                    row["type_name"],
+                    row["disabled"],
+                    row["children_count"],
+                    row["raw_json"],
+                ),
+            )
+            inserted += 1
+        conn.commit()
+        return {"inserted": inserted, "total": inserted}
+    except Exception:
+        conn.rollback()
+        raise
 
 
 def _ensure_system_settings_table(conn: sqlite3.Connection) -> None:
@@ -622,57 +626,60 @@ def sync_category_attributes(
     }
     response = _post("/v1/description-category/attribute", payload, client_id=client_id, api_key=api_key)
     attributes = response.get("result") or []
-
-    conn.execute(
-        "DELETE FROM ozon_attribute_cache WHERE description_category_id = ? AND type_id = ?",
-        (int(description_category_id), int(type_id)),
-    )
-
     inserted = 0
     required = 0
-    for item in attributes:
+    try:
+        conn.execute("BEGIN")
         conn.execute(
-            """
-            INSERT INTO ozon_attribute_cache (
-                description_category_id,
-                type_id,
-                attribute_id,
-                name,
-                description,
-                type,
-                group_id,
-                group_name,
-                dictionary_id,
-                is_required,
-                is_collection,
-                max_value_count,
-                category_dependent,
-                raw_json,
-                fetched_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-            """,
-            (
-                int(description_category_id),
-                int(type_id),
-                item.get("id"),
-                item.get("name"),
-                item.get("description"),
-                item.get("type"),
-                item.get("group_id"),
-                item.get("group_name"),
-                item.get("dictionary_id"),
-                int(bool(item.get("is_required"))),
-                int(bool(item.get("is_collection"))),
-                item.get("max_value_count"),
-                int(bool(item.get("category_dependent"))),
-                json.dumps(item, ensure_ascii=False),
-            ),
+            "DELETE FROM ozon_attribute_cache WHERE description_category_id = ? AND type_id = ?",
+            (int(description_category_id), int(type_id)),
         )
-        inserted += 1
-        if item.get("is_required"):
-            required += 1
-    conn.commit()
-    return {"inserted": inserted, "required": required, "total": inserted}
+        for item in attributes:
+            conn.execute(
+                """
+                INSERT INTO ozon_attribute_cache (
+                    description_category_id,
+                    type_id,
+                    attribute_id,
+                    name,
+                    description,
+                    type,
+                    group_id,
+                    group_name,
+                    dictionary_id,
+                    is_required,
+                    is_collection,
+                    max_value_count,
+                    category_dependent,
+                    raw_json,
+                    fetched_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                """,
+                (
+                    int(description_category_id),
+                    int(type_id),
+                    item.get("id"),
+                    item.get("name"),
+                    item.get("description"),
+                    item.get("type"),
+                    item.get("group_id"),
+                    item.get("group_name"),
+                    item.get("dictionary_id"),
+                    int(bool(item.get("is_required"))),
+                    int(bool(item.get("is_collection"))),
+                    item.get("max_value_count"),
+                    int(bool(item.get("category_dependent"))),
+                    json.dumps(item, ensure_ascii=False),
+                ),
+            )
+            inserted += 1
+            if item.get("is_required"):
+                required += 1
+        conn.commit()
+        return {"inserted": inserted, "required": required, "total": inserted}
+    except Exception:
+        conn.rollback()
+        raise
 
 
 def list_cached_attributes(
@@ -721,13 +728,7 @@ def sync_attribute_dictionary_values(
         (int(description_category_id), int(type_id), int(attribute_id)),
     ).fetchone()
     dictionary_id = int(attr_row["dictionary_id"]) if attr_row and attr_row["dictionary_id"] is not None else None
-
-    conn.execute(
-        "DELETE FROM ozon_attribute_value_cache WHERE description_category_id = ? AND type_id = ? AND attribute_id = ?",
-        (int(description_category_id), int(type_id), int(attribute_id)),
-    )
-
-    inserted = 0
+    collected_values: list[dict[str, Any]] = []
     last_value_id = 0
     while True:
         payload = {
@@ -743,6 +744,20 @@ def sync_attribute_dictionary_values(
         response = _post("/v1/description-category/attribute/values", payload, client_id=client_id, api_key=api_key)
         result = response.get("result") or []
         for item in result:
+            collected_values.append(item)
+            if item.get("id") is not None:
+                last_value_id = int(item.get("id"))
+        has_next = bool(response.get("has_next"))
+        if not has_next or not result:
+            break
+    inserted = 0
+    try:
+        conn.execute("BEGIN")
+        conn.execute(
+            "DELETE FROM ozon_attribute_value_cache WHERE description_category_id = ? AND type_id = ? AND attribute_id = ?",
+            (int(description_category_id), int(type_id), int(attribute_id)),
+        )
+        for item in collected_values:
             conn.execute(
                 """
                 INSERT INTO ozon_attribute_value_cache (
@@ -771,19 +786,16 @@ def sync_attribute_dictionary_values(
                 ),
             )
             inserted += 1
-            if item.get("id") is not None:
-                last_value_id = int(item.get("id"))
-        has_next = bool(response.get("has_next"))
-        if not has_next or not result:
-            break
-
-    conn.commit()
-    return {
-        "inserted": inserted,
-        "attribute_id": int(attribute_id),
-        "dictionary_id": dictionary_id,
-        "attribute_name": attr_row["name"] if attr_row else None,
-    }
+        conn.commit()
+        return {
+            "inserted": inserted,
+            "attribute_id": int(attribute_id),
+            "dictionary_id": dictionary_id,
+            "attribute_name": attr_row["name"] if attr_row else None,
+        }
+    except Exception:
+        conn.rollback()
+        raise
 
 
 
