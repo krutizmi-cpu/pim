@@ -2977,6 +2977,20 @@ def render_section_help() -> None:
         )
 
 
+def _search_terms(value: str) -> list[str]:
+    return [token for token in re.split(r"\s+", str(value or "").strip().lower()) if token]
+
+
+def _matches_search_tokens(values: list[object], query: str) -> bool:
+    terms = _search_terms(query)
+    if not terms:
+        return True
+    haystacks = [str(value or "").strip().lower() for value in values if str(value or "").strip()]
+    if not haystacks:
+        return False
+    return all(any(term in haystack for haystack in haystacks) for term in terms)
+
+
 def _build_product_filters(
     search: str = "",
     category: str = "",
@@ -2988,9 +3002,16 @@ def _build_product_filters(
     params: list[object] = []
 
     if search:
-        where.append("(name LIKE ? OR article LIKE ? OR barcode LIKE ? OR supplier_article LIKE ?)")
-        s = f"%{search}%"
-        params.extend([s, s, s, s])
+        search_terms = _search_terms(search)
+        for term in search_terms:
+            where.append(
+                "("
+                "article LIKE ? OR supplier_article LIKE ? OR internal_article LIKE ? OR barcode LIKE ? "
+                "OR name LIKE ? OR brand LIKE ? OR category LIKE ? OR base_category LIKE ? OR subcategory LIKE ?"
+                ")"
+            )
+            s = f"%{term}%"
+            params.extend([s, s, s, s, s, s, s, s, s])
 
     if category:
         where.append(
@@ -3125,17 +3146,13 @@ def find_products_for_card(
 ) -> list[dict]:
     where: list[str] = []
     params: list[object] = []
-    if search:
-        where.append("(name LIKE ? OR article LIKE ? OR internal_article LIKE ? OR supplier_article LIKE ?)")
-        s = f"%{search.strip()}%"
-        params.extend([s, s, s, s])
     if supplier and supplier != "Все":
         where.append("LOWER(TRIM(supplier_name)) = LOWER(TRIM(?))")
         params.append(supplier)
 
     sql = """
         SELECT
-            id, article, internal_article, supplier_article, name,
+            id, article, internal_article, supplier_article, name, brand, barcode,
             category, base_category, subcategory, supplier_name, ozon_category_path,
             ozon_description_category_id, ozon_type_id, supplier_parse_status, updated_at
         FROM products
@@ -3153,6 +3170,25 @@ def find_products_for_card(
         parts = _split_ozon_path_parts(item.get("ozon_category_path"))
         item["ozon_subcategory"] = parts[-1] if parts else ""
         item["ozon_category"] = parts[-2] if len(parts) >= 2 else item["ozon_subcategory"]
+        if search and not _matches_search_tokens(
+            [
+                item.get("article"),
+                item.get("internal_article"),
+                item.get("supplier_article"),
+                item.get("name"),
+                item.get("brand"),
+                item.get("barcode"),
+                item.get("supplier_name"),
+                item.get("category"),
+                item.get("base_category"),
+                item.get("subcategory"),
+                item.get("ozon_category"),
+                item.get("ozon_subcategory"),
+                item.get("ozon_category_path"),
+            ],
+            search,
+        ):
+            continue
         if category_filter and category_filter != "все":
             if str(item.get("ozon_category") or "").strip().lower() != category_filter:
                 continue
@@ -3167,20 +3203,27 @@ def find_products_for_card(
 
 def _card_product_sort_key(item: dict, search: str = "") -> tuple:
     query = str(search or "").strip().lower()
+    terms = _search_terms(query)
     article = str(item.get("article") or "").strip().lower()
     internal_article = str(item.get("internal_article") or "").strip().lower()
     supplier_article = str(item.get("supplier_article") or "").strip().lower()
     name = str(item.get("name") or "").strip().lower()
+    brand = str(item.get("brand") or "").strip().lower()
     exact = 0 if query and query in {article, internal_article, supplier_article} else 1
     starts = 0 if query and (
         article.startswith(query) or internal_article.startswith(query) or supplier_article.startswith(query)
     ) else 1
-    contains = 0 if query and query and (
-        query in article or query in internal_article or query in supplier_article or query in name
+    token_hit = 0 if terms and any(
+        (article.startswith(term) or internal_article.startswith(term) or supplier_article.startswith(term))
+        for term in terms
+    ) else 1
+    contains = 0 if query and (
+        _matches_search_tokens([article, internal_article, supplier_article, name, brand], query)
     ) else 1
     return (
         exact,
         starts,
+        token_hit,
         contains,
         article or supplier_article or internal_article or name,
         -int(item.get("id") or 0),
@@ -5754,7 +5797,7 @@ def show_product_tab():
     media_settings = load_media_settings(conn)
     media_public_base_url = str(media_settings.get("public_base_url") or "").strip()
     st.subheader("Поиск и выбор товара для редактирования")
-    st.caption("Работаем от артикула: сначала находишь товар через быстрый список, затем открываешь карточку для точечной доводки.")
+    st.caption("Найди товар по артикулу, бренду или нескольким словам, затем спокойно доведи карточку ниже.")
     with st.container(border=True):
         fs1, fs2, fs3, fs4, fs5 = st.columns([3, 2, 2, 2, 1])
         with fs1:
@@ -5840,7 +5883,7 @@ def show_product_tab():
             st.session_state["selected_product_id"] = int(product_options[min(len(product_options) - 1, idx + 1)])
             st.rerun()
     with n3:
-        st.caption("Выбор товара теперь ориентирован на артикул. Сначала смотри быстрый список выше, затем открывай нужную карточку.")
+        st.caption("Список выше нужен для быстрого выбора. Поиск работает по нескольким словам и ключевым полям товара.")
     selected_product_id = st.selectbox(
         "Товар по артикулу / названию",
         options=product_options,
@@ -5890,138 +5933,40 @@ def show_product_tab():
     ps3.metric("Парсинг", _parse_status_label(product["supplier_parse_status"] if "supplier_parse_status" in product.keys() else None))
     ps4.metric("Фото", int(len(current_gallery_urls)))
     ps5.metric("Ядро", f"{int(product_core_filled)}/{int(product_core_total)}")
-
-    with st.expander("Текущие настройки парсинга", expanded=False):
-        st.caption(
-            "Порядок fallback: supplier_url -> Ozon -> Яндекс Маркет -> web -> category stats/defaults. "
-            "Изменить настройки можно во вкладке Каталог."
-        )
-        st.write(
-            {
-                "timeout_seconds": parser_settings.get("timeout_seconds"),
-                "max_hops": parser_settings.get("max_hops"),
-                "fallback_max_results": parser_settings.get("fallback_max_results"),
-                "source_strategy": parser_settings.get("source_strategy"),
-                "extra_fallback_domains": parser_settings.get("extra_fallback_domains"),
-                "require_article_match": parser_settings.get("require_article_match"),
-                "min_name_overlap": parser_settings.get("min_name_overlap"),
-                "min_fallback_score": parser_settings.get("min_fallback_score"),
-                "enable_web_fallback": parser_settings.get("enable_web_fallback"),
-                "enable_ozon_fallback": parser_settings.get("enable_ozon_fallback"),
-                "enable_yandex_fallback": parser_settings.get("enable_yandex_fallback"),
-                "enable_stats_fallback": parser_settings.get("enable_stats_fallback"),
-                "enable_defaults_fallback": parser_settings.get("enable_defaults_fallback"),
-            }
-        )
-    with st.expander("Инструкция по кнопкам раздела Карточка", expanded=False):
-        st.markdown(
-            """
-- `Поиск товара (артикул/наименование) / Категория Ozon / Подкатегория Ozon / Поставщик`: фильтр выбора товара для редактирования.
-- `Быстрый список`: смотри артикул и открывай нужный товар без долгого поиска по форме.
-- Если у товара уже определена Ozon-категория, её атрибуты автоматически подтягиваются в блок редактирования ниже.
-- `Заполнить товар по основному пайплайну`: главный режим для одного товара. Делает Ozon -> supplier/web -> AI.
-- `Точечные операции по товару`: ручные supplier/Ozon действия для сложных случаев.
-- `Стратегия парсинга для этого товара`: вручную выбрать сценарий поиска данных (поставщик, web, домены).
-- `Рассчитать габариты/вес (статистика)`: заполнить пустые логистические поля по статистике похожих товаров и типовым значениям.
-- `Галерея фото`: поле для нескольких фото (по одной ссылке в строке), даже если сейчас найдена только одна картинка.
-- `AI-контент`: генерация SEO-описания, AI-подсказки для пустых Ozon-атрибутов и генерация 2 маркетинг-изображений.
-- `Подобрать Ozon категорию`: автоподбор эталонной категории Ozon.
-- `Перепривязать Ozon категорию (force)`: повторный подбор Ozon категории с перезаписью.
-- `Очистить Ozon-привязку`: сбросить неверный Ozon-match и заново выбрать категорию.
-- `Сохранить карточку`: сохранение ручных изменений.
-            """
-        )
-    category_values = list_catalog_categories(conn)
     supplier_profiles = list_supplier_profiles(conn, only_active=True)
     supplier_profile_map = {str(p["supplier_name"]): p for p in supplier_profiles}
-
-    with st.expander("Источник данных поставщика (URL template / профиль)", expanded=False):
-        sp1, sp2, sp3 = st.columns([2, 3, 1])
-        with sp1:
-            profile_name = st.selectbox(
-                "Профиль поставщика",
-                options=[""] + sorted(supplier_profile_map.keys()),
-                index=(sorted(supplier_profile_map.keys()).index(str(product["supplier_name"])) + 1) if (product["supplier_name"] and str(product["supplier_name"]) in supplier_profile_map) else 0,
-                key=f"product_supplier_profile_{int(product_id)}",
-            )
-        with sp2:
-            selected_profile_template = (
-                supplier_profile_map.get(profile_name, {}).get("url_template")
-                if profile_name
-                else ""
-            )
-            supplier_url_template = st.text_input(
-                "URL template для товара",
-                value=selected_profile_template or "",
-                placeholder="https://site.ru/catalog/?q={supplier_article_q}",
-                key=f"product_supplier_url_template_{int(product_id)}",
-                help="Поддерживаются плейсхолдеры: {article}, {supplier_article}, {name}, {code} и *_q.",
-            )
-        with sp3:
-            if st.button("Подставить URL", key=f"product_apply_supplier_url_{int(product_id)}"):
-                render_payload = {
-                    "article": product["article"],
-                    "supplier_article": product["supplier_article"],
-                    "name": product["name"],
-                    "category": product["category"],
-                    "code": product["supplier_article"] or product["article"],
-                }
-                generated_url = render_supplier_url(supplier_url_template, render_payload) if supplier_url_template else None
-                if generated_url:
-                    save_product(
-                        conn,
-                        int(product_id),
-                        {
-                            "supplier_name": profile_name or product["supplier_name"] or None,
-                            "supplier_url": generated_url,
-                        },
-                    )
-                    save_field_source(
-                        conn=conn,
-                        product_id=int(product_id),
-                        field_name="supplier_url",
-                        source_type="manual",
-                        source_value_raw=generated_url,
-                        source_url=None,
-                        confidence=1.0,
-                        is_manual=True,
-                    )
-                    st.success("URL поставщика подставлен из шаблона профиля.")
-                    st.rerun()
-                else:
-                    st.warning("Не удалось собрать URL. Проверь шаблон и поля товара.")
-
-        sp4, sp5 = st.columns([2, 3])
-        strategy_options = [
-            ("auto_full", "Авто: поставщик -> web-поиск -> AI"),
-            ("supplier_only", "Только сайт поставщика"),
-            ("web_only", "Только интернет-поиск + AI"),
-            ("custom_domains", "Только выбранные домены"),
-        ]
-        strategy_values = [x[0] for x in strategy_options]
-        default_strategy = str(parser_settings.get("source_strategy", "auto_full") or "auto_full")
-        if default_strategy not in strategy_values:
-            default_strategy = "auto_full"
-        with sp4:
-            product_source_strategy = st.selectbox(
-                "Стратегия парсинга для этого товара",
-                options=strategy_values,
-                index=strategy_values.index(default_strategy),
-                format_func=lambda x: next((label for key, label in strategy_options if key == x), x),
-                key=f"product_source_strategy_{int(product_id)}",
-            )
-        with sp5:
-            product_extra_domains = st.text_input(
-                "Доп. домены (override для товара)",
-                value=str(parser_settings.get("extra_fallback_domains", "") or ""),
-                key=f"product_extra_domains_{int(product_id)}",
-                help="Через запятую: домены, где искать карточку товара для fallback.",
-            )
-
-        st.caption(
-            "Если на сайте поставщика неполные данные, используй fallback и дополнительные домены. "
-            "Ozon/Яндекс здесь работают как приоритет поиска в интернете, а не как гарантированный прямой парсинг маркетплейса."
+    strategy_options = [
+        ("auto_full", "Авто: поставщик -> web-поиск -> AI"),
+        ("supplier_only", "Только сайт поставщика"),
+        ("web_only", "Только интернет-поиск + AI"),
+        ("custom_domains", "Только выбранные домены"),
+    ]
+    strategy_values = [x[0] for x in strategy_options]
+    default_strategy = str(parser_settings.get("source_strategy", "auto_full") or "auto_full")
+    if default_strategy not in strategy_values:
+        default_strategy = "auto_full"
+    supplier_profile_options = sorted(supplier_profile_map.keys())
+    profile_name = st.session_state.get(
+        f"product_supplier_profile_{int(product_id)}",
+        str(product["supplier_name"]) if (product["supplier_name"] and str(product["supplier_name"]) in supplier_profile_map) else "",
+    )
+    if profile_name not in supplier_profile_map:
+        profile_name = ""
+    selected_profile_template = supplier_profile_map.get(profile_name, {}).get("url_template") if profile_name else ""
+    supplier_url_template = str(
+        st.session_state.get(f"product_supplier_url_template_{int(product_id)}", selected_profile_template or "")
+    )
+    product_source_strategy = str(
+        st.session_state.get(f"product_source_strategy_{int(product_id)}", default_strategy)
+    )
+    if product_source_strategy not in strategy_values:
+        product_source_strategy = default_strategy
+    product_extra_domains = str(
+        st.session_state.get(
+            f"product_extra_domains_{int(product_id)}",
+            str(parser_settings.get("extra_fallback_domains", "") or ""),
         )
+    )
 
     runtime_parser_settings = dict(parser_settings)
     runtime_parser_settings["source_strategy"] = str(locals().get("product_source_strategy") or parser_settings.get("source_strategy", "auto_full"))
@@ -6098,10 +6043,12 @@ def show_product_tab():
             "если нужно вручную перепривязать категорию или сделать точечную диагностику."
         )
 
-    with st.expander("Точечные операции по товару", expanded=False):
-        ctop1, ctop2 = st.columns([1, 1])
+    with st.container(border=True):
+        st.markdown("#### Ручные действия по товару")
+        st.caption("Открывай этот блок, только если нужно вручную допарсить товар, перепривязать категорию или пересобрать служебные данные.")
+        ctop1, ctop2, ctop3 = st.columns(3)
         with ctop1:
-            if st.button("Спарсить поставщика", help="Обогатить карточку с сайта поставщика без жесткой перезаписи ручных значений"):
+            if st.button("Спарсить поставщика", use_container_width=True, help="Обогатить карточку с сайта поставщика без жесткой перезаписи ручных значений"):
                 result = enrich_product_from_supplier(conn, int(product_id), force=False, parser_settings=runtime_parser_settings)
                 if result["ok"]:
                     st.success(result["message"])
@@ -6111,18 +6058,7 @@ def show_product_tab():
                 else:
                     st.error(result["message"])
         with ctop2:
-            if st.button("Перезаполнить из поставщика", help="Жесткая перезапись значений из supplier page (force-режим)"):
-                result = enrich_product_from_supplier(conn, int(product_id), force=True, parser_settings=runtime_parser_settings)
-                if result["ok"]:
-                    st.success(result["message"])
-                    if result.get("updates"):
-                        st.json(result["updates"])
-                    st.rerun()
-                else:
-                    st.error(result["message"])
-        ctop3, ctop4, ctop4b = st.columns([1, 1, 1])
-        with ctop3:
-            if st.button("Подобрать Ozon категорию", help="Подобрать эталонную Ozon категорию автоматически"):
+            if st.button("Подобрать Ozon категорию", use_container_width=True, help="Подобрать эталонную Ozon категорию автоматически"):
                 res = bulk_assign_ozon_categories(conn, [int(product_id)], min_score=OZON_CATEGORY_MIN_SCORE, force=False)
                 refreshed_product = get_product(conn, int(product_id))
                 materialized = {"slots_created": 0}
@@ -6141,43 +6077,8 @@ def show_product_tab():
                         f"Создано слотов Ozon-атрибутов: {int(materialized.get('slots_created') or 0)}."
                     )
                 st.rerun()
-        with ctop4:
-            if st.button("Перепривязать Ozon категорию (force)", help="Повторно назначить Ozon категорию с перезаписью текущей привязки"):
-                res = bulk_assign_ozon_categories(conn, [int(product_id)], min_score=OZON_CATEGORY_MIN_SCORE, force=True)
-                refreshed_product = get_product(conn, int(product_id))
-                materialized = {"slots_created": 0}
-                if refreshed_product:
-                    materialized = materialize_ozon_attribute_slots_for_product(
-                        conn,
-                        product_id=int(product_id),
-                        description_category_id=int(refreshed_product["ozon_description_category_id"] or 0),
-                        type_id=int(refreshed_product["ozon_type_id"] or 0),
-                    )
-                if res.get("message"):
-                    st.info(str(res["message"]))
-                else:
-                    st.success(
-                        f"Ozon force-привязка: обработано {res['processed']}, привязано {res['assigned']}, пропущено {res['skipped']}. "
-                        f"Создано слотов Ozon-атрибутов: {int(materialized.get('slots_created') or 0)}."
-                    )
-                st.rerun()
-        with ctop4b:
-            if st.button("Очистить Ozon-привязку", help="Убрать текущую Ozon категорию, если матчинг был неверным"):
-                save_product(
-                    conn,
-                    int(product_id),
-                    {
-                        "ozon_description_category_id": None,
-                        "ozon_type_id": None,
-                        "ozon_category_path": None,
-                        "ozon_category_confidence": None,
-                    },
-                )
-                st.success("Ozon-привязка очищена. Ниже можно вручную поправить category/base/subcategory и сохранить карточку.")
-                st.rerun()
-        dtop1, dtop2, dtop3, dtop4 = st.columns([1, 1, 1, 1])
-        with dtop1:
-            if st.button("Подобрать Detmir категорию", help="Подобрать клиентскую категорию Детского Мира по мастер-карточке и Ozon-ядру"):
+        with ctop3:
+            if st.button("Подобрать Detmir категорию", use_container_width=True, help="Подобрать клиентскую категорию Детского Мира по мастер-карточке и Ozon-ядру"):
                 detmir_match = detect_best_detmir_category_for_product(conn, dict(product))
                 if detmir_match.get("ok"):
                     matched = detmir_match.get("category") or {}
@@ -6205,90 +6106,207 @@ def show_product_tab():
                     st.rerun()
                 else:
                     st.warning(str(detmir_match.get("message") or "Не удалось уверенно подобрать Detmir-категорию. Ниже доступны варианты."))
-        with dtop2:
-            if st.button("Импортировать требования Detmir", help="Подтянуть overlay-атрибуты выбранной Detmir-категории в PIM"):
-                if detmir_category_id_current <= 0:
-                    st.warning("Сначала назначь Detmir-категорию.")
-                else:
-                    import_result = import_detmir_category_requirements_to_pim(conn, category_id=detmir_category_id_current)
-                    st.success(
-                        f"Detmir overlay импортирован: атрибутов {int(import_result.get('imported') or 0)}, "
-                        f"обязательных {int(import_result.get('required') or 0)}, "
-                        f"mapping rules {int(import_result.get('mapping_saved') or 0)}."
-                    )
-                    st.rerun()
-        with dtop3:
-            if st.button("Заполнить gaps под Detmir", help="Перенести уже найденные master/Ozon-данные в Detmir overlay для текущей категории"):
-                if detmir_category_id_current <= 0:
-                    st.warning("Сначала назначь Detmir-категорию.")
-                else:
-                    existing_detmir_requirements = list_channel_requirements(conn, channel_code="detmir", category_code=detmir_category_scope)
-                    if not existing_detmir_requirements:
-                        import_detmir_category_requirements_to_pim(conn, category_id=detmir_category_id_current)
-                    gapfill_result = _fill_channel_attrs_from_product_state(
-                        conn=conn,
-                        product_row=dict(product),
-                        channel_code="detmir",
-                        category_code=detmir_category_scope,
-                        source_type="derived_from_master",
-                        source_url="detmir_overlay_gapfill",
-                        force=False,
-                        target_channel_code="detmir",
-                    )
-                    st.success(
-                        f"Detmir gaps обработаны: заполнено {int(gapfill_result.get('saved') or 0)}, "
-                        f"пропущено {int(gapfill_result.get('skipped') or 0)}, "
-                        f"всего целей {int(gapfill_result.get('targets') or 0)}."
-                    )
-                    st.rerun()
-        with dtop4:
-            if st.button("Очистить Detmir-привязку", help="Убрать текущую категорию Детского Мира, если матчинг был неверным"):
-                save_product(
-                    conn,
-                    int(product_id),
-                    {
-                        "detmir_category_id": None,
-                        "detmir_category_path": None,
-                        "detmir_category_confidence": None,
-                    },
+        with st.expander("Редкие и сервисные действия", expanded=False):
+            st.caption("Здесь находятся force-режимы, шаблон URL поставщика, Detmir-gapfill и статистический расчёт габаритов.")
+            sp1, sp2, sp3 = st.columns([2, 3, 1])
+            with sp1:
+                profile_name = st.selectbox(
+                    "Профиль поставщика",
+                    options=[""] + supplier_profile_options,
+                    index=((supplier_profile_options.index(profile_name) + 1) if profile_name in supplier_profile_options else 0),
+                    key=f"product_supplier_profile_{int(product_id)}",
                 )
-                st.success("Detmir-привязка очищена. Ниже можно вручную выбрать или скорректировать категорию и сохранить карточку.")
-                st.rerun()
+            with sp2:
+                supplier_url_template = st.text_input(
+                    "URL template для товара",
+                    value=selected_profile_template or supplier_url_template or "",
+                    placeholder="https://site.ru/catalog/?q={supplier_article_q}",
+                    key=f"product_supplier_url_template_{int(product_id)}",
+                    help="Поддерживаются плейсхолдеры: {article}, {supplier_article}, {name}, {code} и *_q.",
+                )
+            with sp3:
+                st.markdown("<br>", unsafe_allow_html=True)
+                if st.button("Подставить URL", key=f"product_apply_supplier_url_{int(product_id)}", use_container_width=True):
+                    render_payload = {
+                        "article": product["article"],
+                        "supplier_article": product["supplier_article"],
+                        "name": product["name"],
+                        "category": product["category"],
+                        "code": product["supplier_article"] or product["article"],
+                    }
+                    generated_url = render_supplier_url(supplier_url_template, render_payload) if supplier_url_template else None
+                    if generated_url:
+                        save_product(
+                            conn,
+                            int(product_id),
+                            {
+                                "supplier_name": profile_name or product["supplier_name"] or None,
+                                "supplier_url": generated_url,
+                            },
+                        )
+                        save_field_source(
+                            conn=conn,
+                            product_id=int(product_id),
+                            field_name="supplier_url",
+                            source_type="manual",
+                            source_value_raw=generated_url,
+                            source_url=None,
+                            confidence=1.0,
+                            is_manual=True,
+                        )
+                        st.success("URL поставщика подставлен из шаблона профиля.")
+                        st.rerun()
+                    else:
+                        st.warning("Не удалось собрать URL. Проверь шаблон и поля товара.")
 
-    ctop5, ctop6, ctop7 = st.columns([1, 1, 2])
-    with ctop5:
-        card_dim_min_samples = st.number_input(
-            "Мин. выборка (карточка)",
-            min_value=1,
-            max_value=50,
-            value=4,
-            step=1,
-            key=f"card_dim_min_samples_{int(product_id)}",
-        )
-    with ctop6:
-        card_dim_force = st.checkbox(
-            "Перезаписать существующие",
-            value=False,
-            key=f"card_dim_force_{int(product_id)}",
-        )
-    with ctop7:
-        st.markdown("<br>", unsafe_allow_html=True)
-        if st.button("Рассчитать габариты/вес (статистика)", key=f"card_estimate_dims_{int(product_id)}"):
-            dim_result = estimate_dimensions_for_product(
-                conn=conn,
-                product_id=int(product_id),
-                force=bool(card_dim_force),
-                min_samples=int(card_dim_min_samples),
-            )
-            if dim_result.get("ok"):
-                st.success(
-                    f"{dim_result.get('message')}. Источники: {', '.join(dim_result.get('used_sources') or []) or '-'}"
+            sp4, sp5 = st.columns([2, 3])
+            with sp4:
+                product_source_strategy = st.selectbox(
+                    "Стратегия парсинга для этого товара",
+                    options=strategy_values,
+                    index=strategy_values.index(product_source_strategy),
+                    format_func=lambda x: next((label for key, label in strategy_options if key == x), x),
+                    key=f"product_source_strategy_{int(product_id)}",
                 )
-                if dim_result.get("updates"):
-                    st.json(dim_result.get("updates"))
-                st.rerun()
-            else:
-                st.error(str(dim_result.get("message") or "Не удалось рассчитать габариты/вес"))
+            with sp5:
+                product_extra_domains = st.text_input(
+                    "Доп. домены (override для товара)",
+                    value=product_extra_domains,
+                    key=f"product_extra_domains_{int(product_id)}",
+                    help="Через запятую: домены, где искать карточку товара для fallback.",
+                )
+
+            adv1, adv2, adv3 = st.columns(3)
+            with adv1:
+                if st.button("Перезаполнить из поставщика", use_container_width=True, help="Жесткая перезапись значений из supplier page"):
+                    result = enrich_product_from_supplier(conn, int(product_id), force=True, parser_settings=runtime_parser_settings)
+                    if result["ok"]:
+                        st.success(result["message"])
+                        if result.get("updates"):
+                            st.json(result["updates"])
+                        st.rerun()
+                    else:
+                        st.error(result["message"])
+            with adv2:
+                if st.button("Перепривязать Ozon категорию", use_container_width=True, help="Повторно назначить Ozon категорию с перезаписью текущей привязки"):
+                    res = bulk_assign_ozon_categories(conn, [int(product_id)], min_score=OZON_CATEGORY_MIN_SCORE, force=True)
+                    refreshed_product = get_product(conn, int(product_id))
+                    materialized = {"slots_created": 0}
+                    if refreshed_product:
+                        materialized = materialize_ozon_attribute_slots_for_product(
+                            conn,
+                            product_id=int(product_id),
+                            description_category_id=int(refreshed_product["ozon_description_category_id"] or 0),
+                            type_id=int(refreshed_product["ozon_type_id"] or 0),
+                        )
+                    if res.get("message"):
+                        st.info(str(res["message"]))
+                    else:
+                        st.success(
+                            f"Ozon force-привязка: обработано {res['processed']}, привязано {res['assigned']}, пропущено {res['skipped']}. "
+                            f"Создано слотов Ozon-атрибутов: {int(materialized.get('slots_created') or 0)}."
+                        )
+                    st.rerun()
+            with adv3:
+                if st.button("Очистить Ozon-привязку", use_container_width=True, help="Убрать текущую Ozon категорию, если матчинг был неверным"):
+                    save_product(
+                        conn,
+                        int(product_id),
+                        {
+                            "ozon_description_category_id": None,
+                            "ozon_type_id": None,
+                            "ozon_category_path": None,
+                            "ozon_category_confidence": None,
+                        },
+                    )
+                    st.success("Ozon-привязка очищена. Ниже можно вручную поправить category/base/subcategory и сохранить карточку.")
+                    st.rerun()
+
+            det1, det2, det3 = st.columns(3)
+            with det1:
+                if st.button("Импортировать требования Detmir", use_container_width=True, help="Подтянуть overlay-атрибуты выбранной Detmir-категории в PIM"):
+                    if detmir_category_id_current <= 0:
+                        st.warning("Сначала назначь Detmir-категорию.")
+                    else:
+                        import_result = import_detmir_category_requirements_to_pim(conn, category_id=detmir_category_id_current)
+                        st.success(
+                            f"Detmir overlay импортирован: атрибутов {int(import_result.get('imported') or 0)}, "
+                            f"обязательных {int(import_result.get('required') or 0)}, "
+                            f"mapping rules {int(import_result.get('mapping_saved') or 0)}."
+                        )
+                        st.rerun()
+            with det2:
+                if st.button("Заполнить gaps под Detmir", use_container_width=True, help="Перенести уже найденные master/Ozon-данные в Detmir overlay для текущей категории"):
+                    if detmir_category_id_current <= 0:
+                        st.warning("Сначала назначь Detmir-категорию.")
+                    else:
+                        existing_detmir_requirements = list_channel_requirements(conn, channel_code="detmir", category_code=detmir_category_scope)
+                        if not existing_detmir_requirements:
+                            import_detmir_category_requirements_to_pim(conn, category_id=detmir_category_id_current)
+                        gapfill_result = _fill_channel_attrs_from_product_state(
+                            conn=conn,
+                            product_row=dict(product),
+                            channel_code="detmir",
+                            category_code=detmir_category_scope,
+                            source_type="derived_from_master",
+                            source_url="detmir_overlay_gapfill",
+                            force=False,
+                            target_channel_code="detmir",
+                        )
+                        st.success(
+                            f"Detmir gaps обработаны: заполнено {int(gapfill_result.get('saved') or 0)}, "
+                            f"пропущено {int(gapfill_result.get('skipped') or 0)}, "
+                            f"всего целей {int(gapfill_result.get('targets') or 0)}."
+                        )
+                        st.rerun()
+            with det3:
+                if st.button("Очистить Detmir-привязку", use_container_width=True, help="Убрать текущую категорию Детского Мира, если матчинг был неверным"):
+                    save_product(
+                        conn,
+                        int(product_id),
+                        {
+                            "detmir_category_id": None,
+                            "detmir_category_path": None,
+                            "detmir_category_confidence": None,
+                        },
+                    )
+                    st.success("Detmir-привязка очищена. Ниже можно вручную выбрать или скорректировать категорию и сохранить карточку.")
+                    st.rerun()
+
+            ctop5, ctop6, ctop7 = st.columns([1, 1, 2])
+            with ctop5:
+                card_dim_min_samples = st.number_input(
+                    "Мин. выборка",
+                    min_value=1,
+                    max_value=50,
+                    value=4,
+                    step=1,
+                    key=f"card_dim_min_samples_{int(product_id)}",
+                )
+            with ctop6:
+                card_dim_force = st.checkbox(
+                    "Перезаписать существующие",
+                    value=False,
+                    key=f"card_dim_force_{int(product_id)}",
+                )
+            with ctop7:
+                st.markdown("<br>", unsafe_allow_html=True)
+                if st.button("Рассчитать габариты/вес (статистика)", key=f"card_estimate_dims_{int(product_id)}", use_container_width=True):
+                    dim_result = estimate_dimensions_for_product(
+                        conn=conn,
+                        product_id=int(product_id),
+                        force=bool(card_dim_force),
+                        min_samples=int(card_dim_min_samples),
+                    )
+                    if dim_result.get("ok"):
+                        st.success(
+                            f"{dim_result.get('message')}. Источники: {', '.join(dim_result.get('used_sources') or []) or '-'}"
+                        )
+                        if dim_result.get("updates"):
+                            st.json(dim_result.get("updates"))
+                        st.rerun()
+                    else:
+                        st.error(str(dim_result.get("message") or "Не удалось рассчитать габариты/вес"))
 
     parse_status = product["supplier_parse_status"] if "supplier_parse_status" in product.keys() else None
     parse_comment = product["supplier_parse_comment"] if "supplier_parse_comment" in product.keys() else None
@@ -7079,27 +7097,6 @@ def show_product_tab():
                 "Здесь собраны атрибуты категории канала и атрибуты из mapping rules (source_type=attribute). "
                 "Для Ozon и Detmir по умолчанию открывается scope текущей категории товара."
             )
-            if st.button(
-                "Автозаполнить этот блок из уже найденных данных товара",
-                key=f"card_attr_autofill_btn_{int(product_id)}_{selected_channel}_{selected_scope or 'all'}",
-                help="Берёт уже заполненные поля карточки и мастер-атрибуты и пытается перенести их в атрибуты текущего канала/категории.",
-            ):
-                autofill_res = _fill_channel_attrs_from_product_state(
-                    conn=conn,
-                    product_row=dict(product),
-                    channel_code=str(selected_channel),
-                    category_code=(selected_scope or None),
-                    source_type="derived_from_master",
-                    source_url="product_state",
-                    force=False,
-                    target_channel_code=(selected_channel if save_as_channel else None),
-                )
-                st.success(
-                    f"Автозаполнение завершено: заполнено {int(autofill_res.get('saved') or 0)}, "
-                    f"пропущено {int(autofill_res.get('skipped') or 0)}, "
-                    f"всего атрибутов в блоке {int(autofill_res.get('targets') or 0)}."
-                )
-                st.rerun()
             edited_df = st.data_editor(
                 ed_df,
                 use_container_width=True,
@@ -7277,8 +7274,6 @@ def show_product_tab():
                 st.caption(
                     "Для Детского Мира сначала привяжи категорию, потом импортируй её требования и только после этого добивай gaps / готовь payload."
                 )
-            with st.expander("Подсказки по существующим категориям", expanded=False):
-                st.write(sorted(category_values)[:300] if category_values else ["Справочник категорий пока пуст"])
 
         with st.expander("3. Логистика и упаковка", expanded=False):
             lg1, lg2 = st.columns(2)
@@ -10676,7 +10671,6 @@ def main():
 6. **Клиентский шаблон**: подтяни shortlist и выгрузи готовую пачку.
             """
         )
-    render_section_help()
     if selected_section == "import":
         show_import_tab()
     elif selected_section == "catalog":
