@@ -4,6 +4,14 @@ import sqlite3
 from datetime import datetime
 
 
+def _normalize_profile_column(row: dict) -> dict:
+    normalized = dict(row)
+    has_mapping = bool(str(normalized.get("source_name") or "").strip()) and bool(str(normalized.get("source_type") or "").strip())
+    normalized["status"] = str(normalized.get("status") or ("matched" if has_mapping else "unmatched")).strip()
+    normalized["matched_by"] = str(normalized.get("matched_by") or "saved_profile").strip() or "saved_profile"
+    return normalized
+
+
 def save_template_profile(
     conn: sqlite3.Connection,
     profile_name: str,
@@ -99,4 +107,4 @@ def get_template_profile_columns(conn: sqlite3.Connection, profile_id: int) -> l
         "SELECT * FROM template_profile_columns WHERE profile_id = ? ORDER BY sort_order, id",
         (int(profile_id),),
     ).fetchall()
-    return [dict(r) for r in rows]
+    return [_normalize_profile_column(dict(r)) for r in rows]

@@ -1419,6 +1419,29 @@ def _safe_int_id(value: object) -> int:
         return 0
 
 
+def _safe_float_value(value: object, default: float = 0.0) -> float:
+    try:
+        if value is None:
+            return float(default)
+        if pd.isna(value):
+            return float(default)
+    except Exception:
+        pass
+    try:
+        return float(value)
+    except Exception:
+        return float(default)
+
+
+def _clamp_unit_confidence(value: object) -> float:
+    return max(0.0, min(1.0, _safe_float_value(value, default=0.0)))
+
+
+def _detmir_confidence_from_match_score(score: object) -> float | None:
+    normalized = _clamp_unit_confidence(_safe_float_value(score, default=0.0) / 10.0)
+    return normalized if normalized > 0 else None
+
+
 def compute_quick_ozon_readiness(conn, product_row) -> dict[str, object]:
     product_id = _safe_int_id(product_row.get("id")) if hasattr(product_row, "get") else 0
     desc_id = _safe_int_id(product_row.get("ozon_description_category_id")) if hasattr(product_row, "get") else 0
@@ -5038,7 +5061,7 @@ def show_catalog_tab():
                         payload = {
                             "detmir_category_id": detmir_category_id or None,
                             "detmir_category_path": str(matched.get("full_path") or matched.get("name") or "").strip() or None,
-                            "detmir_category_confidence": float(matched.get("match_score") or 0.0) / 10.0 if float(matched.get("match_score") or 0.0) > 0 else None,
+                            "detmir_category_confidence": _detmir_confidence_from_match_score(matched.get("match_score")),
                         }
                         save_product(conn, int(pid), payload)
                         save_field_source(
@@ -5048,7 +5071,7 @@ def show_catalog_tab():
                             source_type="detmir_category_match",
                             source_value_raw=detmir_category_id,
                             source_url=str(matched.get("full_path") or matched.get("name") or "detmir_match"),
-                            confidence=min(0.99, max(0.35, float(payload.get("detmir_category_confidence") or 0.0))),
+                            confidence=min(0.99, max(0.35, _clamp_unit_confidence(payload.get("detmir_category_confidence")))),
                             is_manual=False,
                         )
                         matched_categories += 1
@@ -6619,7 +6642,7 @@ def show_product_tab():
                     payload = {
                         "detmir_category_id": category_id or None,
                         "detmir_category_path": str(matched.get("full_path") or matched.get("name") or "").strip() or None,
-                        "detmir_category_confidence": float(matched.get("match_score") or 0.0) / 10.0 if float(matched.get("match_score") or 0.0) > 0 else None,
+                        "detmir_category_confidence": _detmir_confidence_from_match_score(matched.get("match_score")),
                     }
                     save_product(conn, int(product_id), payload)
                     save_field_source(
@@ -6629,7 +6652,7 @@ def show_product_tab():
                         source_type="detmir_category_match",
                         source_value_raw=category_id,
                         source_url=str(matched.get("full_path") or matched.get("name") or "detmir_match"),
-                        confidence=min(0.99, max(0.35, float(payload.get("detmir_category_confidence") or 0.0))),
+                        confidence=min(0.99, max(0.35, _clamp_unit_confidence(payload.get("detmir_category_confidence")))),
                         is_manual=False,
                     )
                     st.success(
@@ -7400,7 +7423,7 @@ def show_product_tab():
                     {
                         "detmir_category_id": chosen_id or None,
                         "detmir_category_path": str(chosen.get("full_path") or chosen.get("name") or "").strip() or None,
-                        "detmir_category_confidence": float(chosen.get("match_score") or 0.0) / 10.0 if float(chosen.get("match_score") or 0.0) > 0 else None,
+                        "detmir_category_confidence": _detmir_confidence_from_match_score(chosen.get("match_score")),
                     },
                 )
                 save_field_source(
@@ -7737,7 +7760,7 @@ def show_product_tab():
                     detmir_category_id = st.number_input("Detmir category_id", min_value=0, value=int(product["detmir_category_id"] or 0), step=1, help="Можно выбрать вручную, если автоподбор Детского Мира ошибся.")
                     detmir_category_path = st.text_input("Detmir категория (path)", value=str(product["detmir_category_path"] or ""))
                 with det2:
-                    detmir_category_confidence = st.number_input("Уверенность Detmir категории (0..1)", min_value=0.0, max_value=1.0, value=float(product["detmir_category_confidence"] or 0.0), step=0.01)
+                    detmir_category_confidence = st.number_input("Уверенность Detmir категории (0..1)", min_value=0.0, max_value=1.0, value=_clamp_unit_confidence(product["detmir_category_confidence"]), step=0.01)
                     st.caption("Для Детского Мира сначала привяжи категорию, потом импортируй её требования и только после этого добивай gaps / готовь payload.")
 
             with st.expander("3. Логистика и упаковка", expanded=False):
@@ -7797,7 +7820,7 @@ def show_product_tab():
                     "ozon_category_confidence": float(ozon_category_confidence) if float(ozon_category_confidence) > 0 else None,
                     "detmir_category_id": int(detmir_category_id) if int(detmir_category_id) > 0 else None,
                     "detmir_category_path": detmir_category_path or None,
-                    "detmir_category_confidence": float(detmir_category_confidence) if float(detmir_category_confidence) > 0 else None,
+                    "detmir_category_confidence": _clamp_unit_confidence(detmir_category_confidence) if _clamp_unit_confidence(detmir_category_confidence) > 0 else None,
                     "uom": uom or None,
                     "weight": weight or None,
                     "length": length or None,

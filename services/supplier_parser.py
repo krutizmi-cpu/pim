@@ -61,12 +61,18 @@ SEARCH_BLOCKED_DOMAINS = (
 ANTI_BOT_HINTS = (
     "__qb",
     "__qca",
+    "__cf_chl_",
     "access denied",
     "bot verification",
-    "captcha",
+    "verify you are human",
+    "human verification",
+    "sorry, you have been blocked",
+    "cf-turnstile",
+    "hcaptcha",
     "проверка, что вы не робот",
     "проверка что вы не робот",
     "подтвердите, что вы не робот",
+    "подтвердите что вы не робот",
 )
 
 LIKELY_BLOCKED_SUPPLIER_DOMAINS = (
@@ -124,6 +130,15 @@ def _clean_text(value: Any) -> str:
 
 def _compact_text(value: str | None) -> str:
     return re.sub(r"[\s\-_]+", "", _clean_text(value).lower())
+
+
+def _looks_garbled_text(value: Any) -> bool:
+    text = _clean_text(value)
+    if not text:
+        return False
+    hebrew_chars = sum(1 for ch in text if "\u0590" <= ch <= "\u05FF")
+    replacement_chars = text.count("�")
+    return hebrew_chars >= 2 or replacement_chars >= 1
 
 
 def _is_probably_product_code(token: str) -> bool:
@@ -205,7 +220,84 @@ def looks_like_access_block_page(html: str | None) -> bool:
     text = str(html or "").lower()
     if not text:
         return False
-    return any(marker in text for marker in ANTI_BOT_HINTS)
+    if any(marker in text for marker in ANTI_BOT_HINTS):
+        return True
+    has_captcha_widget = any(
+        marker in text
+        for marker in (
+            "g-recaptcha",
+            "grecaptcha.render",
+            "/recaptcha/api.js",
+            "/recaptcha/enterprise.js",
+        )
+    )
+    has_human_challenge_text = any(
+        marker in text
+        for marker in (
+            "i am human",
+            "i'm human",
+            "you are human",
+            "prove you are human",
+            "prove you're human",
+            "not a robot",
+            "robot check",
+            "captcha required",
+            "enter the characters you see below",
+        )
+    )
+    return bool(has_captcha_widget and has_human_challenge_text)
+
+
+def _build_internal_search_urls(preferred_domain: str | None, query: str) -> list[str]:
+    domain = str(preferred_domain or "").strip().lower().replace("www.", "")
+    clean_query = _clean_text(query)
+    if not domain or not clean_query:
+        return []
+    encoded = quote_plus(clean_query)
+    return [
+        f"https://{domain}/search/?q={encoded}",
+        f"https://{domain}/search?q={encoded}",
+        f"https://{domain}/?s={encoded}",
+        f"https://{domain}/catalog/?q={encoded}",
+    ]
+
+
+def _search_preferred_domain_links(
+    query: str,
+    timeout: float,
+    max_links: int,
+    preferred_domain: str | None = None,
+    hints: list[str] | None = None,
+) -> list[str]:
+    links: list[str] = []
+    seen: set[str] = set()
+    clean_hints = [query] + [str(item or "") for item in (hints or []) if _clean_text(item)]
+    for search_url in _build_internal_search_urls(preferred_domain, query):
+        try:
+            html = fetch_supplier_page(search_url, timeout=timeout)
+            soup = BeautifulSoup(html, "html.parser")
+            ranked = _ranked_product_urls_from_listing(
+                soup,
+                page_url=search_url,
+                hints=clean_hints,
+                max_urls=max_links,
+            )
+            if not ranked:
+                raw = extract_supplier_data(html, search_url)
+                ranked = list(raw.get("candidate_product_urls") or [])[: max_links]
+            for candidate in ranked:
+                normalized = _normalize_result_url(candidate)
+                if not normalized or normalized in seen:
+                    continue
+                if _is_blocked_search_domain(normalized, preferred_domain=preferred_domain):
+                    continue
+                seen.add(normalized)
+                links.append(normalized)
+                if len(links) >= max_links:
+                    return links
+        except Exception:
+            continue
+    return links
 
 
 def _extract_article_like_value(parsed: dict[str, Any]) -> str:
@@ -420,6 +512,47 @@ def _extract_image_urls(soup: BeautifulSoup, page_url: str | None = None) -> lis
             return image_urls
 
     return image_urls
+
+
+def _score_image_candidate(url: str, hints: list[str] | None = None) -> float:
+    low = str(url or "").lower()
+    if not low:
+        return -999.0
+    score = 0.0
+    if re.search(r"\.(jpg|jpeg|png|webp)(\?|$)", low):
+        score += 2.0
+    if low.endswith(".svg") or any(token in low for token in ("logo", "favicon", "sprite", "icon", "header-logo")):
+        score -= 8.0
+    if any(token in low for token in ("banner", "slider", "promo", "adv", "advert", "news")):
+        score -= 5.0
+    if "/images/" in low or "images-resize" in low:
+        score += 1.5
+    size_match = re.search(r"w(\d+)h(\d+)", low)
+    if size_match:
+        try:
+            width = int(size_match.group(1))
+            height = int(size_match.group(2))
+            score += min(width, height) / 500.0
+        except Exception:
+            pass
+    strong_phrases, tokens = _build_hint_tokens(hints)
+    compact_url = _compact_text(low)
+    for phrase in strong_phrases:
+        if phrase and phrase in compact_url:
+            score += 4.0
+    for tok in tokens:
+        if len(tok) >= 4 and tok in low:
+            score += 0.8
+    return score
+
+
+def _prioritize_image_urls(image_urls: list[str], hints: list[str] | None = None) -> list[str]:
+    scored: list[tuple[float, str]] = []
+    for idx, candidate in enumerate(image_urls):
+        score = _score_image_candidate(candidate, hints=hints) - (idx * 0.01)
+        scored.append((score, candidate))
+    scored.sort(key=lambda item: (-item[0], item[1]))
+    return [url for _, url in scored]
 
 
 def _extract_attributes(soup: BeautifulSoup) -> dict[str, str]:
@@ -812,7 +945,10 @@ def extract_supplier_data(html: str, url: str | None = None) -> dict[str, Any]:
     h1 = soup.select_one("h1")
     h1_text = _clean_text(h1.get_text(" ", strip=True) if h1 else "")
 
-    name = _clean_text(product_ld.get("name") or h1_text or title)
+    json_ld_name = _clean_text(product_ld.get("name"))
+    if _looks_garbled_text(json_ld_name):
+        json_ld_name = ""
+    name = _clean_text(json_ld_name or h1_text or title)
 
     description = None
     if isinstance(product_ld.get("description"), str):
@@ -954,6 +1090,8 @@ def parse_supplier_product_page(
     html = fetch_supplier_page(raw_url, timeout=timeout)
     raw = extract_supplier_data(html, raw_url)
     parsed = normalize_supplier_data(raw)
+    parsed["image_urls"] = _prioritize_image_urls(list(parsed.get("image_urls") or []), hints=clean_hints)
+    parsed["image_url"] = parsed["image_urls"][0] if parsed.get("image_urls") else None
     resolved_url = raw_url
     best_score = _relevance_score(parsed, resolved_url, hints=clean_hints, preferred_domain=preferred_domain)
 
@@ -983,6 +1121,8 @@ def parse_supplier_product_page(
                 second_html = fetch_supplier_page(candidate_url, timeout=timeout)
                 second_raw = extract_supplier_data(second_html, candidate_url)
                 second_parsed = normalize_supplier_data(second_raw)
+                second_parsed["image_urls"] = _prioritize_image_urls(list(second_parsed.get("image_urls") or []), hints=clean_hints)
+                second_parsed["image_url"] = second_parsed["image_urls"][0] if second_parsed.get("image_urls") else None
             except Exception:
                 continue
 
@@ -1143,22 +1283,31 @@ def fallback_search_product_data(
 
     for q in query_variants:
         candidate_links: list[str] = []
-        candidate_links.extend(
-            _search_duckduckgo_links(
+        if preferred_domain:
+            candidate_links = _search_preferred_domain_links(
                 q,
                 timeout=timeout,
                 max_links=max(6, int(max_results) * 3),
                 preferred_domain=preferred_domain,
+                hints=all_hints,
             )
-        )
-        candidate_links.extend(
-            _search_bing_links(
-                q,
-                timeout=timeout,
-                max_links=max(6, int(max_results) * 3),
-                preferred_domain=preferred_domain,
+        if not candidate_links:
+            candidate_links.extend(
+                _search_duckduckgo_links(
+                    q,
+                    timeout=timeout,
+                    max_links=max(6, int(max_results) * 3),
+                    preferred_domain=preferred_domain,
+                )
             )
-        )
+            candidate_links.extend(
+                _search_bing_links(
+                    q,
+                    timeout=timeout,
+                    max_links=max(6, int(max_results) * 3),
+                    preferred_domain=preferred_domain,
+                )
+            )
         for link in candidate_links:
             if link in seen_links:
                 continue
@@ -1186,6 +1335,11 @@ def fallback_search_product_data(
                 best["fallback_url"] = resolved
                 best["fallback_query"] = q
                 best["fallback_score"] = round(float(score), 3)
+        if best and preferred_domain:
+            best_host = (urlparse(str(best.get("fallback_url") or "")).netloc or "").lower().replace("www.", "")
+            pref_host = str(preferred_domain or "").lower().replace("www.", "")
+            if pref_host and best_host == pref_host and best_score >= 4.5:
+                break
         if considered > max_candidates:
             break
 
