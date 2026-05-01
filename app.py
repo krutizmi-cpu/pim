@@ -4625,6 +4625,61 @@ def show_catalog_tab():
     page_zip_signature = f"page:{int(page)}:{hashlib.sha1(','.join([str(int(x)) for x in ids]).encode('utf-8')).hexdigest()}"
     filtered_zip_signature = f"filtered:{hashlib.sha1(','.join([str(int(x)) for x in all_filtered_candidate_ids]).encode('utf-8')).hexdigest()}"
     selected_zip_signature = f"selected:{hashlib.sha1(','.join([str(int(x)) for x in selected_shortlist_ids]).encode('utf-8')).hexdigest()}" if selected_shortlist_ids else "selected:none"
+
+    catalog_scope_options = ["Выбранные товары", "Текущая страница", "Вся выборка по фильтру"]
+
+    def resolve_catalog_scope_ids(scope_value: str) -> list[int]:
+        if scope_value == "Выбранные товары":
+            return [int(x) for x in selected_shortlist_ids]
+        if scope_value == "Текущая страница":
+            return [int(x) for x in ids]
+        return [int(x) for x in effective_filtered_candidate_ids]
+
+    def load_catalog_brief_rows(product_ids: list[int]) -> list[dict]:
+        ids_local = [int(x) for x in product_ids if str(x).strip()]
+        if not ids_local:
+            return []
+        rows: list[dict] = []
+        chunk_size = 900
+        for start in range(0, len(ids_local), chunk_size):
+            chunk = ids_local[start : start + chunk_size]
+            placeholders = ", ".join(["?"] * len(chunk))
+            fetched = conn.execute(
+                f"""
+                SELECT
+                    id,
+                    article,
+                    supplier_article,
+                    name,
+                    supplier_name,
+                    ozon_description_category_id,
+                    ozon_type_id,
+                    ozon_category_path,
+                    detmir_category_id,
+                    detmir_category_path,
+                    supplier_parse_status,
+                    image_url
+                FROM products
+                WHERE id IN ({placeholders})
+                """,
+                tuple(chunk),
+            ).fetchall()
+            rows.extend([dict(row) for row in fetched])
+        return rows
+
+    def infer_catalog_template_category(product_rows: list[dict]) -> str:
+        pair_counter: dict[str, int] = {}
+        for row in product_rows:
+            desc_id = int(row.get("ozon_description_category_id") or 0)
+            type_id = int(row.get("ozon_type_id") or 0)
+            if desc_id <= 0 or type_id <= 0:
+                continue
+            code = f"ozon:{desc_id}:{type_id}"
+            pair_counter[code] = int(pair_counter.get(code, 0)) + 1
+        if not pair_counter:
+            return ""
+        return max(sorted(pair_counter.items()), key=lambda item: (int(item[1]), str(item[0])))[0]
+
     bc1, bc2, bc3 = st.columns(3)
     with bc1:
         max_bulk_enrich_page = st.number_input(
@@ -4670,7 +4725,7 @@ def show_catalog_tab():
         f"Ozon перед обогащением: {'вкл' if bool(pre_ozon_before_enrich) else 'выкл'}."
     )
     ai_cfg_ok, ai_cfg_msg = ai_is_configured(ai_settings)
-    with st.expander("AI-пакет для массового заполнения", expanded=False):
+    with st.expander("Тонкая настройка массового наполнения", expanded=False):
         if ai_cfg_ok:
             st.success(ai_cfg_msg)
         else:
@@ -4895,6 +4950,368 @@ def show_catalog_tab():
             f"источники {source_text}, отложено по лимиту {skipped_by_limit}."
         )
 
+    def run_detmir_overlay_batch(candidate_ids: list[int], run_limit: int, run_label: str) -> None:
+        if not candidate_ids:
+            st.info(f"Для режима `{run_label}` нет товаров для подготовки Detmir.")
+            return
+        target_ids = [int(x) for x in candidate_ids[: int(run_limit)]]
+        progress = st.progress(0)
+        processed = 0
+        matched_categories = 0
+        missing_categories = 0
+        imported_requirements = 0
+        overlay_saved = 0
+        overlay_skipped = 0
+        errors = 0
+        for i, pid in enumerate(target_ids, start=1):
+            try:
+                current_product = get_product(conn, int(pid))
+                if not current_product:
+                    errors += 1
+                    continue
+                product_row = dict(current_product)
+                detmir_category_id = int(product_row.get("detmir_category_id") or 0)
+                if detmir_category_id <= 0:
+                    detmir_match = detect_best_detmir_category_for_product(conn, product_row)
+                    if detmir_match.get("ok"):
+                        matched = detmir_match.get("category") or {}
+                        detmir_category_id = int(matched.get("category_id") or 0)
+                        payload = {
+                            "detmir_category_id": detmir_category_id or None,
+                            "detmir_category_path": str(matched.get("full_path") or matched.get("name") or "").strip() or None,
+                            "detmir_category_confidence": float(matched.get("match_score") or 0.0) / 10.0 if float(matched.get("match_score") or 0.0) > 0 else None,
+                        }
+                        save_product(conn, int(pid), payload)
+                        save_field_source(
+                            conn=conn,
+                            product_id=int(pid),
+                            field_name="detmir_category_id",
+                            source_type="detmir_category_match",
+                            source_value_raw=detmir_category_id,
+                            source_url=str(matched.get("full_path") or matched.get("name") or "detmir_match"),
+                            confidence=min(0.99, max(0.35, float(payload.get("detmir_category_confidence") or 0.0))),
+                            is_manual=False,
+                        )
+                        matched_categories += 1
+                        product_row.update(payload)
+                    else:
+                        missing_categories += 1
+                        processed += 1
+                        progress.progress(i / len(target_ids))
+                        continue
+
+                detmir_scope = f"detmir:{int(detmir_category_id)}" if int(detmir_category_id) > 0 else ""
+                if not detmir_scope:
+                    missing_categories += 1
+                    processed += 1
+                    progress.progress(i / len(target_ids))
+                    continue
+
+                existing_requirements = list_channel_requirements(conn, channel_code="detmir", category_code=detmir_scope)
+                if not existing_requirements:
+                    import_result = import_detmir_category_requirements_to_pim(conn, category_id=int(detmir_category_id))
+                    imported_requirements += int(import_result.get("imported") or 0)
+
+                gapfill_result = _fill_channel_attrs_from_product_state(
+                    conn=conn,
+                    product_row=product_row,
+                    channel_code="detmir",
+                    category_code=detmir_scope,
+                    source_type="derived_from_master",
+                    source_url="catalog_detmir_overlay_gapfill",
+                    force=False,
+                    target_channel_code="detmir",
+                )
+                overlay_saved += int(gapfill_result.get("saved") or 0)
+                overlay_skipped += int(gapfill_result.get("skipped") or 0)
+            except Exception:
+                errors += 1
+            processed += 1
+            progress.progress(i / len(target_ids))
+
+        skipped_by_limit = max(0, len(candidate_ids) - len(target_ids))
+        st.success(
+            f"[{run_label}] Detmir overlay готов: обработано {processed}, "
+            f"категорий сматчено {matched_categories}, без категории {missing_categories}, "
+            f"импортировано требований {imported_requirements}, заполнено overlay-полей {overlay_saved}, "
+            f"пропущено {overlay_skipped}, ошибок {errors}, отложено по лимиту {skipped_by_limit}."
+        )
+
+    workflow_scope = st.radio(
+        "Рабочая область каталога",
+        options=catalog_scope_options,
+        index=catalog_scope_options.index(str(st.session_state.get("catalog_workflow_scope") or "Выбранные товары")) if str(st.session_state.get("catalog_workflow_scope") or "Выбранные товары") in catalog_scope_options else 0,
+        horizontal=True,
+        key="catalog_workflow_scope",
+        help="Каталог теперь работает как основной конвейер: выбери область, подготовь категории и overlay, затем массово заполни и выгрузи в шаблон клиента.",
+    )
+    workflow_target_ids = resolve_catalog_scope_ids(workflow_scope)
+    workflow_brief_rows = load_catalog_brief_rows(workflow_target_ids)
+    workflow_default_category_code = infer_catalog_template_category(workflow_brief_rows)
+    workflow_ozon_ready = sum(
+        1
+        for row in workflow_brief_rows
+        if int(row.get("ozon_description_category_id") or 0) > 0 and int(row.get("ozon_type_id") or 0) > 0
+    )
+    workflow_detmir_ready = sum(1 for row in workflow_brief_rows if int(row.get("detmir_category_id") or 0) > 0)
+    workflow_with_images = sum(1 for row in workflow_brief_rows if str(row.get("image_url") or "").strip())
+    workflow_parse_success = sum(1 for row in workflow_brief_rows if str(row.get("supplier_parse_status") or "").strip().lower() == "success")
+
+    with st.container(border=True):
+        st.markdown("### Основной конвейер каталога")
+        st.caption(
+            "Здесь теперь главный путь работы: сначала готовим Ozon-ядро, затем client overlays, потом массово наполняем карточки и сразу готовим выгрузку под клиента."
+        )
+        ws1, ws2, ws3, ws4 = st.columns(4)
+        ws1.metric("В работе", int(len(workflow_target_ids)))
+        ws2.metric("С Ozon", int(workflow_ozon_ready))
+        ws3.metric("С Detmir", int(workflow_detmir_ready))
+        ws4.metric("С фото", int(workflow_with_images))
+        st.caption(
+            f"Область: {workflow_scope}. "
+            f"Парсинг успех: {workflow_parse_success}. "
+            "Для Excel-клиентов отдельный overlay обычно не нужен: шаблоны читают master-memory напрямую. "
+            "Отдельно готовим только API/overlay-каналы вроде Детского Мира."
+        )
+
+        flow1, flow2, flow3 = st.columns([1.05, 1.05, 1.35], gap="large")
+
+        with flow1:
+            with st.container(border=True):
+                st.markdown("#### 1. Категории и схемы")
+                st.caption("Подготовить эталон Ozon и client overlay перед массовым заполнением.")
+                if st.button("Подготовить Ozon-ядро", type="primary", use_container_width=True, key="catalog_workflow_prepare_ozon"):
+                    if not workflow_target_ids:
+                        st.warning("В выбранной области нет товаров.")
+                    else:
+                        prep_res = bulk_assign_ozon_categories(
+                            conn,
+                            [int(x) for x in workflow_target_ids],
+                            min_score=OZON_CATEGORY_MIN_SCORE,
+                            force=False,
+                        )
+                        seeded = ensure_ozon_requirements_for_products(conn, [int(x) for x in workflow_target_ids])
+                        materialized = materialize_ozon_attribute_slots_for_products(conn, [int(x) for x in workflow_target_ids])
+                        st.success(
+                            f"Ozon готов: обработано {int(prep_res.get('processed') or 0)}, привязано {int(prep_res.get('assigned') or 0)}, "
+                            f"импортировано атрибутов {int(seeded.get('imported_attributes') or 0)}, создано слотов {int(materialized.get('slots_created') or 0)}."
+                        )
+                        st.rerun()
+                if st.button("Подготовить Detmir overlay", use_container_width=True, key="catalog_workflow_prepare_detmir"):
+                    run_detmir_overlay_batch(
+                        candidate_ids=[int(x) for x in workflow_target_ids],
+                        run_limit=max(len(workflow_target_ids), 1),
+                        run_label=f"Detmir / {workflow_scope}",
+                    )
+                if st.button("Открыть Каналы", use_container_width=True, key="catalog_workflow_open_channels"):
+                    request_workspace_navigation("🧭 Каналы")
+                st.caption(
+                    "Если Detmir-категории и атрибуты ещё не синхронизированы, сначала зайди в `Каналы -> Детский Мир API`, затем вернись сюда."
+                )
+
+        with flow2:
+            with st.container(border=True):
+                st.markdown("#### 2. Массовое наполнение")
+                st.caption("Заполнить master-карточки, Ozon-атрибуты и переиспользуемые данные для клиентов.")
+                fill_detmir_after_ai = st.checkbox(
+                    "После AI сразу подготовить Detmir overlay",
+                    value=True,
+                    key="catalog_fill_detmir_after_ai",
+                    help="После supplier/web + AI система сразу перенесёт уже найденные значения в Detmir overlay.",
+                )
+                if st.button("Заполнить всё для области", type="primary", use_container_width=True, key="catalog_workflow_fill_all"):
+                    run_ai_enrichment_batch(
+                        candidate_ids=[int(x) for x in workflow_target_ids],
+                        run_limit=max(len(workflow_target_ids), 1),
+                        run_label=f"AI / {workflow_scope}",
+                    )
+                    if bool(fill_detmir_after_ai) and workflow_target_ids:
+                        run_detmir_overlay_batch(
+                            candidate_ids=[int(x) for x in workflow_target_ids],
+                            run_limit=max(len(workflow_target_ids), 1),
+                            run_label=f"Detmir-after-AI / {workflow_scope}",
+                        )
+                st.caption(
+                    "Этот шаг должен быть базовым для 90% товаров. `Карточка` остаётся для редких ручных правок, если массовый проход что-то не добрал."
+                )
+
+        with flow3:
+            with st.container(border=True):
+                st.markdown("#### 3. Клиент и выгрузка")
+                st.caption("Выбери клиента и категорию, проверь готовность пачки и выгрузи исходный клиентский Excel прямо отсюда.")
+                catalog_client_entries = list_client_channels(conn)
+                catalog_client_map = {
+                    str(item.get("client_code") or "").strip(): item
+                    for item in catalog_client_entries
+                    if str(item.get("client_code") or "").strip()
+                }
+                catalog_client_codes = sorted(
+                    catalog_client_map.keys(),
+                    key=lambda x: (str(catalog_client_map.get(x, {}).get("client_name") or x).lower(), x.lower()),
+                )
+
+                def _catalog_client_label(code: str) -> str:
+                    item = catalog_client_map.get(str(code or "").strip(), {})
+                    client_name = str(item.get("client_name") or "").strip()
+                    return f"{client_name} ({code})" if client_name else str(code)
+
+                export_client_code = st.selectbox(
+                    "Клиент",
+                    options=[""] + catalog_client_codes,
+                    index=0,
+                    format_func=lambda value: "-- выбери клиента --" if not value else _catalog_client_label(str(value)),
+                    key="catalog_export_client_code",
+                )
+                export_category_options, export_category_labels = _build_ozon_template_category_options(
+                    conn,
+                    channel_code=export_client_code or None,
+                    limit=5000,
+                )
+                if workflow_default_category_code and workflow_default_category_code in export_category_options and not st.session_state.get("catalog_export_category_code"):
+                    st.session_state["catalog_export_category_code"] = workflow_default_category_code
+                export_category_code = st.selectbox(
+                    "Ozon-категория для профиля/шаблона",
+                    options=export_category_options,
+                    index=(
+                        export_category_options.index(str(st.session_state.get("catalog_export_category_code") or ""))
+                        if str(st.session_state.get("catalog_export_category_code") or "") in export_category_options
+                        else 0
+                    ),
+                    format_func=lambda value: export_category_labels.get(str(value), str(value)),
+                    key="catalog_export_category_code",
+                )
+
+                export_profiles = [
+                    p for p in list_template_profiles(conn, channel_code=export_client_code or None)
+                    if str(p.get("category_code") or "").strip() == str(export_category_code or "").strip()
+                ] if export_client_code else []
+                export_profile_options = [None] + [int(p["id"]) for p in export_profiles]
+                export_profile_id = st.selectbox(
+                    "Профиль шаблона",
+                    options=export_profile_options,
+                    format_func=lambda value: "-- нет --" if value is None else next(
+                        (f"{p['profile_name']} (#{p['id']})" for p in export_profiles if int(p["id"]) == int(value)),
+                        str(value),
+                    ),
+                    key="catalog_export_profile_id",
+                )
+
+                export_template_files = list_uploaded_files(
+                    conn,
+                    storage_kind="client_template",
+                    channel_code=export_client_code or None,
+                    category_code=export_category_code or None,
+                    limit=30,
+                ) if export_client_code else []
+                export_template_options = [None] + [int(row["id"]) for row in export_template_files]
+                export_template_file_id = st.selectbox(
+                    "Сохранённый Excel-шаблон",
+                    options=export_template_options,
+                    format_func=lambda value: "-- нет --" if value is None else next(
+                        (
+                            f"{row.get('original_file_name') or Path(str(row.get('stored_rel_path') or '')).name} | #{int(row['id'])}"
+                            for row in export_template_files
+                            if int(row["id"]) == int(value)
+                        ),
+                        str(value),
+                    ),
+                    key="catalog_export_template_file_id",
+                )
+
+                export_scope_text = f"Пачка для выгрузки: {len(workflow_target_ids)} товаров."
+                if workflow_default_category_code:
+                    export_scope_text += f" Доминирующая категория области: {workflow_default_category_code}."
+                st.caption(export_scope_text)
+
+                export_profile_columns = get_template_profile_columns(conn, int(export_profile_id)) if export_profile_id else []
+                export_template_row = next(
+                    (row for row in export_template_files if int(row["id"]) == int(export_template_file_id)),
+                    None,
+                ) if export_template_file_id else None
+                export_template_bytes = read_uploaded_file_bytes(conn, int(export_template_file_id)) if export_template_file_id else None
+                export_template_metadata = get_uploaded_file_metadata(export_template_row)
+                export_sheet_name = str(export_template_metadata.get("sheet_name") or "").strip() or "Товары"
+                export_data_start_row = int(export_template_metadata.get("data_start_row") or 2)
+
+                ex1, ex2 = st.columns(2)
+                with ex1:
+                    if st.button("Открыть пачку в Клиентский шаблон", use_container_width=True, key="catalog_open_template_workspace"):
+                        if export_client_code:
+                            st.session_state["template_client_code"] = export_client_code
+                            st.session_state["template_client_selector"] = export_client_code
+                        if export_category_code:
+                            st.session_state["template_category_select"] = export_category_code
+                        if export_template_file_id:
+                            st.session_state["template_saved_file_id"] = int(export_template_file_id)
+                        st.session_state["template_selected_ids_from_catalog"] = [int(x) for x in workflow_target_ids]
+                        st.session_state["template_selected_ids"] = [int(x) for x in workflow_target_ids]
+                        request_workspace_navigation("🧩 Клиентский шаблон")
+                with ex2:
+                    if st.button("Проверить readiness пачки", use_container_width=True, key="catalog_export_check_readiness"):
+                        if not workflow_target_ids:
+                            st.warning("В выбранной области нет товаров.")
+                        elif not export_profile_columns:
+                            st.warning("Сначала выбери профиль шаблона клиента.")
+                        elif not export_template_bytes:
+                            st.warning("Сначала выбери сохранённый Excel-шаблон клиента.")
+                        else:
+                            safe_catalog_template_bytes = sanitize_template_xlsx_bytes(export_template_bytes)
+                            catalog_template_df = read_client_template_dataframe(safe_catalog_template_bytes, sheet_name=export_sheet_name)
+                            catalog_filled_df = fill_template_dataframe(conn, catalog_template_df, workflow_target_ids, export_profile_columns)
+                            catalog_batch_readiness = analyze_template_readiness(catalog_filled_df, export_profile_columns)
+                            summary = catalog_batch_readiness.get("summary") or {}
+                            cr1, cr2, cr3, cr4 = st.columns(4)
+                            cr1.metric("Средняя готовность", f"{int(summary.get('avg_readiness') or 0)}%")
+                            cr2.metric("Готовых строк", int(summary.get("ready_rows") or 0))
+                            cr3.metric("Частично готовы", int(summary.get("partial_rows") or 0))
+                            cr4.metric("Блокеры", int(summary.get("blocked_rows") or 0))
+                            if int(summary.get("blocked_rows") or 0) > 0:
+                                st.warning("Есть блокеры. Лучше открыть `Клиентский шаблон` и добить gaps перед финальной выгрузкой.")
+                            else:
+                                st.success("Пачка выглядит готовой к клиентской выгрузке.")
+
+                export_signature = f"{export_client_code}|{export_category_code}|{export_profile_id}|{export_template_file_id}|{workflow_scope}|{hashlib.sha1(','.join([str(int(x)) for x in workflow_target_ids]).encode('utf-8')).hexdigest() if workflow_target_ids else 'none'}"
+                if st.button("Собрать готовый Excel клиента", type="primary", use_container_width=True, key="catalog_export_build_button"):
+                    if not workflow_target_ids:
+                        st.warning("В выбранной области нет товаров.")
+                    elif not export_profile_columns:
+                        st.warning("Сначала выбери профиль шаблона клиента.")
+                    elif not export_template_bytes:
+                        st.warning("Сначала выбери сохранённый Excel-шаблон клиента.")
+                    else:
+                        safe_catalog_template_bytes = sanitize_template_xlsx_bytes(export_template_bytes)
+                        ready_export_bytes = fill_template_workbook_bytes(
+                            conn,
+                            safe_catalog_template_bytes,
+                            workflow_target_ids,
+                            export_profile_columns,
+                            sheet_name=export_sheet_name,
+                            data_start_row=int(export_data_start_row),
+                        )
+                        st.session_state["catalog_client_export_bytes"] = ready_export_bytes
+                        st.session_state["catalog_client_export_signature"] = export_signature
+                        st.session_state["catalog_client_export_name"] = (
+                            export_template_row.get("original_file_name")
+                            if export_template_row
+                            else "client_template.xlsx"
+                        )
+                        st.success("Клиентский Excel собран. Ниже можно скачать готовый файл.")
+                if (
+                    st.session_state.get("catalog_client_export_signature") == export_signature
+                    and st.session_state.get("catalog_client_export_bytes")
+                ):
+                    st.download_button(
+                        "Скачать готовый Excel клиента",
+                        data=st.session_state["catalog_client_export_bytes"],
+                        file_name=f"filled_{Path(str(st.session_state.get('catalog_client_export_name') or 'client_template.xlsx')).name}",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        key="catalog_export_download_ready_file",
+                    )
+                st.caption(
+                    "Если нужен тонкий gap-анализ, ручной remap колонок или client_validated, переходи в `Клиентский шаблон`. "
+                    "Но обычную рабочую выгрузку теперь можно собирать прямо из `Каталога`."
+                )
+
     ai1, ai2, ai3 = st.columns(3)
     with ai1:
         if st.button("Заполнить текущую страницу", type="primary", help="Основной поток: Ozon категория -> supplier/web -> AI название/описание/атрибуты"):
@@ -4918,7 +5335,7 @@ def show_catalog_tab():
                 run_label="AI / Выбранные товары",
             )
 
-    with st.expander("Дополнительные и технические операции", expanded=False):
+    with st.expander("Низкоуровневые операции и сервис", expanded=False):
         cextra1, cextra2, cextra3 = st.columns(3)
         with cextra1:
             if st.button("Автопривязать Ozon категории (текущая страница)", help="Сначала назначить эталонную Ozon категорию для товаров этой страницы"):
