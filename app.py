@@ -6360,14 +6360,14 @@ def enrich_product_from_supplier(
         return {"ok": False, "message": str(e)}
 
 
-def show_product_tab():
+def show_product_tab(summary: dict[str, object] | None = None):
     conn = get_db()
     parser_settings = load_parser_settings(conn)
     ai_settings = load_ai_settings(conn)
     media_settings = load_media_settings(conn)
     media_public_base_url = str(media_settings.get("public_base_url") or "").strip()
     st.subheader("Поиск и выбор товара для редактирования")
-    st.caption("Найди товар по артикулу, бренду или нескольким словам, затем спокойно доведи карточку ниже.")
+    st.caption("Сначала найди нужный товар, а уже потом спокойно переходи к доводке карточки ниже.")
     with st.container(border=True):
         fs1, fs2, fs3, fs4, fs5 = st.columns([3, 2, 2, 2, 1])
         with fs1:
@@ -6536,6 +6536,9 @@ def show_product_tab():
             f"Из карточки автоматически убраны {int(cleanup_cleared)} служебных Ozon-атрибутов, "
             "которые были заполнены автоэвристикой слишком агрессивно. Их можно заполнить только вручную при необходимости."
         )
+
+    if summary:
+        render_workspace_hero("product", summary)
 
     top1, top2, top3, top4 = st.columns(4)
     top1.metric("Артикул", product["article"] or "-")
@@ -11241,7 +11244,8 @@ def main():
     summary = build_workspace_summary(shell_conn)
     shell_conn.close()
     selected_section = render_sidebar_navigation(summary)
-    render_workspace_hero(selected_section, summary)
+    if selected_section != "product":
+        render_workspace_hero(selected_section, summary)
     active_db = summary.get("active_db_path") or str(Path("data/catalog.db"))
     low_db = str(active_db).lower()
     if "\\temp\\pim\\catalog.db" in low_db or "/tmp/pim/catalog.db" in low_db:
@@ -11265,7 +11269,7 @@ def main():
     elif selected_section == "catalog":
         show_catalog_tab()
     elif selected_section == "product":
-        show_product_tab()
+        show_product_tab(summary)
     elif selected_section == "attributes":
         show_attributes_tab()
     elif selected_section == "template":
