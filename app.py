@@ -524,14 +524,14 @@ def build_workspace_summary(conn) -> dict[str, object]:
 
 def render_sidebar_navigation(summary: dict[str, object]) -> str:
     nav_options = [
-        ("📥 Импорт", "import"),
-        ("📚 Каталог", "catalog"),
-        ("🧾 Карточка", "product"),
-        ("🧠 Клиентский шаблон", "template"),
-        ("🛒 Ozon", "ozon"),
-        ("🧩 Атрибуты", "attributes"),
-        ("🔌 Каналы", "channels"),
-        ("⚙️ Настройки", "settings"),
+        ("⇣ Импорт", "import"),
+        ("▦ Каталог", "catalog"),
+        ("▣ Карточка", "product"),
+        ("◪ Клиентский шаблон", "template"),
+        ("◎ Ozon", "ozon"),
+        ("✦ Атрибуты", "attributes"),
+        ("⌁ Каналы", "channels"),
+        ("⚙︎ Настройки", "settings"),
     ]
     nav_labels = [label for label, _ in nav_options]
     nav_map = {label: value for label, value in nav_options}
