@@ -217,31 +217,33 @@ def apply_app_theme() -> None:
     st.markdown(
         """
 <style>
-@import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;700&family=IBM+Plex+Mono:wght@400;500&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=IBM+Plex+Mono:wght@400;500&display=swap');
 
 :root {
-  --pim-bg: #f3f4f6;
-  --pim-bg-soft: #eef2f7;
-  --pim-surface: rgba(255, 255, 255, 0.86);
+  --pim-bg: #f5f5f7;
+  --pim-bg-soft: #edf1f6;
+  --pim-surface: rgba(255, 255, 255, 0.88);
   --pim-surface-strong: #ffffff;
-  --pim-line: rgba(15, 23, 42, 0.08);
-  --pim-text: #111827;
-  --pim-sub: #667085;
-  --pim-accent: #0f172a;
-  --pim-accent-soft: #dbeafe;
+  --pim-line: rgba(17, 24, 39, 0.08);
+  --pim-text: #111111;
+  --pim-sub: #6e7280;
+  --pim-accent: #111111;
+  --pim-accent-soft: #eef2ff;
   --pim-success: #0f766e;
+  --pim-warn: #b45309;
+  --pim-shadow: 0 22px 56px rgba(17, 24, 39, 0.07);
 }
 
 html, body, [class*="css"], [data-testid="stAppViewContainer"] {
-  font-family: 'DM Sans', sans-serif;
+  font-family: 'Manrope', sans-serif;
   color: var(--pim-text);
 }
 
 [data-testid="stAppViewContainer"] {
   background:
-    radial-gradient(circle at top left, rgba(191, 219, 254, 0.45), transparent 28%),
-    radial-gradient(circle at top right, rgba(226, 232, 240, 0.55), transparent 24%),
-    linear-gradient(180deg, #f8fafc 0%, #f3f4f6 54%, #eef2f7 100%);
+    radial-gradient(circle at top left, rgba(219, 234, 254, 0.7), transparent 28%),
+    radial-gradient(circle at top right, rgba(229, 231, 235, 0.7), transparent 26%),
+    linear-gradient(180deg, #fbfbfd 0%, #f5f5f7 52%, #eef1f5 100%);
 }
 
 [data-testid="stHeader"] {
@@ -264,12 +266,13 @@ html, body, [class*="css"], [data-testid="stAppViewContainer"] {
 }
 
 .pim-hero {
-  background: linear-gradient(135deg, rgba(255,255,255,0.94) 0%, rgba(255,255,255,0.76) 100%);
-  border: 1px solid rgba(15, 23, 42, 0.08);
-  border-radius: 28px;
-  padding: 1.4rem 1.5rem 1.15rem 1.5rem;
-  box-shadow: 0 24px 60px rgba(15, 23, 42, 0.08);
+  background: linear-gradient(135deg, rgba(255,255,255,0.98) 0%, rgba(255,255,255,0.8) 100%);
+  border: 1px solid rgba(17, 24, 39, 0.06);
+  border-radius: 30px;
+  padding: 1.45rem 1.55rem 1.2rem 1.55rem;
+  box-shadow: var(--pim-shadow);
   margin-bottom: 1.1rem;
+  backdrop-filter: blur(18px);
 }
 
 .pim-hero-title {
@@ -298,8 +301,8 @@ html, body, [class*="css"], [data-testid="stAppViewContainer"] {
   gap: 0.35rem;
   padding: 0.45rem 0.72rem;
   border-radius: 999px;
-  background: rgba(15, 23, 42, 0.04);
-  border: 1px solid rgba(15, 23, 42, 0.06);
+  background: rgba(17, 24, 39, 0.035);
+  border: 1px solid rgba(17, 24, 39, 0.05);
   color: var(--pim-text);
   font-size: 0.83rem;
 }
@@ -310,10 +313,10 @@ html, body, [class*="css"], [data-testid="stAppViewContainer"] {
 
 .pim-side-card {
   background: rgba(255,255,255,0.84);
-  border: 1px solid rgba(15, 23, 42, 0.08);
+  border: 1px solid rgba(17, 24, 39, 0.06);
   border-radius: 22px;
   padding: 1rem 1rem 0.9rem 1rem;
-  box-shadow: 0 14px 32px rgba(15, 23, 42, 0.05);
+  box-shadow: 0 16px 38px rgba(17, 24, 39, 0.04);
   margin-bottom: 0.9rem;
 }
 
@@ -339,10 +342,10 @@ html, body, [class*="css"], [data-testid="stAppViewContainer"] {
 
 div[data-testid="stMetric"] {
   background: rgba(255,255,255,0.82);
-  border: 1px solid rgba(15, 23, 42, 0.08);
+  border: 1px solid rgba(17, 24, 39, 0.06);
   border-radius: 20px;
   padding: 0.8rem 0.9rem;
-  box-shadow: 0 12px 28px rgba(15, 23, 42, 0.04);
+  box-shadow: 0 12px 28px rgba(17, 24, 39, 0.04);
 }
 
 div[data-testid="stMetricLabel"] {
@@ -356,29 +359,37 @@ div[data-testid="stMetricValue"] {
 
 div.stButton > button,
 div.stDownloadButton > button {
-  border-radius: 16px;
-  border: 1px solid rgba(15, 23, 42, 0.08);
+  border-radius: 18px;
+  border: 1px solid rgba(17, 24, 39, 0.08);
   min-height: 2.7rem;
-  box-shadow: 0 8px 18px rgba(15, 23, 42, 0.04);
+  box-shadow: 0 10px 22px rgba(17, 24, 39, 0.04);
+  transition: all 0.18s ease;
+}
+
+div.stButton > button:hover,
+div.stDownloadButton > button:hover {
+  border-color: rgba(17, 24, 39, 0.16);
+  transform: translateY(-1px);
 }
 
 div.stButton > button[kind="primary"] {
-  background: linear-gradient(180deg, #111827 0%, #0f172a 100%);
+  background: linear-gradient(180deg, #171717 0%, #111111 100%);
   color: #ffffff;
-  border-color: rgba(15, 23, 42, 0.25);
+  border-color: rgba(17, 24, 39, 0.24);
 }
 
 div[data-testid="stExpander"] {
-  border: 1px solid rgba(15, 23, 42, 0.08);
-  border-radius: 20px;
-  background: rgba(255,255,255,0.7);
+  border: 1px solid rgba(17, 24, 39, 0.07);
+  border-radius: 22px;
+  background: rgba(255,255,255,0.72);
+  box-shadow: 0 10px 24px rgba(17, 24, 39, 0.03);
 }
 
 .stTabs [data-baseweb="tab-list"] {
   gap: 0.45rem;
-  background: rgba(255,255,255,0.56);
-  border: 1px solid rgba(15, 23, 42, 0.06);
-  border-radius: 18px;
+  background: rgba(255,255,255,0.62);
+  border: 1px solid rgba(17, 24, 39, 0.06);
+  border-radius: 20px;
   padding: 0.3rem;
 }
 
@@ -392,9 +403,39 @@ div[data-testid="stExpander"] {
 }
 
 div[data-testid="stDataFrame"], div[data-testid="stTable"] {
-  border-radius: 18px;
+  border-radius: 20px;
   overflow: hidden;
-  border: 1px solid rgba(15, 23, 42, 0.08);
+  border: 1px solid rgba(17, 24, 39, 0.07);
+}
+
+div[data-baseweb="input"],
+div[data-baseweb="select"],
+div[data-baseweb="textarea"] {
+  border-radius: 18px !important;
+}
+
+div[data-baseweb="input"] > div,
+div[data-baseweb="select"] > div,
+div[data-baseweb="textarea"] > div {
+  border-radius: 18px !important;
+  border-color: rgba(17, 24, 39, 0.08) !important;
+  background: rgba(255,255,255,0.82) !important;
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.6);
+}
+
+.pim-section-note {
+  color: var(--pim-sub);
+  font-size: 0.92rem;
+  margin: 0.15rem 0 0.85rem 0;
+}
+
+.pim-soft-card {
+  background: rgba(255,255,255,0.78);
+  border: 1px solid rgba(17, 24, 39, 0.06);
+  border-radius: 24px;
+  padding: 1rem 1.1rem;
+  box-shadow: 0 16px 34px rgba(17, 24, 39, 0.035);
+  margin-bottom: 0.85rem;
 }
 
 code, pre, .pim-mono {
@@ -443,7 +484,8 @@ def render_sidebar_navigation(summary: dict[str, object]) -> str:
         ("🧠 Клиентский шаблон", "template"),
         ("🛒 Ozon", "ozon"),
         ("🧩 Атрибуты", "attributes"),
-        ("⚙️ Каналы", "channels"),
+        ("🔌 Каналы", "channels"),
+        ("⚙️ Настройки", "settings"),
     ]
     nav_labels = [label for label, _ in nav_options]
     nav_map = {label: value for label, value in nav_options}
@@ -480,12 +522,13 @@ def request_workspace_navigation(nav_label: str) -> None:
 def render_workspace_hero(section_key: str, summary: dict[str, object]) -> None:
     section_meta = {
         "import": ("Поступление и фиксация памяти", "Загрузи прайс, зафиксируй поставщика, сохрани импорт в каталог и сразу закрепи память в БД."),
-        "catalog": ("Каталог для массовой работы", "Работай по фильтрам, дозаполняй товары пакетно и быстро переходи в точечную карточку по артикулу."),
-        "product": ("Карточка товара", "Финальная доводка master-карточки: категории, атрибуты, фото, AI и контроль источников."),
+        "catalog": ("Каталог для ежедневной работы", "Фильтруй товары, запускай массовое наполнение и открывай карточку по артикулу без лишних технических шагов."),
+        "product": ("Карточка товара", "Финальная доводка master-карточки: категории, overlay клиентов, фото, AI и контроль качества перед выгрузкой."),
         "template": ("Клиентские шаблоны", "Выбор клиента из базы, повторное открытие сохранённого шаблона и стабильный экспорт без новой ручной настройки."),
         "ozon": ("Эталон Ozon и кэш памяти", "Категории, атрибуты и справочники Ozon живут как локальный эталон и должны переживать синки и перезапуски."),
         "attributes": ("Справочник атрибутов", "Поддерживай мастер-слой и клиентские поля без путаницы и дублирования."),
-        "channels": ("Правила каналов и AI", "Настраивай mapping rules, требования и AI-провайдеры как служебный контур системы."),
+        "channels": ("Каналы и overlay клиентов", "Здесь живут channel rules, требования клиентов и интеграции вроде Детского Мира, но не общие настройки PIM."),
+        "settings": ("Настройки PIM", "Отдельное место для AI, парсинга, фото и рабочей конфигурации сервиса без засорения каталога и каналов."),
     }
     title, caption = section_meta.get(section_key, ("PIM", "Рабочая зона PIM."))
     st.markdown(
@@ -667,6 +710,317 @@ def load_media_settings(conn) -> dict[str, object]:
 
 def save_media_settings(conn, settings: dict[str, object]) -> None:
     _set_system_setting(conn, "media.public_base_url", str(settings.get("public_base_url", "") or "").strip())
+
+
+def _coerce_state_number(key: str, default_value: object, caster):
+    if key in st.session_state:
+        try:
+            st.session_state[key] = caster(st.session_state.get(key))
+        except Exception:
+            st.session_state[key] = caster(default_value)
+
+
+def _current_ai_form_settings(saved_settings: dict[str, Any]) -> dict[str, Any]:
+    provider = str(st.session_state.get("ai_cfg_provider", saved_settings.get("provider") or "openai")).strip().lower()
+    return {
+        "enabled": bool(st.session_state.get("ai_cfg_enabled", saved_settings.get("enabled", True))),
+        "provider": provider,
+        "base_url": str(st.session_state.get("ai_cfg_base_url", saved_settings.get("base_url") or "") or "").strip(),
+        "chat_model": str(st.session_state.get("ai_cfg_chat_model", saved_settings.get("chat_model") or "") or "").strip(),
+        "image_model": str(st.session_state.get("ai_cfg_image_model", saved_settings.get("image_model") or "") or "").strip(),
+        "api_key": str(st.session_state.get("ai_cfg_api_key", saved_settings.get("api_key") or "") or "").strip(),
+        "use_env_api_key": bool(st.session_state.get("ai_cfg_use_env_key", saved_settings.get("use_env_api_key", True))),
+        "temperature": float(st.session_state.get("ai_cfg_temperature", saved_settings.get("temperature", 0.3)) or 0.3),
+        "max_tokens": int(float(st.session_state.get("ai_cfg_max_tokens", saved_settings.get("max_tokens", 1800)) or 1800)),
+        "image_size": str(st.session_state.get("ai_cfg_image_size", saved_settings.get("image_size") or "1024x1024") or "1024x1024").strip(),
+        "openrouter_referer": str(st.session_state.get("ai_cfg_or_referer", saved_settings.get("openrouter_referer") or "") or "").strip(),
+        "openrouter_title": str(st.session_state.get("ai_cfg_or_title", saved_settings.get("openrouter_title") or "pim") or "pim").strip(),
+    }
+
+
+def render_ai_settings_panel(conn) -> None:
+    ai_settings = load_ai_settings(conn)
+    ai_profiles = list_ai_connection_profiles(conn)
+    for key, default in (
+        ("ai_cfg_provider", str(ai_settings.get("provider") or "openai")),
+        ("ai_cfg_chat_model", str(ai_settings.get("chat_model") or "")),
+        ("ai_cfg_image_model", str(ai_settings.get("image_model") or "")),
+        ("ai_cfg_base_url", str(ai_settings.get("base_url") or "")),
+        ("ai_cfg_image_size", str(ai_settings.get("image_size") or "1024x1024")),
+        ("ai_cfg_api_key", str(ai_settings.get("api_key") or "")),
+        ("ai_cfg_or_referer", str(ai_settings.get("openrouter_referer") or "")),
+        ("ai_cfg_or_title", str(ai_settings.get("openrouter_title") or "pim")),
+    ):
+        st.session_state.setdefault(key, default)
+    _coerce_state_number("ai_cfg_temperature", ai_settings.get("temperature", 0.3), float)
+    _coerce_state_number("ai_cfg_max_tokens", ai_settings.get("max_tokens", 1800), int)
+    st.session_state.setdefault("ai_cfg_use_env_key", bool(ai_settings.get("use_env_api_key", True)))
+    st.session_state.setdefault("ai_cfg_enabled", bool(ai_settings.get("enabled", True)))
+
+    form_settings = _current_ai_form_settings(ai_settings)
+    cfg_ok, cfg_msg = ai_is_configured(form_settings)
+    active_ok, active_msg = ai_is_configured(ai_settings)
+
+    st.markdown('<div class="pim-soft-card">', unsafe_allow_html=True)
+    st.markdown("### AI-провайдер и профили")
+    st.markdown(
+        '<div class="pim-section-note">AI используется для продающего названия, описания, подсказок атрибутов и промптов для фото. Профиль можно сделать активным одним нажатием.</div>',
+        unsafe_allow_html=True,
+    )
+    if ai_profiles:
+        profile_options = [None] + [int(item["id"]) for item in ai_profiles]
+        profile_map = {int(item["id"]): item for item in ai_profiles}
+        ap1, ap2, ap3 = st.columns([2.2, 1.2, 1])
+        with ap1:
+            selected_ai_profile_id = st.selectbox(
+                "Сохранённый AI-профиль",
+                options=profile_options,
+                format_func=lambda x: "-- выбрать --" if x is None else f"{profile_map[int(x)]['profile_name']} | {profile_map[int(x)].get('provider') or '-'} | {profile_map[int(x)].get('chat_model') or '-'}",
+                key="ai_profile_select",
+            )
+        with ap2:
+            if st.button("Активировать профиль", key="ai_profile_load_btn"):
+                if selected_ai_profile_id is None:
+                    st.warning("Сначала выбери профиль.")
+                else:
+                    loaded = get_ai_connection_profile(conn, int(selected_ai_profile_id))
+                    if loaded:
+                        st.session_state["ai_cfg_provider"] = str(loaded.get("provider") or "openai")
+                        st.session_state["ai_cfg_chat_model"] = str(loaded.get("chat_model") or "")
+                        st.session_state["ai_cfg_image_model"] = str(loaded.get("image_model") or "")
+                        st.session_state["ai_cfg_base_url"] = str(loaded.get("base_url") or "")
+                        st.session_state["ai_cfg_temperature"] = float(loaded.get("temperature") or 0.3)
+                        st.session_state["ai_cfg_max_tokens"] = int(loaded.get("max_tokens") or 1800)
+                        st.session_state["ai_cfg_image_size"] = str(loaded.get("image_size") or "1024x1024")
+                        st.session_state["ai_cfg_use_env_key"] = bool(int(loaded.get("use_env_api_key") or 0))
+                        st.session_state["ai_cfg_enabled"] = True
+                        st.session_state["ai_cfg_api_key"] = str(loaded.get("api_key") or "")
+                        st.session_state["ai_cfg_or_referer"] = str(loaded.get("openrouter_referer") or "")
+                        st.session_state["ai_cfg_or_title"] = str(loaded.get("openrouter_title") or "pim")
+                        save_ai_settings(conn, _current_ai_form_settings(ai_settings))
+                        st.success("Профиль загружен и сделан активным для всего PIM.")
+                        st.rerun()
+        with ap3:
+            st.caption(f"Профилей: {len(ai_profiles)}")
+    if cfg_ok:
+        st.success(cfg_msg)
+    else:
+        st.warning(cfg_msg)
+    if form_settings != ai_settings:
+        if active_ok:
+            st.caption("Ниже сейчас редактируется новая конфигурация. Активная сохранённая конфигурация уже рабочая.")
+        else:
+            st.caption("Ниже есть несохранённые изменения. Для всей системы активна только сохранённая конфигурация.")
+    else:
+        st.caption(active_msg)
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    provider_options = ["openai", "openrouter", "nvidia"]
+    current_provider = str(form_settings.get("provider") or "openai").strip().lower()
+    if current_provider not in provider_options:
+        current_provider = "openai"
+    a1, a2, a3 = st.columns(3)
+    with a1:
+        ai_provider = st.selectbox(
+            "Провайдер AI",
+            options=provider_options,
+            index=provider_options.index(current_provider),
+            format_func=lambda x: {"openai": "OpenAI", "openrouter": "OpenRouter", "nvidia": "NVIDIA"}.get(x, x),
+            key="ai_cfg_provider",
+        )
+    with a2:
+        ai_chat_model = st.text_input("Chat model", value=str(form_settings.get("chat_model") or ""), key="ai_cfg_chat_model")
+    with a3:
+        ai_image_model = st.text_input("Image model", value=str(form_settings.get("image_model") or ""), key="ai_cfg_image_model")
+
+    b1, b2, b3 = st.columns(3)
+    with b1:
+        ai_base_url = st.text_input("Base URL", value=str(form_settings.get("base_url") or ""), key="ai_cfg_base_url")
+    with b2:
+        ai_temperature = st.number_input("Температура", min_value=0.0, max_value=1.5, value=float(form_settings.get("temperature") or 0.3), step=0.1, key="ai_cfg_temperature")
+    with b3:
+        ai_max_tokens = st.number_input("Max tokens", min_value=256, max_value=65536, value=int(form_settings.get("max_tokens") or 1800), step=64, key="ai_cfg_max_tokens")
+
+    c1, c2, c3 = st.columns(3)
+    image_size_options = ["1024x1024", "1536x1024", "1024x1536"]
+    current_image_size = str(form_settings.get("image_size") or "1024x1024")
+    if current_image_size not in image_size_options:
+        current_image_size = "1024x1024"
+    with c1:
+        ai_image_size = st.selectbox("Размер изображения", options=image_size_options, index=image_size_options.index(current_image_size), key="ai_cfg_image_size")
+    with c2:
+        ai_use_env_key = st.checkbox("Брать API key из env", value=bool(form_settings.get("use_env_api_key", True)), key="ai_cfg_use_env_key")
+    with c3:
+        ai_enabled = st.checkbox("AI включен", value=bool(form_settings.get("enabled", True)), key="ai_cfg_enabled")
+
+    ai_api_key = st.text_input(
+        "API key",
+        value=str(form_settings.get("api_key") or ""),
+        type="password",
+        key="ai_cfg_api_key",
+        help="Если поле пустое и включён режим env, система попробует взять ключ из переменных окружения.",
+    )
+
+    if str(ai_provider) == "openrouter":
+        d1, d2 = st.columns(2)
+        with d1:
+            ai_openrouter_referer = st.text_input("OpenRouter Referer", value=str(form_settings.get("openrouter_referer") or ""), key="ai_cfg_or_referer")
+        with d2:
+            ai_openrouter_title = st.text_input("OpenRouter App Title", value=str(form_settings.get("openrouter_title") or "pim"), key="ai_cfg_or_title")
+    else:
+        ai_openrouter_referer = str(form_settings.get("openrouter_referer") or "")
+        ai_openrouter_title = str(form_settings.get("openrouter_title") or "pim")
+
+    ai_profile_name = st.text_input(
+        "Имя профиля AI",
+        value=str(st.session_state.get("ai_profile_name_input") or f"{str(ai_provider).strip()}_{str(ai_chat_model or 'default').strip() or 'default'}"),
+        key="ai_profile_name_input",
+        help="Профили нужны, чтобы быстро переключать провайдера, модель и токен без ручного переввода.",
+    )
+    draft_settings = {
+        "enabled": bool(ai_enabled),
+        "provider": str(ai_provider),
+        "base_url": str(ai_base_url or "").strip(),
+        "chat_model": str(ai_chat_model or "").strip(),
+        "image_model": str(ai_image_model or "").strip(),
+        "api_key": str(ai_api_key or "").strip(),
+        "use_env_api_key": bool(ai_use_env_key),
+        "temperature": float(ai_temperature),
+        "max_tokens": int(ai_max_tokens),
+        "image_size": str(ai_image_size),
+        "openrouter_referer": str(ai_openrouter_referer or "").strip(),
+        "openrouter_title": str(ai_openrouter_title or "pim").strip(),
+    }
+
+    s1, s2, s3 = st.columns([1, 1, 1.2])
+    with s1:
+        if st.button("Сохранить и сделать активным", key="ai_cfg_save_btn", type="primary"):
+            save_ai_settings(conn, draft_settings)
+            st.success("AI-настройки сохранены и стали активными для всего PIM.")
+            st.rerun()
+    with s2:
+        if st.button("Проверить провайдера и модель", key="ai_cfg_test_btn"):
+            check_result = check_ai_connection(draft_settings)
+            if check_result.get("ok"):
+                st.success(
+                    f"AI доступен: provider={check_result.get('provider')}, model={check_result.get('model')}. "
+                    f"{str(check_result.get('text') or '').strip()}"
+                )
+                if check_result.get("warning"):
+                    st.info(f"Замечание: {check_result.get('warning')}")
+            else:
+                st.error(f"Ошибка AI-подключения: {check_result.get('error')}")
+    with s3:
+        if st.button("Сохранить как профиль", key="ai_profile_save_btn"):
+            profile_id = save_ai_connection_profile(conn, ai_profile_name, draft_settings)
+            st.success(f"AI-профиль сохранён: #{profile_id}")
+            st.rerun()
+
+
+def render_media_settings_panel(conn) -> None:
+    media_settings = load_media_settings(conn)
+    st.markdown("### Фото и медиа")
+    st.markdown(
+        '<div class="pim-section-note">Если в прайсах или 1С приходят локальные пути к картинкам, здесь задаётся единый публичный base URL для карточек, шаблонов и ZIP.</div>',
+        unsafe_allow_html=True,
+    )
+    media_public_base_url = st.text_input(
+        "Public base URL для фото",
+        value=str(media_settings.get("public_base_url") or ""),
+        placeholder="Например: https://cdn.example.ru/photos",
+        key="media_cfg_public_base_url",
+        help="Пример: `\\\\fs03\\1c_photo\\LinkPics\\153\\153246_0.jpg` -> `https://.../1c_photo/LinkPics/153/153246_0.jpg`.",
+    )
+    if st.button("Сохранить настройки фото", key="media_cfg_save_btn"):
+        save_media_settings(conn, {"public_base_url": str(media_public_base_url or "").strip()})
+        st.success("Настройки фото сохранены.")
+        st.rerun()
+
+
+def render_parser_settings_panel(conn) -> None:
+    parser_settings = load_parser_settings(conn)
+    st.markdown("### Парсинг и автообогащение")
+    st.markdown(
+        '<div class="pim-section-note">Глобальные настройки enrichment-пайплайна. В рабочем каталоге остаются только быстрые действия по товарам, а не технастройки.</div>',
+        unsafe_allow_html=True,
+    )
+    _coerce_state_number("parser_cfg_timeout_seconds", parser_settings.get("timeout_seconds", 8.0), float)
+    _coerce_state_number("parser_cfg_min_fallback_score", parser_settings.get("min_fallback_score", 3.0), float)
+    _coerce_state_number("parser_cfg_max_hops", parser_settings.get("max_hops", 1), int)
+    _coerce_state_number("parser_cfg_max_results", parser_settings.get("fallback_max_results", 4), int)
+    _coerce_state_number("parser_cfg_min_name_overlap", parser_settings.get("min_name_overlap", 2), int)
+
+    p1, p2, p3 = st.columns(3)
+    with p1:
+        ps_timeout = st.number_input("Таймаут запроса, сек", min_value=2.0, max_value=30.0, value=float(parser_settings.get("timeout_seconds", 8.0)), step=1.0, key="parser_cfg_timeout_seconds")
+        ps_max_hops = st.number_input("Переходов с листинга в карточку", min_value=1, max_value=3, value=int(parser_settings.get("max_hops", 1)), step=1, key="parser_cfg_max_hops")
+        ps_max_results = st.number_input("Лимит кандидатов fallback", min_value=1, max_value=12, value=int(parser_settings.get("fallback_max_results", 4)), step=1, key="parser_cfg_max_results")
+        ps_min_score = st.number_input("Мин. score fallback", min_value=0.0, max_value=10.0, value=float(parser_settings.get("min_fallback_score", 3.0)), step=0.1, key="parser_cfg_min_fallback_score")
+    with p2:
+        strategy_options = [
+            ("auto_full", "Авто: поставщик -> web-поиск -> AI"),
+            ("supplier_only", "Только сайт поставщика"),
+            ("web_only", "Только интернет-поиск + AI"),
+            ("custom_domains", "Только выбранные домены"),
+        ]
+        strategy_values = [x[0] for x in strategy_options]
+        current_strategy = str(parser_settings.get("source_strategy", "auto_full") or "auto_full")
+        if current_strategy not in strategy_values:
+            current_strategy = "auto_full"
+        ps_source_strategy = st.selectbox(
+            "Стратегия источников парсинга",
+            options=strategy_values,
+            index=strategy_values.index(current_strategy),
+            format_func=lambda x: next((label for key, label in strategy_options if key == x), x),
+            key="parser_cfg_source_strategy",
+        )
+        ps_require_article_match = st.checkbox(
+            "Требовать совпадение артикула/кода",
+            value=bool(parser_settings.get("require_article_match", True)),
+            key="parser_cfg_require_article_match",
+            help="Защищает от подстановки данных не того товара при fallback-поиске.",
+        )
+        ps_min_overlap = st.number_input(
+            "Мин. пересечение токенов названия",
+            min_value=1,
+            max_value=5,
+            value=int(parser_settings.get("min_name_overlap", 2)),
+            step=1,
+            key="parser_cfg_min_name_overlap",
+            help="Минимум общих токенов в названии товара и найденной страницы.",
+        )
+    with p3:
+        ps_extra_domains = st.text_area(
+            "Доп. домены fallback (через запятую)",
+            value=str(parser_settings.get("extra_fallback_domains", "") or ""),
+            key="parser_cfg_extra_fallback_domains",
+            help="Пример: sportmaster.ru, alltricks.com, chainreactioncycles.com. Для стратегии `Только выбранные домены` обязательно заполнить.",
+        )
+        ps_stats = st.checkbox("Fallback габаритов из каталога", value=bool(parser_settings.get("enable_stats_fallback", True)), key="parser_cfg_enable_stats_fallback")
+        ps_defaults = st.checkbox("Fallback габаритов из defaults", value=bool(parser_settings.get("enable_defaults_fallback", True)), key="parser_cfg_enable_defaults_fallback")
+    if st.button("Сохранить настройки парсинга", key="parser_cfg_save_button", type="primary"):
+        strategy = str(ps_source_strategy or "auto_full")
+        enable_web = strategy in {"auto_full", "web_only", "custom_domains"}
+        enable_ozon = strategy == "auto_full"
+        enable_yandex = strategy == "auto_full"
+        new_settings = {
+            "timeout_seconds": float(ps_timeout),
+            "max_hops": int(ps_max_hops),
+            "fallback_max_results": int(ps_max_results),
+            "source_strategy": strategy,
+            "extra_fallback_domains": str(ps_extra_domains or "").strip(),
+            "require_article_match": bool(ps_require_article_match),
+            "min_name_overlap": int(ps_min_overlap),
+            "min_fallback_score": float(ps_min_score),
+            "enable_web_fallback": bool(enable_web),
+            "enable_ozon_fallback": bool(enable_ozon),
+            "enable_yandex_fallback": bool(enable_yandex),
+            "enable_stats_fallback": bool(ps_stats),
+            "enable_defaults_fallback": bool(ps_defaults),
+        }
+        save_parser_settings(conn, new_settings)
+        st.success("Настройки парсинга сохранены.")
+        st.rerun()
 
 
 def _set_ozon_bg_state(**kwargs) -> None:
@@ -2611,44 +2965,14 @@ def apply_mass_product_updates(
 
 
 def render_section_help() -> None:
-    with st.expander("Инструкция по разделам и кнопкам", expanded=False):
+    with st.expander("Быстрый контур работы", expanded=False):
         st.markdown(
             """
-**Импорт**
-- `Скачать шаблон импорта поставщика`: скачать эталонный Excel для загрузки каталога.
-- `Профиль поставщика`: выбрать поставщика из базы.
-- `Сохранить профиль`: сохранить/обновить поставщика, сайт и URL-шаблон.
-- `Импортировать`: загрузить файл в мастер-каталог.
-
-**Каталог**
-- `Поиск`: быстрый поиск по названию/артикулу/штрихкоду.
-- `Категория` / `Поставщик`: фильтры из выпадающих меню; категория в приоритете берётся из Ozon-эталона.
-- `Размер страницы` / `Страница` / `◀ Назад` / `Вперед ▶`: постраничная навигация.
-- `Обновить дубли`: пересчитать дубли по текущей странице.
-- `Обогатить поставщика`: массовый парсинг supplier_url по текущей странице.
-- `Автопривязать Ozon категории`: назначить эталонную Ozon-категорию.
-
-**Карточка**
-- `Поиск товара / Категория / Подкатегория / Поставщик`: выбрать нужный товар прямо в разделе Карточка.
-- `Спарсить поставщика`: мягкое обогащение (не перетирает сильные значения).
-- `Перезаполнить из поставщика`: жесткое обогащение с перезаписью.
-- `AI: описание / атрибуты / фото`: генерация SEO-описания, подсказки для пустых Ozon-атрибутов и 2 варианта изображений.
-- `Подобрать Ozon категорию`: автоподбор эталонной Ozon-категории.
-- `Перепривязать Ozon категорию (force)`: повторный подбор с перезаписью.
-- `Атрибуты для заполнения`: редактирование Ozon и клиентских атрибутов по выбранному каналу/категории.
-- `Сохранить карточку`: сохранить ручные изменения в мастер-карточке.
-
-**Клиентский шаблон**
-- `Авторегистрация шаблона`: колонки автоматически добавляются в атрибуты и требования канала/категории.
-- `Сохранить mapping rules`: сохранить правила соответствия колонок.
-- `Сохранить профиль шаблона`: сохранить тип шаблона клиента для повторной выгрузки.
-- `Добавить несматченные в master-атрибуты`: расширить мастер-карточку новыми полями.
-- `Подтвердить значения как client_validated`: зафиксировать проверенные значения.
-- `Скачать заполненный шаблон`: выгрузка результата в формате клиента.
-
-**Каналы**
-- `AI-настройки`: выбор провайдера (OpenAI/OpenRouter/NVIDIA), моделей и API-ключа.
-- `Проверить AI-подключение`: тестовый запрос к выбранной модели.
+1. `Импорт`: загрузи прайс поставщика и сохрани его в мастер-каталог.
+2. `Каталог`: отфильтруй нужные товары и запусти массовое наполнение.
+3. `Карточка`: доведи спорные товары руками, проверь Ozon/Detmir и фото.
+4. `Клиентский шаблон`: выбери клиента, подтяни shortlist и выгрузи готовую пачку.
+5. `Настройки`: здесь живут AI, парсинг и фото. `Каналы` оставлены только для клиентских правил и интеграций.
             """
         )
 
@@ -3993,8 +4317,8 @@ def show_catalog_tab():
     parser_settings = load_parser_settings(conn)
     ai_settings = load_ai_settings(conn)
     st.subheader("Каталог")
-    st.caption("Рекомендуемый поток: 1) загрузили каталог 2) нажали `Заполнить...` 3) точечно довели сложные товары в `Карточка`.")
-    st.info("Фильтр `Категория` учитывает Ozon-эталон в приоритете (ozon_category_path), затем категории из каталога.")
+    st.caption("Рабочий путь: импортировали каталог -> запустили массовое заполнение -> точечно довели сложные позиции в `Карточка`.")
+    st.caption("Фильтр `Категория` в приоритете опирается на Ozon-эталон (`ozon_category_path`), затем на категории из каталога.")
     with st.expander("Инструкция по кнопкам раздела Каталог", expanded=False):
         st.markdown(
             """
@@ -4008,142 +4332,23 @@ def show_catalog_tab():
 - `Обновить дубли по текущей выборке`: пересчет дублей по текущей странице.
             """
         )
-    with st.expander("Настройки парсинга и автообогащения", expanded=False):
-        st.caption("Пайплайн: Ozon эталон категории -> supplier_url карточка -> web-поиск/домены -> AI/статистика/defaults.")
-        # Защита от mixed numeric types на старых сессиях Streamlit:
-        # если в session_state остался int/str от прошлой версии виджета, приводим типы заранее.
-        def _coerce_state_number(key: str, default_value: object, caster):
-            if key in st.session_state:
-                try:
-                    st.session_state[key] = caster(st.session_state.get(key))
-                except Exception:
-                    st.session_state[key] = caster(default_value)
-
-        _coerce_state_number("parser_cfg_timeout_seconds", parser_settings.get("timeout_seconds", 8.0), float)
-        _coerce_state_number("parser_cfg_min_fallback_score", parser_settings.get("min_fallback_score", 3.0), float)
-        _coerce_state_number("parser_cfg_max_hops", parser_settings.get("max_hops", 1), int)
-        _coerce_state_number("parser_cfg_max_results", parser_settings.get("fallback_max_results", 4), int)
-        _coerce_state_number("parser_cfg_min_name_overlap", parser_settings.get("min_name_overlap", 2), int)
-
-        p1, p2, p3 = st.columns(3)
-        with p1:
-            ps_timeout = st.number_input(
-                "Таймаут запроса, сек",
-                min_value=2.0,
-                max_value=30.0,
-                value=float(parser_settings.get("timeout_seconds", 8.0)),
-                step=1.0,
-                key="parser_cfg_timeout_seconds",
-            )
-            ps_max_hops = st.number_input(
-                "Переходов с листинга в карточку",
-                min_value=1,
-                max_value=3,
-                value=int(parser_settings.get("max_hops", 1)),
-                step=1,
-                key="parser_cfg_max_hops",
-            )
-            ps_max_results = st.number_input(
-                "Лимит кандидатов fallback",
-                min_value=1,
-                max_value=12,
-                value=int(parser_settings.get("fallback_max_results", 4)),
-                step=1,
-                key="parser_cfg_max_results",
-            )
-            ps_min_score = st.number_input(
-                "Мин. score fallback",
-                min_value=0.0,
-                max_value=10.0,
-                value=float(parser_settings.get("min_fallback_score", 3.0)),
-                step=0.1,
-                key="parser_cfg_min_fallback_score",
-            )
-        with p2:
-            strategy_options = [
-                ("auto_full", "Авто: поставщик -> web-поиск -> AI"),
-                ("supplier_only", "Только сайт поставщика"),
-                ("web_only", "Только интернет-поиск + AI"),
-                ("custom_domains", "Только выбранные домены"),
-            ]
-            strategy_values = [x[0] for x in strategy_options]
-            current_strategy = str(parser_settings.get("source_strategy", "auto_full") or "auto_full")
-            if current_strategy not in strategy_values:
-                current_strategy = "auto_full"
-            ps_source_strategy = st.selectbox(
-                "Стратегия источников парсинга",
-                options=strategy_values,
-                index=strategy_values.index(current_strategy),
-                format_func=lambda x: next((label for key, label in strategy_options if key == x), x),
-                key="parser_cfg_source_strategy",
-            )
-            ps_require_article_match = st.checkbox(
-                "Требовать совпадение артикула/кода",
-                value=bool(parser_settings.get("require_article_match", True)),
-                key="parser_cfg_require_article_match",
-                help="Защищает от подстановки данных не того товара при fallback-поиске.",
-            )
-        with p3:
-            ps_extra_domains = st.text_area(
-                "Доп. домены fallback (через запятую)",
-                value=str(parser_settings.get("extra_fallback_domains", "") or ""),
-                key="parser_cfg_extra_fallback_domains",
-                help="Пример: sportmaster.ru, alltricks.com, chainreactioncycles.com. Для стратегии `Только выбранные домены` обязательно заполнить.",
-            )
-            ps_stats = st.checkbox(
-                "Fallback габаритов из каталога",
-                value=bool(parser_settings.get("enable_stats_fallback", True)),
-                key="parser_cfg_enable_stats_fallback",
-            )
-            ps_defaults = st.checkbox(
-                "Fallback габаритов из defaults",
-                value=bool(parser_settings.get("enable_defaults_fallback", True)),
-                key="parser_cfg_enable_defaults_fallback",
-            )
-            ps_include_without_url = st.checkbox(
-                "Обогащать товары без supplier_url",
-                value=bool(st.session_state.get("catalog_enrich_include_without_url", True)),
-                key="catalog_enrich_include_without_url",
-                help="Если включено, товары без URL поставщика тоже пойдут в fallback-поиск.",
-            )
-            pre_ozon_before_enrich = st.checkbox(
-                "Перед обогащением сначала делать Ozon автопривязку",
-                value=bool(st.session_state.get("catalog_pre_ozon_before_enrich", True)),
-                key="catalog_pre_ozon_before_enrich",
-                help="Рекомендуется держать включенным: сначала Ozon категория (эталон), потом парсинг и fallback.",
-            )
-            ps_min_overlap = st.number_input(
-                "Мин. пересечение токенов названия",
-                min_value=1,
-                max_value=5,
-                value=int(parser_settings.get("min_name_overlap", 2)),
-                step=1,
-                key="parser_cfg_min_name_overlap",
-                help="Минимум общих токенов в названии товара и найденной страницы.",
-            )
-        if st.button("Сохранить настройки парсинга", key="parser_cfg_save_button", type="primary"):
-            strategy = str(ps_source_strategy or "auto_full")
-            enable_web = strategy in {"auto_full", "web_only", "custom_domains"}
-            enable_ozon = strategy == "auto_full"
-            enable_yandex = strategy == "auto_full"
-            new_settings = {
-                "timeout_seconds": float(ps_timeout),
-                "max_hops": int(ps_max_hops),
-                "fallback_max_results": int(ps_max_results),
-                "source_strategy": strategy,
-                "extra_fallback_domains": str(ps_extra_domains or "").strip(),
-                "require_article_match": bool(ps_require_article_match),
-                "min_name_overlap": int(ps_min_overlap),
-                "min_fallback_score": float(ps_min_score),
-                "enable_web_fallback": bool(enable_web),
-                "enable_ozon_fallback": bool(enable_ozon),
-                "enable_yandex_fallback": bool(enable_yandex),
-                "enable_stats_fallback": bool(ps_stats),
-                "enable_defaults_fallback": bool(ps_defaults),
-            }
-            save_parser_settings(conn, new_settings)
-            st.success("Настройки парсинга сохранены.")
-            st.rerun()
+    with st.expander("Параметры текущего запуска", expanded=False):
+        st.caption(
+            f"Глобальная стратегия сейчас: `{str(parser_settings.get('source_strategy') or 'auto_full')}`. "
+            "Постоянные настройки парсинга, AI и фото теперь живут в разделе `Настройки`."
+        )
+        ps_include_without_url = st.checkbox(
+            "Обогащать товары без supplier_url",
+            value=bool(st.session_state.get("catalog_enrich_include_without_url", True)),
+            key="catalog_enrich_include_without_url",
+            help="Если включено, товары без URL поставщика тоже пойдут в fallback-поиск.",
+        )
+        pre_ozon_before_enrich = st.checkbox(
+            "Перед обогащением сначала делать Ozon автопривязку",
+            value=bool(st.session_state.get("catalog_pre_ozon_before_enrich", True)),
+            key="catalog_pre_ozon_before_enrich",
+            help="Рекомендуется держать включённым: сначала Ozon-категория, потом парсинг и AI.",
+        )
 
     category_values = list_catalog_categories(conn)
     supplier_values = list_distinct_values(conn, "supplier_name")
@@ -6293,7 +6498,7 @@ def show_product_tab():
             st.success(ai_msg)
         else:
             st.warning(ai_msg)
-            st.caption("Проверь настройки в разделе `Каналы` -> `AI-настройки`.")
+            st.caption("Проверь настройки в разделе `Настройки` -> `AI`.")
 
         ai_desc_key = f"ai_desc_candidate_{int(product_id)}"
         ai_title_key = f"ai_title_candidate_{int(product_id)}"
@@ -9844,254 +10049,86 @@ def show_ozon_tab():
     conn.close()
 
 
+def show_settings_tab():
+    conn = get_db()
+    summary = build_workspace_summary(conn)
+    st.subheader("Настройки PIM")
+    st.caption("Все общие настройки сервиса собраны здесь: AI, парсинг, фото и рабочая конфигурация. Каналы больше не должны играть роль системного шкафа со всем подряд.")
+
+    top1, top2, top3, top4 = st.columns(4)
+    top1.metric("Товаров в памяти", int(summary.get("products_total") or 0))
+    top2.metric("Клиентов", int(summary.get("clients_total") or 0))
+    top3.metric("Detmir категорий", int(summary.get("detmir_categories_total") or 0))
+    top4.metric("Ozon cat/type", int(summary.get("ozon_pairs_total") or 0))
+
+    with st.expander("Быстрый маршрут по настройкам", expanded=False):
+        st.markdown(
+            """
+1. `AI`: выбрать провайдера, активировать профиль и проверить доступ к модели.
+2. `Парсинг`: задать стратегию enrichment и защиту от ложных совпадений.
+3. `Фото`: указать публичный base URL, если в прайсах приходят локальные пути.
+4. `Система`: проверить активную БД и понять, где сейчас живёт память PIM.
+            """
+        )
+
+    tab_overview, tab_ai, tab_parser, tab_media = st.tabs(["Обзор", "AI", "Парсинг", "Фото"])
+    with tab_overview:
+        st.markdown("### Состояние памяти и активной конфигурации")
+        ai_settings = load_ai_settings(conn)
+        parser_settings = load_parser_settings(conn)
+        media_settings = load_media_settings(conn)
+        ov1, ov2, ov3 = st.columns(3)
+        with ov1:
+            st.markdown(
+                f"""
+<div class="pim-soft-card">
+  <strong>AI</strong><br/>
+  Провайдер: <span class="pim-mono">{str(ai_settings.get('provider') or '-')}</span><br/>
+  Модель: <span class="pim-mono">{str(ai_settings.get('chat_model') or '-')}</span><br/>
+  Активный ключ: <strong>{'есть' if str(ai_settings.get('api_key') or '').strip() else ('env' if bool(ai_settings.get('use_env_api_key', True)) else 'нет')}</strong>
+</div>
+                """,
+                unsafe_allow_html=True,
+            )
+        with ov2:
+            st.markdown(
+                f"""
+<div class="pim-soft-card">
+  <strong>Парсинг</strong><br/>
+  Стратегия: <span class="pim-mono">{str(parser_settings.get('source_strategy') or '-')}</span><br/>
+  Таймаут: <strong>{float(parser_settings.get('timeout_seconds') or 0):.0f} сек</strong><br/>
+  Домены fallback: <span class="pim-mono">{str(parser_settings.get('extra_fallback_domains') or '-')}</span>
+</div>
+                """,
+                unsafe_allow_html=True,
+            )
+        with ov3:
+            st.markdown(
+                f"""
+<div class="pim-soft-card">
+  <strong>Фото</strong><br/>
+  Public base URL:<br/>
+  <span class="pim-mono">{str(media_settings.get('public_base_url') or '-')}</span><br/><br/>
+  База данных:<br/>
+  <span class="pim-mono">{str(summary.get('active_db_path') or '-')}</span>
+</div>
+                """,
+                unsafe_allow_html=True,
+            )
+    with tab_ai:
+        render_ai_settings_panel(conn)
+    with tab_parser:
+        render_parser_settings_panel(conn)
+    with tab_media:
+        render_media_settings_panel(conn)
+
+    conn.close()
+
+
 def show_channels_tab():
     conn = get_db()
     st.subheader("Каналы")
-    st.caption("Здесь настраиваются требования и mapping rules для клиентов и каналов. Это служебный слой, который управляет экспортом.")
-    ai_settings = load_ai_settings(conn)
-    media_settings = load_media_settings(conn)
-
-    with st.expander("AI-настройки (описание, атрибуты, фото)", expanded=False):
-        st.caption(
-            "Поддерживаются OpenAI/OpenRouter/NVIDIA (OpenAI-compatible API). "
-            "Эти настройки используются в Карточке товара для генерации описания, подсказок атрибутов и изображений."
-        )
-        ai_profiles = list_ai_connection_profiles(conn)
-        if ai_profiles:
-            profile_options = [None] + [int(item["id"]) for item in ai_profiles]
-            profile_map = {int(item["id"]): item for item in ai_profiles}
-            ap1, ap2, ap3 = st.columns([2, 1, 1])
-            with ap1:
-                selected_ai_profile_id = st.selectbox(
-                    "Сохранённый AI-профиль",
-                    options=profile_options,
-                    format_func=lambda x: "-- выбрать --" if x is None else f"{profile_map[int(x)]['profile_name']} | {profile_map[int(x)].get('provider') or '-'} | {profile_map[int(x)].get('chat_model') or '-'}",
-                    key="ai_profile_select",
-                )
-            with ap2:
-                if st.button("Загрузить профиль", key="ai_profile_load_btn") and selected_ai_profile_id is not None:
-                    loaded = get_ai_connection_profile(conn, int(selected_ai_profile_id))
-                    if loaded:
-                        st.session_state["ai_cfg_provider"] = str(loaded.get("provider") or "openai")
-                        st.session_state["ai_cfg_chat_model"] = str(loaded.get("chat_model") or "")
-                        st.session_state["ai_cfg_image_model"] = str(loaded.get("image_model") or "")
-                        st.session_state["ai_cfg_base_url"] = str(loaded.get("base_url") or "")
-                        st.session_state["ai_cfg_temperature"] = float(loaded.get("temperature") or 0.3)
-                        st.session_state["ai_cfg_max_tokens"] = int(loaded.get("max_tokens") or 1800)
-                        st.session_state["ai_cfg_image_size"] = str(loaded.get("image_size") or "1024x1024")
-                        st.session_state["ai_cfg_use_env_key"] = bool(int(loaded.get("use_env_api_key") or 0))
-                        st.session_state["ai_cfg_enabled"] = True
-                        st.session_state["ai_cfg_api_key"] = str(loaded.get("api_key") or "")
-                        st.session_state["ai_cfg_or_referer"] = str(loaded.get("openrouter_referer") or "")
-                        st.session_state["ai_cfg_or_title"] = str(loaded.get("openrouter_title") or "pim")
-                        st.success("AI-профиль загружен в форму.")
-                        st.rerun()
-            with ap3:
-                st.caption(f"Профилей: {len(ai_profiles)}")
-        cfg_ok, cfg_msg = ai_is_configured(ai_settings)
-        if cfg_ok:
-            st.success(cfg_msg)
-        else:
-            st.warning(cfg_msg)
-
-        provider_options = ["openai", "openrouter", "nvidia"]
-        current_provider = str(ai_settings.get("provider") or "openai").strip().lower()
-        if current_provider not in provider_options:
-            current_provider = "openai"
-        a1, a2, a3 = st.columns(3)
-        with a1:
-            ai_provider = st.selectbox(
-                "Провайдер AI",
-                options=provider_options,
-                index=provider_options.index(current_provider),
-                format_func=lambda x: {"openai": "OpenAI", "openrouter": "OpenRouter", "nvidia": "NVIDIA"}.get(x, x),
-                key="ai_cfg_provider",
-            )
-        with a2:
-            ai_chat_model = st.text_input(
-                "Chat model",
-                value=str(ai_settings.get("chat_model") or ""),
-                key="ai_cfg_chat_model",
-            )
-        with a3:
-            ai_image_model = st.text_input(
-                "Image model",
-                value=str(ai_settings.get("image_model") or ""),
-                key="ai_cfg_image_model",
-            )
-
-        b1, b2, b3 = st.columns(3)
-        with b1:
-            ai_base_url = st.text_input(
-                "Base URL",
-                value=str(ai_settings.get("base_url") or ""),
-                key="ai_cfg_base_url",
-            )
-        with b2:
-            ai_temperature = st.number_input(
-                "Температура",
-                min_value=0.0,
-                max_value=1.5,
-                value=float(ai_settings.get("temperature") or 0.3),
-                step=0.1,
-                key="ai_cfg_temperature",
-            )
-        with b3:
-            ai_max_tokens = st.number_input(
-                "Max tokens",
-                min_value=256,
-                max_value=65536,
-                value=int(ai_settings.get("max_tokens") or 1800),
-                step=64,
-                key="ai_cfg_max_tokens",
-            )
-
-        c1, c2, c3 = st.columns(3)
-        image_size_options = ["1024x1024", "1536x1024", "1024x1536"]
-        current_image_size = str(ai_settings.get("image_size") or "1024x1024")
-        if current_image_size not in image_size_options:
-            current_image_size = "1024x1024"
-        with c1:
-            ai_image_size = st.selectbox(
-                "Размер изображения",
-                options=image_size_options,
-                index=image_size_options.index(current_image_size),
-                key="ai_cfg_image_size",
-            )
-        with c2:
-            ai_use_env_key = st.checkbox(
-                "Брать API key из env",
-                value=bool(ai_settings.get("use_env_api_key", True)),
-                key="ai_cfg_use_env_key",
-            )
-        with c3:
-            ai_enabled = st.checkbox(
-                "AI включен",
-                value=bool(ai_settings.get("enabled", True)),
-                key="ai_cfg_enabled",
-            )
-
-        ai_api_key = st.text_input(
-            "API key",
-            value=str(ai_settings.get("api_key") or ""),
-            type="password",
-            key="ai_cfg_api_key",
-            help="Если поле пустое и включен режим env, будет использован ключ из переменных окружения.",
-        )
-
-        if str(ai_provider) == "openrouter":
-            d1, d2 = st.columns(2)
-            with d1:
-                ai_openrouter_referer = st.text_input(
-                    "OpenRouter Referer",
-                    value=str(ai_settings.get("openrouter_referer") or ""),
-                    key="ai_cfg_or_referer",
-                )
-            with d2:
-                ai_openrouter_title = st.text_input(
-                    "OpenRouter App Title",
-                    value=str(ai_settings.get("openrouter_title") or "pim"),
-                    key="ai_cfg_or_title",
-                )
-        else:
-            ai_openrouter_referer = str(ai_settings.get("openrouter_referer") or "")
-            ai_openrouter_title = str(ai_settings.get("openrouter_title") or "pim")
-
-        ai_profile_name = st.text_input(
-            "Имя профиля AI",
-            value=f"{str(ai_provider).strip()}_{str(ai_chat_model or 'default').strip() or 'default'}",
-            key="ai_profile_name_input",
-            help="Сохрани конфигурацию как профиль, чтобы быстро переключаться между токенами/моделями.",
-        )
-
-        s1, s2, s3 = st.columns([1, 1, 1])
-        with s1:
-            if st.button("Сохранить AI-настройки", key="ai_cfg_save_btn"):
-                new_settings = {
-                    "enabled": bool(ai_enabled),
-                    "provider": str(ai_provider),
-                    "base_url": str(ai_base_url or "").strip(),
-                    "chat_model": str(ai_chat_model or "").strip(),
-                    "image_model": str(ai_image_model or "").strip(),
-                    "api_key": str(ai_api_key or "").strip(),
-                    "use_env_api_key": bool(ai_use_env_key),
-                    "temperature": float(ai_temperature),
-                    "max_tokens": int(ai_max_tokens),
-                    "image_size": str(ai_image_size),
-                    "openrouter_referer": str(ai_openrouter_referer or "").strip(),
-                    "openrouter_title": str(ai_openrouter_title or "pim").strip(),
-                }
-                save_ai_settings(conn, new_settings)
-                st.success("AI-настройки сохранены.")
-                st.rerun()
-        with s2:
-            if st.button("Проверить AI-подключение", key="ai_cfg_test_btn"):
-                test_settings = {
-                    "enabled": bool(ai_enabled),
-                    "provider": str(ai_provider),
-                    "base_url": str(ai_base_url or "").strip(),
-                    "chat_model": str(ai_chat_model or "").strip(),
-                    "image_model": str(ai_image_model or "").strip(),
-                    "api_key": str(ai_api_key or "").strip(),
-                    "use_env_api_key": bool(ai_use_env_key),
-                    "temperature": float(ai_temperature),
-                    "max_tokens": int(ai_max_tokens),
-                    "image_size": str(ai_image_size),
-                    "openrouter_referer": str(ai_openrouter_referer or "").strip(),
-                    "openrouter_title": str(ai_openrouter_title or "pim").strip(),
-                }
-                check_result = check_ai_connection(test_settings)
-                if check_result.get("ok"):
-                    st.success(
-                        f"AI подключен: provider={check_result.get('provider')}, "
-                        f"model={check_result.get('model')}, ответ={str(check_result.get('text') or '').strip()}"
-                    )
-                else:
-                    st.error(f"Ошибка AI-подключения: {check_result.get('error')}")
-        with s3:
-            if st.button("Сохранить как AI-профиль", key="ai_profile_save_btn"):
-                profile_id = save_ai_connection_profile(
-                    conn,
-                    ai_profile_name,
-                    {
-                        "provider": str(ai_provider),
-                        "base_url": str(ai_base_url or "").strip(),
-                        "chat_model": str(ai_chat_model or "").strip(),
-                        "image_model": str(ai_image_model or "").strip(),
-                        "api_key": str(ai_api_key or "").strip(),
-                        "use_env_api_key": bool(ai_use_env_key),
-                        "temperature": float(ai_temperature),
-                        "max_tokens": int(ai_max_tokens),
-                        "image_size": str(ai_image_size),
-                        "openrouter_referer": str(ai_openrouter_referer or "").strip(),
-                        "openrouter_title": str(ai_openrouter_title or "pim").strip(),
-                    },
-                )
-                st.success(f"AI-профиль сохранён: #{profile_id}")
-                st.rerun()
-
-    with st.expander("Медиа / фото", expanded=False):
-        st.caption(
-            "Если в прайсах или 1С приходят локальные пути к картинкам, здесь можно задать публичный base URL. "
-            "Тогда система будет конвертировать пути вида `\\\\fs03\\share\\folder\\image.jpg` "
-            "в нормальные web-ссылки для карточки, Excel-выгрузки и ZIP-архивов."
-        )
-        media_public_base_url = st.text_input(
-            "Public base URL для фото",
-            value=str(media_settings.get("public_base_url") or ""),
-            placeholder="Например: https://cdn.example.ru/photos",
-            key="media_cfg_public_base_url",
-            help="Пример: `\\\\fs03\\1c_photo\\LinkPics\\153\\153246_0.jpg` -> `https://.../1c_photo/LinkPics/153/153246_0.jpg`.",
-        )
-        if st.button("Сохранить настройки фото", key="media_cfg_save_btn"):
-            save_media_settings(
-                conn,
-                {
-                    "public_base_url": str(media_public_base_url or "").strip(),
-                },
-            )
-            st.success("Настройки фото сохранены.")
-            st.rerun()
+    st.caption("Здесь живут channel requirements, mapping rules и клиентские overlay-интеграции. Общие настройки PIM теперь вынесены в отдельный раздел `Настройки`.")
 
     with st.expander("Детский Мир API: схема клиента и карточки", expanded=False):
         st.caption(
@@ -10517,7 +10554,7 @@ def show_channels_tab():
         "SELECT channel_code, channel_name, is_active FROM channel_profiles ORDER BY channel_name"
     ).fetchall()
     channel_df = pd.DataFrame([dict(r) for r in channels]) if channels else pd.DataFrame()
-    st.subheader("Каналы")
+    st.markdown("### Реестр каналов и правила")
     if not channel_df.empty:
         st.dataframe(channel_df, use_container_width=True, hide_index=True)
 
@@ -10628,20 +10665,15 @@ def main():
     if "/mount/src/" in low_db and low_db.endswith("/data/catalog.db"):
         st.warning("Используется БД внутри папки приложения. На Streamlit Cloud она может сбрасываться при redeploy. Рекомендуется `PIM_DB_PATH=/home/adminuser/.pim/catalog.db`.")
 
-    with st.expander("Как здесь работать", expanded=False):
+    with st.expander("Маршрут менеджера", expanded=False):
         st.markdown(
             """
-1. **Импорт**: загрузи Excel, выбери авто/ручной режим, при необходимости задай поставщика и URL-шаблон (`{article}`, `{supplier_article}`), затем выполни импорт.
-2. **Импорт → Ozon**: после импорта можно сразу автопривязать товары к Ozon категориям (если синхронизирован кэш категорий во вкладке Ozon).
-3. **Каталог**: работай постранично (страницы + размер), фильтруй по статусу парсинга, запускай массовый supplier enrichment и Ozon-автопривязку по текущей странице.
-4. **Карточка**: дозаполни вручную, смотри источники данных, запусти парсинг поставщика и проверь/скорректируй Ozon category (id/type/path/confidence).
-5. **Атрибуты**: поддерживай master/channel атрибуты, которые участвуют в автоматчинге шаблонов.
-6. **Клиентский шаблон**: загрузи шаблон клиента, выбери категорию, проверь авто-матчинг, при необходимости поправь руками и сохрани профиль.
-7. **Клиентский шаблон → новые поля**: если в шаблоне есть новые характеристики, кнопка добавит их в master-атрибуты и сразу предложит маппинг.
-8. **Экспорт Excel**: заполни выбранные товары, проверь gap/readiness, выгрузи готовый Excel в исходной структуре клиента.
-9. **Ozon**: синхронизируй дерево/атрибуты, используй Ozon как эталон структуры, импортируй атрибуты в PIM и контролируй покрытие.
-10. **Каналы**: поддерживай channel requirements и mapping rules для повторного безручного экспорта.
-11. **AI**: в разделе `Каналы` задай provider/model/key, затем в `Карточка` используй генерацию SEO-описания, подсказки атрибутов и 2 варианта изображений.
+1. **Настройки**: один раз подключи AI, парсинг и фото-базу.
+2. **Импорт**: загрузи каталог поставщика.
+3. **Ozon**: держи эталон категорий и атрибутов в памяти.
+4. **Каталог**: запусти массовое наполнение по выборке.
+5. **Карточка**: доведи спорные товары, Detmir и фото.
+6. **Клиентский шаблон**: подтяни shortlist и выгрузи готовую пачку.
             """
         )
     render_section_help()
@@ -10657,6 +10689,8 @@ def main():
         show_template_tab()
     elif selected_section == "ozon":
         show_ozon_tab()
+    elif selected_section == "settings":
+        show_settings_tab()
     else:
         show_channels_tab()
 

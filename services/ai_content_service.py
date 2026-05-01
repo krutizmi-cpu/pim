@@ -6,6 +6,7 @@ import os
 import re
 import sqlite3
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 
@@ -165,6 +166,82 @@ def _resolve_api_key(settings: dict[str, Any]) -> str:
     return ""
 
 
+def _build_request_headers(settings: dict[str, Any]) -> dict[str, str]:
+    api_key = _resolve_api_key(settings)
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    provider = str(settings.get("provider") or "").strip().lower()
+    if provider == "openrouter":
+        referer = str(settings.get("openrouter_referer") or "").strip() or os.getenv("OPENROUTER_SITE_URL", "").strip()
+        title = str(settings.get("openrouter_title") or "").strip() or os.getenv("OPENROUTER_APP_NAME", "").strip() or "pim"
+        if referer:
+            headers["HTTP-Referer"] = referer
+        if title:
+            headers["X-Title"] = title
+    return headers
+
+
+def _build_http_timeout(provider: str, *, for_chat: bool) -> httpx.Timeout:
+    key = str(provider or "").strip().lower()
+    if for_chat:
+        if key == "nvidia":
+            return httpx.Timeout(connect=20.0, read=180.0, write=45.0, pool=45.0)
+        if key == "openrouter":
+            return httpx.Timeout(connect=20.0, read=120.0, write=40.0, pool=40.0)
+        return httpx.Timeout(connect=15.0, read=90.0, write=30.0, pool=30.0)
+    return httpx.Timeout(connect=12.0, read=30.0, write=20.0, pool=20.0)
+
+
+def _check_model_endpoint(settings: dict[str, Any]) -> dict[str, Any]:
+    ok, reason = ai_is_configured(settings)
+    if not ok:
+        return {"ok": False, "error": reason}
+    base_url = str(settings.get("base_url") or "").rstrip("/")
+    provider = str(settings.get("provider") or "").strip().lower()
+    model = str(settings.get("chat_model") or "").strip()
+    headers = _build_request_headers(settings)
+    encoded_model = quote(model, safe="/:-_")
+    try:
+        with httpx.Client(timeout=_build_http_timeout(provider, for_chat=False)) as client:
+            response = client.get(f"{base_url}/models/{encoded_model}", headers=headers)
+            if response.status_code == 404:
+                list_response = client.get(f"{base_url}/models", headers=headers)
+                list_response.raise_for_status()
+                data = list_response.json()
+                models = data.get("data") if isinstance(data, dict) else None
+                model_ids = {
+                    str(item.get("id") or "").strip()
+                    for item in (models or [])
+                    if isinstance(item, dict)
+                }
+                if model in model_ids:
+                    return {
+                        "ok": True,
+                        "provider": provider,
+                        "model": model,
+                        "mode": "models_list",
+                        "text": f"Модель `{model}` найдена в каталоге провайдера.",
+                    }
+                return {
+                    "ok": False,
+                    "provider": provider,
+                    "model": model,
+                    "error": f"Провайдер отвечает, но модель `{model}` не найдена в `/models`.",
+                }
+            response.raise_for_status()
+            return {
+                "ok": True,
+                "provider": provider,
+                "model": model,
+                "mode": "model_endpoint",
+                "text": f"Провайдер отвечает, модель `{model}` доступна.",
+            }
+    except Exception as e:
+        return {"ok": False, "provider": provider, "model": model, "error": str(e)}
+
+
 def ai_is_configured(settings: dict[str, Any]) -> tuple[bool, str]:
     if not bool(settings.get("enabled", True)):
         return False, "AI отключен в настройках."
@@ -209,7 +286,6 @@ def _chat_completion(
 
     base_url = str(settings.get("base_url") or "").rstrip("/")
     model = str(settings.get("chat_model") or "").strip()
-    api_key = _resolve_api_key(settings)
     provider = str(settings.get("provider") or "").strip().lower()
 
     payload: dict[str, Any] = {
@@ -224,20 +300,9 @@ def _chat_completion(
     if force_json:
         payload["response_format"] = {"type": "json_object"}
 
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
-    if provider == "openrouter":
-        referer = str(settings.get("openrouter_referer") or "").strip() or os.getenv("OPENROUTER_SITE_URL", "").strip()
-        title = str(settings.get("openrouter_title") or "").strip() or os.getenv("OPENROUTER_APP_NAME", "").strip() or "pim"
-        if referer:
-            headers["HTTP-Referer"] = referer
-        if title:
-            headers["X-Title"] = title
-
+    headers = _build_request_headers(settings)
     try:
-        with httpx.Client(timeout=80.0) as client:
+        with httpx.Client(timeout=_build_http_timeout(provider, for_chat=True)) as client:
             response = client.post(f"{base_url}/chat/completions", headers=headers, json=payload)
             response.raise_for_status()
             data = response.json()
@@ -261,13 +326,35 @@ def _chat_completion(
 
 
 def check_ai_connection(settings: dict[str, Any]) -> dict[str, Any]:
-    return _chat_completion(
+    model_check = _check_model_endpoint(settings)
+    if not model_check.get("ok"):
+        return model_check
+    provider = str(settings.get("provider") or "").strip().lower()
+    if provider == "nvidia":
+        return {
+            **model_check,
+            "text": f"{model_check.get('text')} Для NVIDIA это быстрая проверка доступа к модели без ожидания долгой генерации.",
+        }
+    chat_check = _chat_completion(
         settings=settings,
         system_prompt="Ты сервис проверки соединения.",
         user_prompt="Ответь ровно: OK",
         temperature=0.0,
-        max_tokens=20,
+        max_tokens=12,
     )
+    if chat_check.get("ok"):
+        return chat_check
+    return {
+        "ok": True,
+        "provider": provider,
+        "model": str(settings.get("chat_model") or "").strip(),
+        "mode": "model_endpoint_only",
+        "text": (
+            f"{model_check.get('text')} Короткий chat-ping не завершился быстро: "
+            f"{chat_check.get('error') or 'без текста ошибки'}"
+        ),
+        "warning": chat_check.get("error"),
+    }
 
 
 def _product_row(conn: sqlite3.Connection, product_id: int) -> dict[str, Any]:
