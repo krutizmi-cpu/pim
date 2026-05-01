@@ -4671,15 +4671,21 @@ def show_catalog_tab():
         else [int(x) for x in filtered_supplier_candidate_ids]
     )
     selected_shortlist_ids = [int(x) for x in selected_page_ids]
+    effective_selected_shortlist_ids = list(selected_shortlist_ids)
+    if not effective_selected_shortlist_ids and int(selected_id or 0) > 0:
+        # If the operator picked a single product in the focus block but did not
+        # add anything to the shortlist, treat that focused product as the
+        # working selection for "Selected products" actions.
+        effective_selected_shortlist_ids = [int(selected_id)]
     page_zip_signature = f"page:{int(page)}:{hashlib.sha1(','.join([str(int(x)) for x in ids]).encode('utf-8')).hexdigest()}"
     filtered_zip_signature = f"filtered:{hashlib.sha1(','.join([str(int(x)) for x in all_filtered_candidate_ids]).encode('utf-8')).hexdigest()}"
-    selected_zip_signature = f"selected:{hashlib.sha1(','.join([str(int(x)) for x in selected_shortlist_ids]).encode('utf-8')).hexdigest()}" if selected_shortlist_ids else "selected:none"
+    selected_zip_signature = f"selected:{hashlib.sha1(','.join([str(int(x)) for x in effective_selected_shortlist_ids]).encode('utf-8')).hexdigest()}" if effective_selected_shortlist_ids else "selected:none"
 
     catalog_scope_options = ["Выбранные товары", "Текущая страница", "Вся выборка по фильтру"]
 
     def resolve_catalog_scope_ids(scope_value: str) -> list[int]:
         if scope_value == "Выбранные товары":
-            return [int(x) for x in selected_shortlist_ids]
+            return [int(x) for x in effective_selected_shortlist_ids]
         if scope_value == "Текущая страница":
             return [int(x) for x in ids]
         return [int(x) for x in effective_filtered_candidate_ids]
@@ -4773,6 +4779,10 @@ def show_catalog_tab():
         f"Лимиты: страница {int(max_bulk_enrich_page)}, выборка {int(max_bulk_enrich_filtered)}. "
         f"Ozon перед обогащением: {'вкл' if bool(pre_ozon_before_enrich) else 'выкл'}."
     )
+    if not selected_shortlist_ids and effective_selected_shortlist_ids:
+        st.caption(
+            "Shortlist пуст, поэтому для режима `Выбранные товары` будет использован товар из блока `Быстрый переход и фокус`."
+        )
     ai_cfg_ok, ai_cfg_msg = ai_is_configured(ai_settings)
     with st.expander("Тонкая настройка массового наполнения", expanded=False):
         if ai_cfg_ok:
@@ -5379,8 +5389,8 @@ def show_catalog_tab():
     with ai3:
         if st.button("Заполнить выбранные товары", type="primary", help="Запустить основной поток только по отмеченным товарам на этой странице"):
             run_ai_enrichment_batch(
-                candidate_ids=[int(x) for x in selected_shortlist_ids],
-                run_limit=max(len(selected_shortlist_ids), 1),
+                candidate_ids=[int(x) for x in effective_selected_shortlist_ids],
+                run_limit=max(len(effective_selected_shortlist_ids), 1),
                 run_label="AI / Выбранные товары",
             )
 
@@ -5412,8 +5422,8 @@ def show_catalog_tab():
                 st.rerun()
         with cextra3:
             if st.button("Автопривязать Ozon категории (выбранные)", help="Назначить Ozon категорию только отмеченным товарам"):
-                res = bulk_assign_ozon_categories(conn, [int(x) for x in selected_shortlist_ids], min_score=OZON_CATEGORY_MIN_SCORE, force=False)
-                materialized = materialize_ozon_attribute_slots_for_products(conn, [int(x) for x in selected_shortlist_ids])
+                res = bulk_assign_ozon_categories(conn, [int(x) for x in effective_selected_shortlist_ids], min_score=OZON_CATEGORY_MIN_SCORE, force=False)
+                materialized = materialize_ozon_attribute_slots_for_products(conn, [int(x) for x in effective_selected_shortlist_ids])
                 if res.get("message"):
                     st.info(str(res["message"]))
                 else:
@@ -5448,8 +5458,8 @@ def show_catalog_tab():
                 )
         with oextra3:
             if st.button("Подтянуть Ozon-атрибуты (выбранные)", help="Подготовить Ozon-атрибуты только для отмеченных товаров"):
-                seeded = ensure_ozon_requirements_for_products(conn, [int(x) for x in selected_shortlist_ids])
-                materialized = materialize_ozon_attribute_slots_for_products(conn, [int(x) for x in selected_shortlist_ids])
+                seeded = ensure_ozon_requirements_for_products(conn, [int(x) for x in effective_selected_shortlist_ids])
+                materialized = materialize_ozon_attribute_slots_for_products(conn, [int(x) for x in effective_selected_shortlist_ids])
                 st.success(
                     "Готово по выбранным: "
                     f"товаров с Ozon-категорией {int(seeded.get('products_with_ozon_category') or 0)} из {int(seeded.get('products_total') or 0)}, "
@@ -5485,8 +5495,8 @@ def show_catalog_tab():
         with b4:
             if st.button("Только supplier/web enrichment (выбранные)", help="Запустить supplier/web enrichment без AI только по отмеченным товарам"):
                 run_supplier_enrichment_batch(
-                    candidate_ids=[int(x) for x in selected_shortlist_ids],
-                    run_limit=max(len(selected_shortlist_ids), 1),
+                    candidate_ids=[int(x) for x in effective_selected_shortlist_ids],
+                    run_limit=max(len(effective_selected_shortlist_ids), 1),
                     run_label="Выбранные товары",
                 )
 
@@ -5508,8 +5518,8 @@ def show_catalog_tab():
         with d3:
             if st.button("Рассчитать габариты/вес (выбранные)", help="Рассчитать логистику только по отмеченным товарам"):
                 run_dimension_estimation_batch(
-                    candidate_ids=[int(x) for x in selected_shortlist_ids],
-                    run_limit=max(len(selected_shortlist_ids), 1),
+                    candidate_ids=[int(x) for x in effective_selected_shortlist_ids],
+                    run_limit=max(len(effective_selected_shortlist_ids), 1),
                     run_label="Выбранные товары",
                 )
         z1, z2, z3 = st.columns(3)
@@ -5573,7 +5583,7 @@ def show_catalog_tab():
             if st.button("Подготовить ZIP фото выбранных", key="catalog_prepare_images_selected_zip"):
                 zip_selected_bytes, zip_selected_stats = build_product_images_zip(
                     conn,
-                    [int(x) for x in selected_shortlist_ids],
+                    [int(x) for x in effective_selected_shortlist_ids],
                     public_base_url=media_public_base_url,
                 )
                 st.session_state["catalog_selected_zip_bytes"] = zip_selected_bytes
@@ -5704,7 +5714,7 @@ def show_catalog_tab():
         )
         if apply_mass:
             if scope == "Выбранные товары":
-                target_ids = [int(x) for x in selected_shortlist_ids]
+                target_ids = [int(x) for x in effective_selected_shortlist_ids]
             elif scope == "Текущая страница":
                 target_ids = [int(x) for x in ids]
             else:
