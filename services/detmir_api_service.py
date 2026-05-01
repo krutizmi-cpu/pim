@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
 import time
 from datetime import datetime
@@ -52,6 +53,16 @@ _DETMIR_STANDARD_MAPPING_RULES: dict[str, tuple[str, str, str | None]] = {
     "model": ("attribute", "model", None),
     "description": ("column", "description", None),
     "tnved": ("column", "tnved_code", None),
+}
+_STOP_TOKENS = {
+    "для",
+    "и",
+    "или",
+    "товары",
+    "товар",
+    "прочее",
+    "разное",
+    "аксессуары",
 }
 
 
@@ -247,6 +258,55 @@ def _detmir_attribute_code(attribute_key: str, attribute_name: str | None = None
         fallback = "".join(ch if ch.isalnum() or ch == "_" else "_" for ch in fallback)
         safe = "_".join(part for part in fallback.split("_") if part) or "field"
     return f"detmir_attr_{safe}"
+
+
+def _normalize_text(value: object) -> str:
+    text = str(value or "").strip().lower()
+    text = text.replace("ё", "е")
+    text = re.sub(r"[^a-zа-я0-9]+", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _tokenize_text(value: object) -> set[str]:
+    normalized = _normalize_text(value)
+    return {
+        token
+        for token in normalized.split(" ")
+        if token and len(token) > 1 and token not in _STOP_TOKENS
+    }
+
+
+def _split_multi_values(value: object) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [str(x).strip() for x in value if str(x).strip()]
+    if isinstance(value, (tuple, set)):
+        return [str(x).strip() for x in value if str(x).strip()]
+    if isinstance(value, (int, float, bool)):
+        return [str(value).strip()]
+    text = str(value or "").strip()
+    if not text:
+        return []
+    if text.startswith("[") and text.endswith("]"):
+        try:
+            parsed = json.loads(text)
+            if isinstance(parsed, list):
+                return [str(x).strip() for x in parsed if str(x).strip()]
+        except Exception:
+            pass
+    parts = re.split(r"[,\n;/]+", text)
+    return [part.strip() for part in parts if part.strip()]
+
+
+def _value_present(value: object) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, (list, tuple, set, dict)):
+        return bool(value)
+    return value not in (0, 0.0)
 
 
 def _flatten_category_tree(nodes: list[dict[str, Any]], parent_id: int | None = None, parent_path: str = "", level: int = 1) -> list[dict[str, Any]]:
@@ -1058,6 +1118,100 @@ def list_cached_products(
     return [dict(r) for r in rows]
 
 
+def get_cached_category(conn: sqlite3.Connection, category_id: int) -> dict[str, Any] | None:
+    row = conn.execute(
+        "SELECT * FROM detmir_category_cache WHERE category_id = ? LIMIT 1",
+        (int(category_id),),
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def suggest_categories_for_product(
+    conn: sqlite3.Connection,
+    product_row: dict[str, Any],
+    *,
+    limit: int = 12,
+    only_leaf: bool = True,
+) -> list[dict[str, Any]]:
+    rows = list_cached_categories(conn, only_leaf=bool(only_leaf), limit=5000)
+    if not rows:
+        return []
+    product_name = str(product_row.get("name") or "").strip()
+    hints = [
+        str(product_row.get("ozon_category_path") or "").strip(),
+        str(product_row.get("subcategory") or "").strip(),
+        str(product_row.get("category") or "").strip(),
+        str(product_row.get("base_category") or "").strip(),
+        product_name,
+    ]
+    hint_tokens = set()
+    for hint in hints:
+        hint_tokens.update(_tokenize_text(hint))
+    ozon_path_tokens = _tokenize_text(product_row.get("ozon_category_path"))
+    category_tokens = _tokenize_text(" ".join(str(x or "") for x in [product_row.get("category"), product_row.get("base_category"), product_row.get("subcategory")]))
+    ranked: list[dict[str, Any]] = []
+    for row in rows:
+        path = str(row.get("full_path") or row.get("name") or "").strip()
+        path_tokens = _tokenize_text(path)
+        if not path_tokens:
+            continue
+        overlap = len(hint_tokens & path_tokens)
+        score = 0.0
+        if overlap:
+            score += overlap * 2.5
+        if ozon_path_tokens:
+            score += len(ozon_path_tokens & path_tokens) * 1.8
+        if category_tokens:
+            score += len(category_tokens & path_tokens) * 2.2
+        name_norm = _normalize_text(product_name)
+        path_norm = _normalize_text(path)
+        if name_norm and path_norm and any(token in name_norm for token in path_tokens):
+            score += 1.0
+        if path_norm.endswith("велосипеды") and "велосипед" in hint_tokens:
+            score += 1.5
+        if path_norm.endswith("самокаты") and "самокат" in hint_tokens:
+            score += 1.5
+        if path_norm.endswith("беговелы") and "беговел" in hint_tokens:
+            score += 1.5
+        if score <= 0:
+            continue
+        ranked.append(
+            {
+                **row,
+                "match_score": round(score, 2),
+                "token_overlap": overlap,
+            }
+        )
+    ranked.sort(
+        key=lambda item: (
+            -float(item.get("match_score") or 0.0),
+            -int(item.get("token_overlap") or 0),
+            str(item.get("full_path") or item.get("name") or ""),
+        )
+    )
+    return ranked[: max(1, int(limit))]
+
+
+def detect_best_category_for_product(
+    conn: sqlite3.Connection,
+    product_row: dict[str, Any],
+    *,
+    min_score: float = 2.5,
+    limit: int = 12,
+) -> dict[str, Any]:
+    suggestions = suggest_categories_for_product(conn, product_row, limit=limit)
+    if not suggestions:
+        return {"ok": False, "message": "В кэше Detmir пока нет подходящих категорий."}
+    best = suggestions[0]
+    if float(best.get("match_score") or 0.0) < float(min_score):
+        return {
+            "ok": False,
+            "message": "Автоматический матчинг Detmir-категории слишком неуверенный.",
+            "suggestions": suggestions,
+        }
+    return {"ok": True, "category": best, "suggestions": suggestions}
+
+
 def get_detmir_cache_stats(conn: sqlite3.Connection) -> dict[str, Any]:
     rows = {}
     for table_name in (
@@ -1082,6 +1236,226 @@ def get_detmir_cache_stats(conn: sqlite3.Connection) -> dict[str, Any]:
     rows["last_schema_sync_at"] = _get_setting(conn, DETMIR_LAST_SCHEMA_SYNC_KEY)
     rows["last_product_sync_at"] = _get_setting(conn, DETMIR_LAST_PRODUCT_SYNC_KEY)
     return rows
+
+
+def _resolve_attribute_value_candidates(
+    conn: sqlite3.Connection,
+    *,
+    attribute_key: str,
+) -> list[dict[str, Any]]:
+    rows = list_cached_attribute_values(conn, attribute_key=str(attribute_key).strip(), limit=100000)
+    prepared: list[dict[str, Any]] = []
+    for row in rows:
+        prepared.append(
+            {
+                "value_key": str(row.get("value_key") or "").strip(),
+                "value_label": str(row.get("value_label") or "").strip(),
+                "label_norm": _normalize_text(row.get("value_label")),
+                "key_norm": _normalize_text(row.get("value_key")),
+            }
+        )
+    return prepared
+
+
+def _resolve_dictionary_value(
+    conn: sqlite3.Connection,
+    *,
+    attribute_key: str,
+    raw_value: object,
+    is_multi: bool,
+) -> dict[str, Any]:
+    parts = _split_multi_values(raw_value)
+    if not parts:
+        return {"ok": False, "values": [], "status": "missing", "raw_value": raw_value}
+    candidates = _resolve_attribute_value_candidates(conn, attribute_key=str(attribute_key))
+    if not candidates:
+        return {"ok": False, "values": [], "status": "dictionary_cache_missing", "raw_value": raw_value}
+    picked_keys: list[str] = []
+    picked_labels: list[str] = []
+    unresolved: list[str] = []
+    for part in parts:
+        part_norm = _normalize_text(part)
+        matched = None
+        for cand in candidates:
+            if part_norm in {cand["label_norm"], cand["key_norm"]}:
+                matched = cand
+                break
+        if matched is None:
+            for cand in candidates:
+                if part_norm and (part_norm in cand["label_norm"] or cand["label_norm"] in part_norm or part_norm in cand["key_norm"]):
+                    matched = cand
+                    break
+        if matched is None:
+            unresolved.append(part)
+            continue
+        picked_keys.append(matched["value_key"])
+        picked_labels.append(matched["value_label"])
+    if unresolved:
+        return {
+            "ok": False,
+            "values": picked_keys if is_multi else (picked_keys[0] if picked_keys else None),
+            "labels": picked_labels,
+            "status": "dictionary_unmatched",
+            "raw_value": raw_value,
+            "unresolved": unresolved,
+        }
+    return {
+        "ok": True,
+        "values": picked_keys if is_multi else (picked_keys[0] if picked_keys else None),
+        "labels": picked_labels,
+        "status": "ok",
+        "raw_value": raw_value,
+    }
+
+
+def analyze_product_detmir_readiness(
+    conn: sqlite3.Connection,
+    *,
+    product_id: int,
+    category_id: int | None = None,
+) -> dict[str, Any]:
+    from services.template_matching import build_product_value_map
+
+    product_row = conn.execute("SELECT * FROM products WHERE id = ? LIMIT 1", (int(product_id),)).fetchone()
+    if not product_row:
+        return {"summary": {"status": "not_found", "readiness_pct": 0}, "rows": [], "payload": {}}
+    product = dict(product_row)
+    resolved_category_id = int(category_id or product.get("detmir_category_id") or 0)
+    if resolved_category_id <= 0:
+        return {
+            "summary": {
+                "status": "no_category",
+                "readiness_pct": 0,
+                "required_total": 0,
+                "required_filled": 0,
+                "blockers": 1,
+                "warnings": 0,
+                "photos_count": 0,
+                "dictionary_unmatched": 0,
+            },
+            "rows": [],
+            "payload": {},
+        }
+    category_code = _detmir_category_code(resolved_category_id)
+    detmir_attrs = list_cached_attributes(conn, category_id=resolved_category_id, include_variant=True, limit=10000)
+    if not detmir_attrs:
+        return {
+            "summary": {
+                "status": "no_schema",
+                "readiness_pct": 0,
+                "required_total": 0,
+                "required_filled": 0,
+                "blockers": 1,
+                "warnings": 0,
+                "photos_count": 0,
+                "dictionary_unmatched": 0,
+            },
+            "rows": [],
+            "payload": {},
+        }
+    value_map = build_product_value_map(conn, int(product_id))
+    media_gallery = value_map.get("media_gallery") or []
+    if not isinstance(media_gallery, list):
+        media_gallery = _split_multi_values(media_gallery)
+    barcode = str(product.get("barcode") or value_map.get("barcode") or "").strip()
+    vendor_product_id = (
+        str(product.get("supplier_article") or "").strip()
+        or str(product.get("internal_article") or "").strip()
+        or str(product.get("article") or "").strip()
+    )
+    title = str(product.get("name") or value_map.get("name") or "").strip()
+
+    rows: list[dict[str, Any]] = [
+        {"target": "category_id", "required": 1, "status": "ok", "value": resolved_category_id, "notes": "Detmir category"},
+        {"target": "barcode", "required": 1, "status": "ok" if barcode else "missing", "value": barcode or None, "notes": "Основа привязки фото и карточки"},
+        {"target": "vendorProductId", "required": 1, "status": "ok" if vendor_product_id else "missing", "value": vendor_product_id or None, "notes": "Идентификатор товара поставщика"},
+        {"target": "title", "required": 1, "status": "ok" if title else "missing", "value": title or None, "notes": "Название товара в Детском Мире"},
+        {"target": "photos", "required": 1, "status": "ok" if media_gallery else "missing", "value": media_gallery, "notes": "Желательно минимум 3 фото"},
+    ]
+    payload_attributes: list[dict[str, Any]] = []
+    required_total = 0
+    required_filled = 0
+    dictionary_unmatched = 0
+    for attr in detmir_attrs:
+        attribute_key = str(attr.get("attribute_key") or "").strip()
+        local_code = _detmir_attribute_code(attribute_key, str(attr.get("attribute_name") or ""))
+        raw_value = value_map.get(local_code)
+        required = int(bool(attr.get("is_required")))
+        status = "missing"
+        resolved_value: Any = None
+        notes = ""
+        if _value_present(raw_value):
+            attr_type = str(attr.get("data_type") or "").strip().upper()
+            is_multi = attr_type == "SELECT_MULTIPLE"
+            if attr_type in _SELECT_TYPES:
+                resolved = _resolve_dictionary_value(
+                    conn,
+                    attribute_key=attribute_key,
+                    raw_value=raw_value,
+                    is_multi=is_multi,
+                )
+                status = str(resolved.get("status") or "missing")
+                resolved_value = resolved.get("values")
+                if status == "ok":
+                    notes = ", ".join(resolved.get("labels") or [])
+                elif status == "dictionary_unmatched":
+                    dictionary_unmatched += 1
+                    notes = f"Нужно сопоставить: {', '.join(resolved.get('unresolved') or [])}"
+                elif status == "dictionary_cache_missing":
+                    notes = "Нет кэша справочных значений"
+            else:
+                status = "ok"
+                resolved_value = raw_value
+        row = {
+            "target": attribute_key,
+            "attribute_code": local_code,
+            "attribute_name": str(attr.get("attribute_name") or attribute_key),
+            "required": required,
+            "status": status,
+            "value": raw_value,
+            "resolved_value": resolved_value,
+            "notes": notes,
+            "data_type": str(attr.get("data_type") or ""),
+            "is_variant_attribute": int(bool(attr.get("is_variant_attribute"))),
+        }
+        rows.append(row)
+        if required:
+            required_total += 1
+            if status == "ok":
+                required_filled += 1
+        if status == "ok" and resolved_value not in (None, "", [], {}):
+            payload_attributes.append({"key": attribute_key, "value": resolved_value})
+
+    blockers = sum(1 for row in rows if int(row.get("required") or 0) == 1 and str(row.get("status")) != "ok")
+    warnings = 0
+    if len(media_gallery) < 3:
+        warnings += 1
+    photo_urls = [str(x).strip() for x in media_gallery if str(x).strip()]
+    if any(not url.startswith(("http://", "https://")) for url in photo_urls):
+        warnings += 1
+    readiness_pct = round((required_filled / required_total) * 100) if required_total else 0
+    payload = {
+        "categoryId": resolved_category_id,
+        "vendorProductId": vendor_product_id or None,
+        "title": title or None,
+        "barcodes": [barcode] if barcode else [],
+        "photos": photo_urls,
+        "attributes": payload_attributes,
+    }
+    return {
+        "summary": {
+            "status": "ok",
+            "readiness_pct": int(readiness_pct),
+            "required_total": int(required_total),
+            "required_filled": int(required_filled),
+            "blockers": int(blockers),
+            "warnings": int(warnings),
+            "photos_count": int(len(photo_urls)),
+            "dictionary_unmatched": int(dictionary_unmatched),
+        },
+        "rows": rows,
+        "payload": payload,
+    }
 
 
 def import_category_requirements_to_pim(

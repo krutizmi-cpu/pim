@@ -60,7 +60,8 @@
   - можно сохранить `client_id/api_key`, проверить соединение и синхронизировать Detmir schema и карточки;
   - в память PIM сохраняются кэши `detmir_category_cache`, `detmir_attribute_cache`, `detmir_attribute_value_cache`, `detmir_product_cache`;
   - Detmir не становится вторым master-ядром: его категории и атрибуты подтягиваются как клиентские требования поверх Ozon-эталона;
-  - для выбранной Detmir-категории можно импортировать channel requirements и стартовые mapping rules в PIM.
+  - для выбранной Detmir-категории можно импортировать channel requirements и стартовые mapping rules в PIM;
+  - в `Карточка` есть отдельный Detmir-flow: подобрать/исправить категорию, заполнить gaps, посмотреть readiness и payload.
 
 ## Инструкция по разделам
 
@@ -90,6 +91,7 @@
 - Ручное дозаполнение мастер-товара.
 - Парсинг поставщика (мягкий/force).
 - Просмотр и правка Ozon category (`description_category_id`, `type_id`, `path`, `confidence`).
+- Просмотр и правка Detmir category (`category_id`, `path`, `confidence`) с отдельным readiness-блоком.
 - Контроль источников данных (manual/supplier/client и др.).
 - Поиск сертификатов/деклараций ФСА:
   - поиск по юрлицу поставщика, виду товара и `ТН ВЭД`;
@@ -130,7 +132,8 @@
 - Detmir API:
   - сохранение `client_id/api_key` в системных настройках или чтение key из env;
   - read-only sync дерева категорий, категорий с атрибутами, справочных значений и карточек товаров;
-  - импорт Detmir category requirements в overlay-слой PIM (`channel_attribute_requirements` + стартовые `mapping rules`).
+  - импорт Detmir category requirements в overlay-слой PIM (`channel_attribute_requirements` + стартовые `mapping rules`);
+  - после sync основной рабочий сценарий менеджера продолжается в `Карточка`, а не в техническом API-блоке.
 - AI-настройки:
   - выбор провайдера/модели;
   - API key (из UI или env);

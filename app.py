@@ -146,6 +146,10 @@ from services.detmir_api_service import (
     list_cached_products as list_detmir_cached_products,
     get_detmir_cache_stats,
     import_category_requirements_to_pim as import_detmir_category_requirements_to_pim,
+    get_cached_category as get_detmir_cached_category,
+    suggest_categories_for_product as suggest_detmir_categories_for_product,
+    detect_best_category_for_product as detect_best_detmir_category_for_product,
+    analyze_product_detmir_readiness,
 )
 from services.dimension_fallback import infer_category_fields, infer_dimensions_from_catalog, infer_dimensions_from_category_defaults, is_dimension_payload_suspicious
 from services.ai_content_service import (
@@ -1035,6 +1039,46 @@ def compute_quick_ozon_readiness(conn, product_row) -> dict[str, object]:
         "required_filled": int(filled),
         "readiness_pct": int(readiness_pct),
         "missing": int(required_total - filled),
+    }
+
+
+def compute_quick_detmir_readiness(conn, product_row) -> dict[str, object]:
+    product_id = int(product_row.get("id") or 0) if hasattr(product_row, "get") else 0
+    category_id = int(product_row.get("detmir_category_id") or 0) if hasattr(product_row, "get") else 0
+    if product_id <= 0 or category_id <= 0:
+        return {
+            "status": "no_category",
+            "required_total": 0,
+            "required_filled": 0,
+            "readiness_pct": 0,
+            "blockers": 1,
+            "warnings": 0,
+            "photos_count": 0,
+            "dictionary_unmatched": 0,
+        }
+    try:
+        result = analyze_product_detmir_readiness(conn, product_id=product_id, category_id=category_id)
+    except Exception:
+        return {
+            "status": "error",
+            "required_total": 0,
+            "required_filled": 0,
+            "readiness_pct": 0,
+            "blockers": 1,
+            "warnings": 0,
+            "photos_count": 0,
+            "dictionary_unmatched": 0,
+        }
+    summary = result.get("summary") or {}
+    return {
+        "status": str(summary.get("status") or "ok"),
+        "required_total": int(summary.get("required_total") or 0),
+        "required_filled": int(summary.get("required_filled") or 0),
+        "readiness_pct": int(summary.get("readiness_pct") or 0),
+        "blockers": int(summary.get("blockers") or 0),
+        "warnings": int(summary.get("warnings") or 0),
+        "photos_count": int(summary.get("photos_count") or 0),
+        "dictionary_unmatched": int(summary.get("dictionary_unmatched") or 0),
     }
 
 
@@ -2097,6 +2141,38 @@ def _build_ozon_scope_labels(conn) -> dict[str, str]:
     return labels
 
 
+def _build_detmir_scope_labels(conn) -> dict[str, str]:
+    rows = conn.execute(
+        """
+        SELECT DISTINCT category_code
+        FROM channel_attribute_requirements
+        WHERE channel_code = 'detmir'
+          AND category_code IS NOT NULL
+          AND TRIM(category_code) <> ''
+        ORDER BY category_code
+        """
+    ).fetchall()
+    labels: dict[str, str] = {}
+    for row in rows:
+        code = str(row["category_code"] or "")
+        labels[code] = code
+        if not code.startswith("detmir:"):
+            continue
+        parts = code.split(":")
+        if len(parts) != 2:
+            continue
+        try:
+            category_id = int(parts[1])
+        except Exception:
+            continue
+        cat = get_detmir_cached_category(conn, category_id)
+        if cat:
+            labels[code] = f"{cat.get('full_path') or cat.get('name') or '-'} | cat={category_id}"
+        else:
+            labels[code] = f"Detmir категория {category_id}"
+    return labels
+
+
 def ensure_ozon_requirements_for_product_category(
     conn,
     description_category_id: int,
@@ -2944,6 +3020,9 @@ def save_product(conn, product_id: int, payload: dict):
             ozon_type_id = ?,
             ozon_category_path = ?,
             ozon_category_confidence = ?,
+            detmir_category_id = ?,
+            detmir_category_path = ?,
+            detmir_category_confidence = ?,
             uom = ?,
             weight = ?,
             length = ?,
@@ -2977,6 +3056,9 @@ def save_product(conn, product_id: int, payload: dict):
             merged.get("ozon_type_id"),
             merged.get("ozon_category_path"),
             merged.get("ozon_category_confidence"),
+            merged.get("detmir_category_id"),
+            merged.get("detmir_category_path"),
+            merged.get("detmir_category_confidence"),
             merged.get("uom"),
             merged.get("weight"),
             merged.get("length"),
@@ -2995,7 +3077,8 @@ def save_product(conn, product_id: int, payload: dict):
     tracked_fields = [
         "article", "internal_article", "supplier_article", "name", "brand", "supplier_name", "barcode",
         "category", "base_category", "subcategory", "wheel_diameter_inch", "supplier_url",
-        "ozon_description_category_id", "ozon_type_id", "ozon_category_path", "ozon_category_confidence", "uom",
+        "ozon_description_category_id", "ozon_type_id", "ozon_category_path", "ozon_category_confidence",
+        "detmir_category_id", "detmir_category_path", "detmir_category_confidence", "uom",
         "weight", "length", "width", "height", "package_length", "package_width", "package_height",
         "gross_weight", "image_url", "description", "tnved_code"
     ]
@@ -5746,17 +5829,39 @@ def show_product_tab():
     top4.metric("Поставщик", product["supplier_name"] or "-")
 
     exact_ozon_ready = compute_quick_ozon_readiness(conn, dict(product))
+    exact_detmir_ready = compute_quick_detmir_readiness(conn, dict(product))
     best_template_ready = compute_best_template_profile_readiness(conn, dict(product))
-    ready1, ready2, ready3, ready4 = st.columns(4)
+    detmir_category_id_current = int(product["detmir_category_id"] or 0)
+    detmir_category_scope = f"detmir:{detmir_category_id_current}" if detmir_category_id_current > 0 else ""
+    detmir_category_current = get_detmir_cached_category(conn, detmir_category_id_current) if detmir_category_id_current > 0 else None
+    detmir_readiness_details = analyze_product_detmir_readiness(
+        conn,
+        product_id=int(product_id),
+        category_id=detmir_category_id_current if detmir_category_id_current > 0 else None,
+    )
+    try:
+        detmir_category_suggestions = suggest_detmir_categories_for_product(conn, dict(product), limit=8)
+    except Exception:
+        detmir_category_suggestions = []
+    ready1, ready2, ready3, ready4, ready5 = st.columns(5)
     ready1.metric("Ozon ready", f"{int(exact_ozon_ready.get('readiness_pct') or 0)}%")
     ready2.metric("Ozon обязательные", f"{int(exact_ozon_ready.get('required_filled') or 0)}/{int(exact_ozon_ready.get('required_total') or 0)}")
     ready3.metric("Лучший шаблон", f"{int(best_template_ready.get('readiness_pct') or 0)}%")
     ready4.metric("Профилей по категории", int(best_template_ready.get("profiles_total") or 0))
+    ready5.metric("Detmir ready", f"{int(exact_detmir_ready.get('readiness_pct') or 0)}%")
     if int(best_template_ready.get("profiles_total") or 0) > 0:
         st.caption(
             f"Лучший клиентский профиль сейчас: {best_template_ready.get('channel_code') or '-'} / "
             f"{best_template_ready.get('profile_name') or '-'} "
             f"({int(best_template_ready.get('filled_columns') or 0)}/{int(best_template_ready.get('matched_columns') or 0)})."
+        )
+    if str(exact_detmir_ready.get("status") or "") == "ok":
+        st.caption(
+            f"Detmir: обязательных заполнено {int(exact_detmir_ready.get('required_filled') or 0)}/"
+            f"{int(exact_detmir_ready.get('required_total') or 0)}, "
+            f"блокеров {int(exact_detmir_ready.get('blockers') or 0)}, "
+            f"предупреждений {int(exact_detmir_ready.get('warnings') or 0)}, "
+            f"фото {int(exact_detmir_ready.get('photos_count') or 0)}."
         )
 
     mainc1, mainc2 = st.columns([1, 2])
@@ -5864,6 +5969,85 @@ def show_product_tab():
                     },
                 )
                 st.success("Ozon-привязка очищена. Ниже можно вручную поправить category/base/subcategory и сохранить карточку.")
+                st.rerun()
+        dtop1, dtop2, dtop3, dtop4 = st.columns([1, 1, 1, 1])
+        with dtop1:
+            if st.button("Подобрать Detmir категорию", help="Подобрать клиентскую категорию Детского Мира по мастер-карточке и Ozon-ядру"):
+                detmir_match = detect_best_detmir_category_for_product(conn, dict(product))
+                if detmir_match.get("ok"):
+                    matched = detmir_match.get("category") or {}
+                    category_id = int(matched.get("category_id") or 0)
+                    payload = {
+                        "detmir_category_id": category_id or None,
+                        "detmir_category_path": str(matched.get("full_path") or matched.get("name") or "").strip() or None,
+                        "detmir_category_confidence": float(matched.get("match_score") or 0.0) / 10.0 if float(matched.get("match_score") or 0.0) > 0 else None,
+                    }
+                    save_product(conn, int(product_id), payload)
+                    save_field_source(
+                        conn=conn,
+                        product_id=int(product_id),
+                        field_name="detmir_category_id",
+                        source_type="detmir_category_match",
+                        source_value_raw=category_id,
+                        source_url=str(matched.get("full_path") or matched.get("name") or "detmir_match"),
+                        confidence=min(0.99, max(0.35, float(payload.get("detmir_category_confidence") or 0.0))),
+                        is_manual=False,
+                    )
+                    st.success(
+                        f"Detmir-категория подобрана: {payload['detmir_category_path'] or category_id}. "
+                        "Следом можно импортировать требования категории и дозаполнить gaps."
+                    )
+                    st.rerun()
+                else:
+                    st.warning(str(detmir_match.get("message") or "Не удалось уверенно подобрать Detmir-категорию. Ниже доступны варианты."))
+        with dtop2:
+            if st.button("Импортировать требования Detmir", help="Подтянуть overlay-атрибуты выбранной Detmir-категории в PIM"):
+                if detmir_category_id_current <= 0:
+                    st.warning("Сначала назначь Detmir-категорию.")
+                else:
+                    import_result = import_detmir_category_requirements_to_pim(conn, category_id=detmir_category_id_current)
+                    st.success(
+                        f"Detmir overlay импортирован: атрибутов {int(import_result.get('imported') or 0)}, "
+                        f"обязательных {int(import_result.get('required') or 0)}, "
+                        f"mapping rules {int(import_result.get('mapping_saved') or 0)}."
+                    )
+                    st.rerun()
+        with dtop3:
+            if st.button("Заполнить gaps под Detmir", help="Перенести уже найденные master/Ozon-данные в Detmir overlay для текущей категории"):
+                if detmir_category_id_current <= 0:
+                    st.warning("Сначала назначь Detmir-категорию.")
+                else:
+                    existing_detmir_requirements = list_channel_requirements(conn, channel_code="detmir", category_code=detmir_category_scope)
+                    if not existing_detmir_requirements:
+                        import_detmir_category_requirements_to_pim(conn, category_id=detmir_category_id_current)
+                    gapfill_result = _fill_channel_attrs_from_product_state(
+                        conn=conn,
+                        product_row=dict(product),
+                        channel_code="detmir",
+                        category_code=detmir_category_scope,
+                        source_type="derived_from_master",
+                        source_url="detmir_overlay_gapfill",
+                        force=False,
+                        target_channel_code="detmir",
+                    )
+                    st.success(
+                        f"Detmir gaps обработаны: заполнено {int(gapfill_result.get('saved') or 0)}, "
+                        f"пропущено {int(gapfill_result.get('skipped') or 0)}, "
+                        f"всего целей {int(gapfill_result.get('targets') or 0)}."
+                    )
+                    st.rerun()
+        with dtop4:
+            if st.button("Очистить Detmir-привязку", help="Убрать текущую категорию Детского Мира, если матчинг был неверным"):
+                save_product(
+                    conn,
+                    int(product_id),
+                    {
+                        "detmir_category_id": None,
+                        "detmir_category_path": None,
+                        "detmir_category_confidence": None,
+                    },
+                )
+                st.success("Detmir-привязка очищена. Ниже можно вручную выбрать или скорректировать категорию и сохранить карточку.")
                 st.rerun()
 
     ctop5, ctop6, ctop7 = st.columns([1, 1, 2])
@@ -6426,19 +6610,129 @@ def show_product_tab():
         else:
             st.info("Для этой Ozon-категории в PIM пока нет импортированных attribute requirements.")
 
+    st.markdown("### Детский Мир: overlay и готовность")
+    detmir_summary = detmir_readiness_details.get("summary") or {}
+    detmir_current_path = str(product["detmir_category_path"] or "") or str((detmir_category_current or {}).get("full_path") or "")
+    dm1, dm2, dm3, dm4 = st.columns([1.2, 1.2, 1.2, 1.6])
+    dm1.metric("Detmir ready", f"{int(detmir_summary.get('readiness_pct') or 0)}%")
+    dm2.metric("Detmir обязательные", f"{int(detmir_summary.get('required_filled') or 0)}/{int(detmir_summary.get('required_total') or 0)}")
+    dm3.metric("Detmir блокеры", int(detmir_summary.get("blockers") or 0))
+    dm4.metric("Detmir фото", int(detmir_summary.get("photos_count") or 0))
+    if detmir_current_path:
+        st.caption(f"Текущая Detmir-категория: {detmir_current_path}")
+    if not str(product["barcode"] or "").strip():
+        st.warning("Для Детского Мира штрихкод критичен: без него карточка и фото-flow будут с высоким риском блокировки.")
+    photo_count = int(detmir_summary.get("photos_count") or 0)
+    if photo_count < 3:
+        st.info("Для Детского Мира лучше держать минимум 3 фото. Если у поставщика фото мало, добивай галерею web/AI-пайплайном или вручную.")
+    if current_gallery_urls:
+        detmir_non_public = [url for url in current_gallery_urls if not str(url).strip().startswith(("http://", "https://"))]
+        if detmir_non_public:
+            st.warning("В галерее есть непубличные ссылки/локальные пути. Для Detmir лучше оставить только публичные http/https ссылки.")
+
+    suggestion_options = [int(row.get("category_id") or 0) for row in detmir_category_suggestions if int(row.get("category_id") or 0) > 0]
+    suggestion_map = {int(row.get("category_id") or 0): row for row in detmir_category_suggestions if int(row.get("category_id") or 0) > 0}
+    if suggestion_options:
+        sm1, sm2 = st.columns([2, 1])
+        with sm1:
+            selected_detmir_suggestion = st.selectbox(
+                "Подсказки по Detmir-категории",
+                options=suggestion_options,
+                index=0,
+                format_func=lambda cid: (
+                    f"{suggestion_map[int(cid)].get('full_path') or suggestion_map[int(cid)].get('name')} "
+                    f"| score={float(suggestion_map[int(cid)].get('match_score') or 0):.2f}"
+                ),
+                key=f"product_detmir_suggestion_{int(product_id)}",
+            )
+        with sm2:
+            st.markdown("<br>", unsafe_allow_html=True)
+            if st.button("Применить выбранную Detmir-категорию", key=f"apply_detmir_suggestion_{int(product_id)}"):
+                chosen = suggestion_map.get(int(selected_detmir_suggestion)) or {}
+                chosen_id = int(chosen.get("category_id") or 0)
+                save_product(
+                    conn,
+                    int(product_id),
+                    {
+                        "detmir_category_id": chosen_id or None,
+                        "detmir_category_path": str(chosen.get("full_path") or chosen.get("name") or "").strip() or None,
+                        "detmir_category_confidence": float(chosen.get("match_score") or 0.0) / 10.0 if float(chosen.get("match_score") or 0.0) > 0 else None,
+                    },
+                )
+                save_field_source(
+                    conn=conn,
+                    product_id=int(product_id),
+                    field_name="detmir_category_id",
+                    source_type="manual",
+                    source_value_raw=chosen_id,
+                    source_url=str(chosen.get("full_path") or chosen.get("name") or "detmir_manual_pick"),
+                    confidence=1.0,
+                    is_manual=True,
+                )
+                st.success("Detmir-категория применена. Теперь импортируй требования и дозаполни gaps.")
+                st.rerun()
+
+    with st.expander("Detmir readiness: обязательные поля, справочники и payload", expanded=False):
+        readiness_rows = detmir_readiness_details.get("rows") or []
+        if readiness_rows:
+            readiness_df = pd.DataFrame(readiness_rows)
+            st.dataframe(
+                with_ru_columns(
+                    readiness_df,
+                    extra_map={
+                        "target": "Цель Detmir",
+                        "attribute_code": "Код атрибута PIM",
+                        "attribute_name": "Название атрибута",
+                        "required": "Обязательный",
+                        "status": "Статус",
+                        "value": "Текущее значение",
+                        "resolved_value": "Значение для API",
+                        "notes": "Комментарий",
+                        "data_type": "Тип Detmir",
+                        "is_variant_attribute": "Вариантный",
+                    },
+                ),
+                use_container_width=True,
+                hide_index=True,
+            )
+            blocked_rows = [row for row in readiness_rows if int(row.get("required") or 0) == 1 and str(row.get("status") or "") != "ok"]
+            if blocked_rows:
+                st.warning(
+                    "Есть блокеры под Детский Мир. Сначала добей обязательные поля и проверь справочники, "
+                    "потом уже готовь payload/отправку."
+                )
+        else:
+            st.info("Readiness пока нечего показать: сначала назначь Detmir-категорию и подтяни её schema в память.")
+        detmir_payload_json = json.dumps(detmir_readiness_details.get("payload") or {}, ensure_ascii=False, indent=2)
+        st.code(detmir_payload_json, language="json")
+        st.download_button(
+            "Скачать Detmir payload JSON",
+            data=detmir_payload_json.encode("utf-8"),
+            file_name=f"detmir_payload_{_sanitize_filename_part(str(product['article'] or product_id))}.json",
+            mime="application/json",
+            key=f"detmir_payload_download_{int(product_id)}",
+        )
+
     st.markdown("### Атрибуты для заполнения (Ozon и клиентские шаблоны)")
     channel_codes = list_channel_codes(conn)
     if channel_codes:
         product_ozon_scope = f"ozon:{ozon_desc_id}:{ozon_type_id}" if ozon_desc_id > 0 and ozon_type_id > 0 else ""
+        product_detmir_scope = detmir_category_scope
         channel_widget_key = f"card_attr_channel_{int(product_id)}"
         if product_ozon_scope and "ozon" in channel_codes and channel_widget_key not in st.session_state:
             st.session_state[channel_widget_key] = "ozon"
+        elif product_detmir_scope and "detmir" in channel_codes and channel_widget_key not in st.session_state:
+            st.session_state[channel_widget_key] = "detmir"
         default_channel = str(st.session_state.get(channel_widget_key) or st.session_state.get("card_attr_channel") or "")
         if product_ozon_scope and "ozon" in channel_codes:
             default_channel = "ozon"
+        elif product_detmir_scope and "detmir" in channel_codes and not default_channel:
+            default_channel = "detmir"
         if default_channel not in channel_codes:
             if product_ozon_scope and "ozon" in channel_codes:
                 default_channel = "ozon"
+            elif product_detmir_scope and "detmir" in channel_codes:
+                default_channel = "detmir"
             elif "onlinetrade" in channel_codes:
                 default_channel = "onlinetrade"
             else:
@@ -6456,10 +6750,17 @@ def show_product_tab():
         category_scopes = list_channel_category_codes(conn, selected_channel)
         if selected_channel == "ozon" and product_ozon_scope and product_ozon_scope not in category_scopes:
             category_scopes = [product_ozon_scope] + category_scopes
+        if selected_channel == "detmir" and product_detmir_scope and product_detmir_scope not in category_scopes:
+            category_scopes = [product_detmir_scope] + category_scopes
         category_scopes = list(dict.fromkeys(category_scopes))
         scope_options = [""] + category_scopes
-        scope_labels = _build_ozon_scope_labels(conn)
-        if selected_channel != "ozon":
+        if selected_channel == "ozon":
+            scope_labels = _build_ozon_scope_labels(conn)
+        elif selected_channel == "detmir":
+            scope_labels = _build_detmir_scope_labels(conn)
+        else:
+            scope_labels = {}
+        if selected_channel not in {"ozon", "detmir"}:
             for code in category_scopes:
                 scope_labels.setdefault(code, str(code))
 
@@ -6468,6 +6769,8 @@ def show_product_tab():
             default_scope = ""
         if selected_channel == "ozon" and product_ozon_scope:
             default_scope = product_ozon_scope
+        elif selected_channel == "detmir" and product_detmir_scope:
+            default_scope = product_detmir_scope
         elif not default_scope:
             product_scope_candidates = [
                 str(product["subcategory"] or "").strip(),
@@ -6482,6 +6785,8 @@ def show_product_tab():
         scope_widget_key = f"card_attr_scope_{int(product_id)}_{selected_channel}"
         if selected_channel == "ozon" and product_ozon_scope and scope_widget_key not in st.session_state:
             st.session_state[scope_widget_key] = product_ozon_scope
+        if selected_channel == "detmir" and product_detmir_scope and scope_widget_key not in st.session_state:
+            st.session_state[scope_widget_key] = product_detmir_scope
         with ch2:
             selected_scope = st.selectbox(
                 "Категория атрибутов",
@@ -6565,7 +6870,10 @@ def show_product_tab():
 
         if editor_rows:
             ed_df = pd.DataFrame(editor_rows)
-            st.caption("Здесь собраны атрибуты категории канала и атрибуты из mapping rules (source_type=attribute). Для карточки с Ozon-категорией по умолчанию открыт Ozon scope.")
+            st.caption(
+                "Здесь собраны атрибуты категории канала и атрибуты из mapping rules (source_type=attribute). "
+                "Для Ozon и Detmir по умолчанию открывается scope текущей категории товара."
+            )
             if st.button(
                 "Автозаполнить этот блок из уже найденных данных товара",
                 key=f"card_attr_autofill_btn_{int(product_id)}_{selected_channel}_{selected_scope or 'all'}",
@@ -6740,6 +7048,30 @@ def show_product_tab():
                     value=float(product["ozon_category_confidence"] or 0.0),
                     step=0.01,
                 )
+            det1, det2 = st.columns(2)
+            with det1:
+                detmir_category_id = st.number_input(
+                    "Detmir category_id",
+                    min_value=0,
+                    value=int(product["detmir_category_id"] or 0),
+                    step=1,
+                    help="Можно выбрать вручную, если автоподбор Детского Мира ошибся.",
+                )
+                detmir_category_path = st.text_input(
+                    "Detmir категория (path)",
+                    value=str(product["detmir_category_path"] or ""),
+                )
+            with det2:
+                detmir_category_confidence = st.number_input(
+                    "Уверенность Detmir категории (0..1)",
+                    min_value=0.0,
+                    max_value=1.0,
+                    value=float(product["detmir_category_confidence"] or 0.0),
+                    step=0.01,
+                )
+                st.caption(
+                    "Для Детского Мира сначала привяжи категорию, потом импортируй её требования и только после этого добивай gaps / готовь payload."
+                )
             with st.expander("Подсказки по существующим категориям", expanded=False):
                 st.write(sorted(category_values)[:300] if category_values else ["Справочник категорий пока пуст"])
 
@@ -6797,6 +7129,9 @@ def show_product_tab():
                 "ozon_type_id": int(ozon_type_id) if int(ozon_type_id) > 0 else None,
                 "ozon_category_path": ozon_category_path or None,
                 "ozon_category_confidence": float(ozon_category_confidence) if float(ozon_category_confidence) > 0 else None,
+                "detmir_category_id": int(detmir_category_id) if int(detmir_category_id) > 0 else None,
+                "detmir_category_path": detmir_category_path or None,
+                "detmir_category_confidence": float(detmir_category_confidence) if float(detmir_category_confidence) > 0 else None,
                 "uom": uom or None,
                 "weight": weight or None,
                 "length": length or None,
