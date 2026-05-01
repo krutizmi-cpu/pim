@@ -2,6 +2,20 @@
 
 ## 2026-05-01
 
+### `pending` Fix catalog crash on NaN Ozon ids in readiness block
+
+- Исправлен production-баг, из-за которого `Каталог` мог падать на блоке быстрого фокуса с ошибкой `ValueError: cannot convert float NaN to integer`.
+- Причина:
+  - часть строк выборки приходила в UI с `NaN` в `ozon_description_category_id` или `ozon_type_id`;
+  - быстрый readiness-блок пытался делать `int(NaN)` без безопасной нормализации.
+- Что изменено:
+  - в `app.py` добавлен helper `_safe_int_id`;
+  - `compute_quick_ozon_readiness`, `compute_quick_detmir_readiness` и `compute_best_template_profile_readiness` переведены на безопасное чтение числовых id.
+- Что проверить вручную:
+  - открыть `Каталог` на выборке, где раньше выпадала красная ошибка;
+  - выбрать товар в блоке `Быстрый переход и фокус`;
+  - убедиться, что экран больше не падает, даже если у части товаров Ozon-id пустой или `NaN`.
+
 ### `pending` Add persistent Sportmaster template memory by category
 
 - В PIM добавлен отдельный слой памяти для `Sportmaster` как Excel-first клиента без API.

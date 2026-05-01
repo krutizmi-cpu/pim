@@ -1405,10 +1405,24 @@ def _readiness_value_present(value: object) -> bool:
     return value not in (0, 0.0)
 
 
+def _safe_int_id(value: object) -> int:
+    try:
+        if value is None:
+            return 0
+        if pd.isna(value):
+            return 0
+    except Exception:
+        pass
+    try:
+        return int(value or 0)
+    except Exception:
+        return 0
+
+
 def compute_quick_ozon_readiness(conn, product_row) -> dict[str, object]:
-    product_id = int(product_row.get("id") or 0) if hasattr(product_row, "get") else 0
-    desc_id = int(product_row.get("ozon_description_category_id") or 0) if hasattr(product_row, "get") else 0
-    type_id = int(product_row.get("ozon_type_id") or 0) if hasattr(product_row, "get") else 0
+    product_id = _safe_int_id(product_row.get("id")) if hasattr(product_row, "get") else 0
+    desc_id = _safe_int_id(product_row.get("ozon_description_category_id")) if hasattr(product_row, "get") else 0
+    type_id = _safe_int_id(product_row.get("ozon_type_id")) if hasattr(product_row, "get") else 0
     if product_id <= 0 or desc_id <= 0 or type_id <= 0:
         return {"status": "no_category", "required_total": 0, "required_filled": 0, "readiness_pct": 0, "missing": 0}
 
@@ -1443,8 +1457,8 @@ def compute_quick_ozon_readiness(conn, product_row) -> dict[str, object]:
 
 
 def compute_quick_detmir_readiness(conn, product_row) -> dict[str, object]:
-    product_id = int(product_row.get("id") or 0) if hasattr(product_row, "get") else 0
-    category_id = int(product_row.get("detmir_category_id") or 0) if hasattr(product_row, "get") else 0
+    product_id = _safe_int_id(product_row.get("id")) if hasattr(product_row, "get") else 0
+    category_id = _safe_int_id(product_row.get("detmir_category_id")) if hasattr(product_row, "get") else 0
     if product_id <= 0 or category_id <= 0:
         return {
             "status": "no_category",
@@ -1483,13 +1497,13 @@ def compute_quick_detmir_readiness(conn, product_row) -> dict[str, object]:
 
 
 def compute_best_template_profile_readiness(conn, product_row, limit_profiles: int = 40) -> dict[str, object]:
-    product_id = int(product_row.get("id") or 0) if hasattr(product_row, "get") else 0
+    product_id = _safe_int_id(product_row.get("id")) if hasattr(product_row, "get") else 0
     if product_id <= 0:
         return {"profiles_total": 0, "best_readiness_pct": 0}
 
     category_code = ""
-    desc_id = int(product_row.get("ozon_description_category_id") or 0) if hasattr(product_row, "get") else 0
-    type_id = int(product_row.get("ozon_type_id") or 0) if hasattr(product_row, "get") else 0
+    desc_id = _safe_int_id(product_row.get("ozon_description_category_id")) if hasattr(product_row, "get") else 0
+    type_id = _safe_int_id(product_row.get("ozon_type_id")) if hasattr(product_row, "get") else 0
     if desc_id > 0 and type_id > 0:
         category_code = f"ozon:{desc_id}:{type_id}"
 
