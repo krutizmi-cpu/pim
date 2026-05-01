@@ -545,7 +545,14 @@ def fill_template_dataframe(conn, template_df: pd.DataFrame, product_ids: list[i
         row_data = {}
         for match in matches:
             col = match["template_column"]
-            if match["status"] != "matched":
+            status = str(match.get("status") or "").strip().lower()
+            is_matched = status == "matched" or (
+                not status
+                and bool(str(match.get("template_column") or "").strip())
+                and bool(str(match.get("source_type") or "").strip())
+                and bool(str(match.get("source_name") or "").strip())
+            )
+            if not is_matched:
                 row_data[col] = None
                 continue
             transform_rule = _resolve_transform_rule(match)
@@ -679,7 +686,14 @@ def fill_template_workbook_bytes(
         target_row = start_row + row_offset
         value_map = build_product_value_map(conn, int(product_id))
         for match in matches:
-            if match.get("status") != "matched":
+            status = str(match.get("status") or "").strip().lower()
+            is_matched = status == "matched" or (
+                not status
+                and bool(str(match.get("template_column") or "").strip())
+                and bool(str(match.get("source_type") or "").strip())
+                and bool(str(match.get("source_name") or "").strip())
+            )
+            if not is_matched:
                 continue
             template_column = match.get("template_column")
             source_name = match.get("source_name")

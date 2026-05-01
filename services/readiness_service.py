@@ -15,6 +15,17 @@ ROW_LABEL_CANDIDATES = [
 ]
 
 
+def _mapping_is_matched(row: dict[str, Any]) -> bool:
+    status = str(row.get("status") or "").strip().lower()
+    if status:
+        return status == "matched"
+    return (
+        bool(str(row.get("template_column") or "").strip())
+        and bool(str(row.get("source_type") or "").strip())
+        and bool(str(row.get("source_name") or "").strip())
+    )
+
+
 def _is_missing(value: Any) -> bool:
     if value is None:
         return True
@@ -38,8 +49,8 @@ def _row_label(row: pd.Series, fallback_index: int) -> str:
 
 
 def analyze_template_readiness(filled_df: pd.DataFrame, mapping_rows: list[dict[str, Any]]) -> dict[str, Any]:
-    matched_rows = [row for row in mapping_rows if row.get("status") == "matched" and row.get("template_column") in filled_df.columns]
-    unmatched_rows = [row for row in mapping_rows if row.get("status") != "matched"]
+    matched_rows = [row for row in mapping_rows if _mapping_is_matched(row) and row.get("template_column") in filled_df.columns]
+    unmatched_rows = [row for row in mapping_rows if not _mapping_is_matched(row)]
 
     if filled_df.empty:
         return {
