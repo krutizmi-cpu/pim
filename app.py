@@ -7715,7 +7715,12 @@ def show_product_tab():
                 st.markdown("### Редактирование карточки")
                 st.caption("Главные поля товара и ручная корректировка категории, логистики, фото и описания.")
             with fhead2:
-                submitted_top = st.form_submit_button("Сохранить карточку", type="primary", use_container_width=True)
+                submitted_top = st.form_submit_button(
+                    "Сохранить карточку",
+                    type="primary",
+                    use_container_width=True,
+                    key=f"product_form_submit_top_{int(product_id)}",
+                )
 
             with st.expander("1. Идентификация товара", expanded=True):
                 id1, id2 = st.columns(2)
@@ -7789,7 +7794,11 @@ def show_product_tab():
                 )
                 description = st.text_area("Описание", value=description_initial_value, height=180)
 
-            submitted_bottom = st.form_submit_button("Сохранить карточку", type="primary")
+            submitted_bottom = st.form_submit_button(
+                "Сохранить карточку",
+                type="primary",
+                key=f"product_form_submit_bottom_{int(product_id)}",
+            )
             submitted = bool(submitted_top or submitted_bottom)
 
             if submitted:
