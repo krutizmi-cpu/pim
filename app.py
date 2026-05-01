@@ -135,7 +135,7 @@ from services.certificate_registry import (
     list_fsa_documents,
     delete_fsa_document,
 )
-from services.ozon_api_service import is_configured, sync_category_tree, list_cached_categories, list_cached_category_pairs, get_ozon_cache_stats, get_ozon_sync_coverage, sync_missing_category_attributes, sync_category_attributes, list_cached_attributes, sync_attribute_dictionary_values, sync_all_category_dictionary_values, list_cached_attribute_values, import_cached_attributes_to_pim, import_all_cached_attributes_to_pim, suggest_mappings_for_cached_attributes, save_suggested_mappings, analyze_product_ozon_coverage, ensure_ozon_master_attributes, build_product_ozon_payload, materialize_product_ozon_attributes, preview_product_ozon_dictionary_gaps, build_product_ozon_api_attributes, build_bulk_ozon_api_payloads, build_ozon_attributes_update_request, submit_ozon_attributes_update, list_ozon_update_jobs, get_ozon_update_job, retry_ozon_update_job, list_ozon_update_job_items, save_dictionary_override, list_dictionary_overrides, delete_dictionary_override, sync_all_categories_and_attributes
+from services.ozon_api_service import AUTO_MANUAL_ONLY_OZON_CODES, is_configured, sync_category_tree, list_cached_categories, list_cached_category_pairs, get_ozon_cache_stats, get_ozon_sync_coverage, sync_missing_category_attributes, sync_category_attributes, list_cached_attributes, sync_attribute_dictionary_values, sync_all_category_dictionary_values, list_cached_attribute_values, import_cached_attributes_to_pim, import_all_cached_attributes_to_pim, suggest_mappings_for_cached_attributes, save_suggested_mappings, analyze_product_ozon_coverage, ensure_ozon_master_attributes, build_product_ozon_payload, materialize_product_ozon_attributes, preview_product_ozon_dictionary_gaps, build_product_ozon_api_attributes, build_bulk_ozon_api_payloads, build_ozon_attributes_update_request, submit_ozon_attributes_update, list_ozon_update_jobs, get_ozon_update_job, retry_ozon_update_job, list_ozon_update_job_items, save_dictionary_override, list_dictionary_overrides, delete_dictionary_override, sync_all_categories_and_attributes
 from services.ozon_category_match import bulk_assign_ozon_categories
 from services.detmir_api_service import (
     load_detmir_settings,
@@ -2049,6 +2049,9 @@ def _fill_channel_attrs_from_product_state(
         attr_name = str(row.get("attribute_name") or code)
         if not code:
             continue
+        if str(channel_code).strip() == "ozon" and code in AUTO_MANUAL_ONLY_OZON_CODES:
+            skipped += 1
+            continue
         resolved = _resolve_best_value_for_attr(attr_name, candidates, scalar_map)
         if not resolved:
             continue
@@ -2144,6 +2147,9 @@ def _fill_ozon_attrs_from_parsed(
         code = str(row["attribute_code"] or "").strip()
         if not code:
             continue
+        if code in AUTO_MANUAL_ONLY_OZON_CODES:
+            skipped += 1
+            continue
         resolved = _resolve_best_value_for_attr(str(row["attribute_name"] or code), candidates, scalar_map)
         if not resolved:
             continue
@@ -2170,6 +2176,60 @@ def _fill_ozon_attrs_from_parsed(
         except Exception:
             skipped += 1
     return {"saved": int(saved), "skipped": int(skipped)}
+
+
+AUTO_UNSAFE_OZON_SOURCE_TYPES = {
+    "derived_from_master",
+    "supplier_page",
+    "web_search_fallback",
+    "web_search_fallback_domain",
+    "ozon_search_fallback",
+    "yandex_search_fallback",
+    "domain_search_fallback",
+    "name_category_inference",
+    "category_stats_fallback",
+    "category_defaults_fallback",
+}
+
+
+def _cleanup_unsafe_ozon_autofill_values(conn, product_id: int) -> int:
+    product_id = _safe_int_id(product_id)
+    if product_id <= 0:
+        return 0
+    cleared = 0
+    for code in sorted(AUTO_MANUAL_ONLY_OZON_CODES):
+        field_name = f"attr:{code}"
+        latest = get_latest_field_source(conn, product_id, field_name)
+        if not latest:
+            continue
+        if int(latest.get("is_manual") or 0) == 1:
+            continue
+        latest_source_type = str(latest.get("source_type") or "").strip()
+        if latest_source_type not in AUTO_UNSAFE_OZON_SOURCE_TYPES:
+            continue
+        current_rows = [
+            row
+            for row in get_product_attribute_values(conn, product_id)
+            if str(row.get("attribute_code") or "").strip() == code
+        ]
+        if not current_rows:
+            continue
+        has_value = any(not _is_empty_like(row.get("value")) for row in current_rows)
+        if not has_value:
+            continue
+        set_product_attribute_value(conn, product_id, code, None)
+        save_field_source(
+            conn=conn,
+            product_id=product_id,
+            field_name=field_name,
+            source_type="auto_cleanup",
+            source_value_raw=None,
+            source_url=f"cleanup:{latest_source_type}",
+            confidence=1.0,
+            is_manual=False,
+        )
+        cleared += 1
+    return int(cleared)
 
 
 def _infer_dimension_heuristics(product_row: dict) -> dict[str, Any]:
@@ -6421,6 +6481,10 @@ def show_product_tab():
         conn.close()
         return
 
+    cleanup_cleared = _cleanup_unsafe_ozon_autofill_values(conn, int(product_id))
+    if cleanup_cleared > 0:
+        product = get_product(conn, product_id)
+
     current_gallery_urls = _collect_product_gallery_urls(
         conn,
         int(product_id),
@@ -6466,6 +6530,12 @@ def show_product_tab():
     runtime_parser_settings = dict(parser_settings)
     runtime_parser_settings["source_strategy"] = str(locals().get("product_source_strategy") or parser_settings.get("source_strategy", "auto_full"))
     runtime_parser_settings["extra_fallback_domains"] = str(locals().get("product_extra_domains") or parser_settings.get("extra_fallback_domains", ""))
+
+    if cleanup_cleared > 0:
+        st.info(
+            f"Из карточки автоматически убраны {int(cleanup_cleared)} служебных Ozon-атрибутов, "
+            "которые были заполнены автоэвристикой слишком агрессивно. Их можно заполнить только вручную при необходимости."
+        )
 
     top1, top2, top3, top4 = st.columns(4)
     top1.metric("Артикул", product["article"] or "-")

@@ -1128,6 +1128,19 @@ KNOWN_OZON_MAPPING_RULES = [
 ]
 
 
+AUTO_MANUAL_ONLY_OZON_CODES = {
+    "rich_content_json",
+    "hashtags",
+    "pdf_url",
+    "pdf_file_name",
+    "merge_similar_items",
+    "ozon_video_title",
+    "ozon_video_url",
+    "ozon_video_products",
+    "ozon_video_cover_url",
+}
+
+
 def _normalize_name(value: str | None) -> str:
     return " ".join((value or "").strip().lower().replace("ё", "е").replace("_", " ").replace("-", " ").split())
 
@@ -1521,13 +1534,20 @@ def suggest_mappings_for_cached_attributes(
         matched_by = None
 
         existing = existing_rules.get(target_field)
-        if existing and _source_exists(conn, existing.get("source_type"), existing.get("source_name")):
+        existing_source_name = str(existing.get("source_name") or "").strip() if existing else ""
+        if (
+            existing
+            and existing_source_name not in AUTO_MANUAL_ONLY_OZON_CODES
+            and _source_exists(conn, existing.get("source_type"), existing.get("source_name"))
+        ):
             source_type = existing.get("source_type")
             source_name = existing.get("source_name")
             transform_rule = existing.get("transform_rule")
             matched_by = "saved_rule"
         else:
             for needles, candidate_source_type, candidate_source_name, candidate_transform in KNOWN_OZON_MAPPING_RULES:
+                if str(candidate_source_name or "").strip() in AUTO_MANUAL_ONLY_OZON_CODES:
+                    continue
                 if any(needle in normalized for needle in needles) and _source_exists(conn, candidate_source_type, candidate_source_name):
                     source_type = candidate_source_type
                     source_name = candidate_source_name
