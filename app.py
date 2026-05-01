@@ -5371,29 +5371,6 @@ def show_catalog_tab():
                     "Но обычную рабочую выгрузку теперь можно собирать прямо из `Каталога`."
                 )
 
-    ai1, ai2, ai3 = st.columns(3)
-    with ai1:
-        if st.button("Заполнить текущую страницу", type="primary", help="Основной поток: Ozon категория -> supplier/web -> AI название/описание/атрибуты"):
-            run_ai_enrichment_batch(
-                candidate_ids=[int(x) for x in ids],
-                run_limit=int(max_bulk_enrich_page),
-                run_label="AI / Текущая страница",
-            )
-    with ai2:
-        if st.button("Заполнить всю выборку фильтра", type="primary", help="Основной поток: Ozon категория -> supplier/web -> AI название/описание/атрибуты по текущему фильтру"):
-            run_ai_enrichment_batch(
-                candidate_ids=[int(x) for x in effective_filtered_candidate_ids],
-                run_limit=int(max_bulk_enrich_filtered),
-                run_label="AI / Вся выборка фильтра",
-            )
-    with ai3:
-        if st.button("Заполнить выбранные товары", type="primary", help="Запустить основной поток только по отмеченным товарам на этой странице"):
-            run_ai_enrichment_batch(
-                candidate_ids=[int(x) for x in effective_selected_shortlist_ids],
-                run_limit=max(len(effective_selected_shortlist_ids), 1),
-                run_label="AI / Выбранные товары",
-            )
-
     with st.expander("Низкоуровневые операции и сервис", expanded=False):
         cextra1, cextra2, cextra3 = st.columns(3)
         with cextra1:
