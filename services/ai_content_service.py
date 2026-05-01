@@ -187,7 +187,7 @@ def _build_http_timeout(provider: str, *, for_chat: bool) -> httpx.Timeout:
     key = str(provider or "").strip().lower()
     if for_chat:
         if key == "nvidia":
-            return httpx.Timeout(connect=20.0, read=180.0, write=45.0, pool=45.0)
+            return httpx.Timeout(connect=15.0, read=45.0, write=25.0, pool=25.0)
         if key == "openrouter":
             return httpx.Timeout(connect=20.0, read=120.0, write=40.0, pool=40.0)
         return httpx.Timeout(connect=15.0, read=90.0, write=30.0, pool=30.0)
@@ -538,7 +538,7 @@ def generate_seo_description_for_product(
         system_prompt=system_prompt,
         user_prompt=user_prompt,
         temperature=float(settings.get("temperature", 0.3)),
-        max_tokens=int(settings.get("max_tokens", 1800)),
+        max_tokens=min(900, int(settings.get("max_tokens", 1800))),
     )
     if not result.get("ok"):
         return result
@@ -603,7 +603,7 @@ def generate_selling_title_for_product(
         system_prompt=system_prompt,
         user_prompt=user_prompt,
         temperature=min(0.45, float(settings.get("temperature", 0.3))),
-        max_tokens=min(1200, int(settings.get("max_tokens", 1800))),
+        max_tokens=min(320, int(settings.get("max_tokens", 1800))),
         force_json=True,
     )
     if not result.get("ok"):
@@ -697,7 +697,7 @@ def generate_ai_attribute_suggestions_for_product(
         system_prompt=system_prompt,
         user_prompt=user_prompt,
         temperature=min(0.5, float(settings.get("temperature", 0.3))),
-        max_tokens=min(2600, int(settings.get("max_tokens", 1800))),
+        max_tokens=min(1100, int(settings.get("max_tokens", 1800))),
         force_json=True,
     )
     if not result.get("ok"):

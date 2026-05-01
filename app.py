@@ -6529,7 +6529,12 @@ def show_product_tab():
                 if st.button("← В каталог", use_container_width=True, key=f"product_back_to_catalog_{int(product_id)}"):
                     request_workspace_navigation("📚 Каталог")
             with headb2:
-                if st.button("Заполнить пайплайн", type="primary", use_container_width=True, help="Ozon категория -> supplier/web -> AI название/описание/атрибуты"):
+                if st.button(
+                    "Заполнить карточку автоматически",
+                    type="primary",
+                    use_container_width=True,
+                    help="Система последовательно попробует: Ozon-категорию, сайт поставщика / web-поиск, затем AI для названия, описания и атрибутов.",
+                ):
                     bulk_assign_ozon_categories(conn, [int(product_id)], min_score=OZON_CATEGORY_MIN_SCORE, force=False)
                     enrich_product_from_supplier(conn, int(product_id), force=False, parser_settings=runtime_parser_settings)
                     ai_fill_result = run_ai_enrichment_for_product(
@@ -6543,13 +6548,13 @@ def show_product_tab():
                     )
                     if ai_fill_result.get("ok"):
                         st.success(
-                            f"Пайплайн завершён: название={'да' if ai_fill_result.get('title_applied') else 'нет'}, "
+                            f"Автозаполнение завершено: название={'да' if ai_fill_result.get('title_applied') else 'нет'}, "
                             f"описание={'да' if ai_fill_result.get('description_applied') else 'нет'}, "
                             f"AI-атрибутов сохранено {int(ai_fill_result.get('attributes_saved') or 0)}."
                         )
                         st.rerun()
                     else:
-                        st.error(str(ai_fill_result.get("error") or "Не удалось выполнить AI-пайплайн."))
+                        st.error(str(ai_fill_result.get("error") or "Не удалось выполнить автоматическое заполнение карточки."))
 
         hm1, hm2, hm3, hm4, hm5 = st.columns(5)
         hm1.metric("Артикул", str(product["article"] or product["supplier_article"] or product["internal_article"] or "-"))

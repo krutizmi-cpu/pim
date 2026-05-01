@@ -179,6 +179,20 @@ def _is_listing_like_url(url: str) -> bool:
     return bool(re.search(r"(category=|/catalog/?$|/search|[?&]q=|[?&]s=|/catalog/\?|/search\?)", low))
 
 
+def _is_root_like_url(url: str) -> bool:
+    try:
+        parsed = urlparse(str(url or "").strip())
+    except Exception:
+        return False
+    path = str(parsed.path or "").strip()
+    query = str(parsed.query or "").strip()
+    if path in {"", "/"}:
+        return True
+    if path.rstrip("/") in {"", "/catalog"} and not query:
+        return True
+    return False
+
+
 def _is_blocked_search_domain(url: str, preferred_domain: str | None = None) -> bool:
     host = (urlparse(url).netloc or "").lower()
     if not host:
@@ -376,6 +390,8 @@ def _relevance_score(
 
     if _is_listing_like_url(low_url):
         score -= 1.2
+    if _is_root_like_url(low_url):
+        score -= 3.2
     if _clean_text(name).lower() in GENERIC_PRODUCT_PAGE_WORDS:
         score -= 2.0
     if not _clean_text(name):
@@ -906,9 +922,14 @@ def _detect_page_kind(soup: BeautifulSoup, page_url: str, raw_product_count: int
     listing_signals += len(soup.select(".pagination a, .pager a"))
     if re.search(r"(search=|/search|\?q=|\?s=)", page_url.lower()):
         listing_signals += 2
+    if _is_root_like_url(page_url):
+        listing_signals += 4
 
     product_signals = 0
-    if soup.select_one("h1"):
+    h1_node = soup.select_one("h1")
+    h1_text = _clean_text(h1_node.get_text(" ", strip=True) if h1_node else "")
+    title_text = _clean_text(soup.title.get_text(" ", strip=True) if soup.title else "")
+    if h1_node:
         product_signals += 1
     if soup.select_one("meta[property='og:type'][content='product']"):
         product_signals += 2
@@ -916,6 +937,14 @@ def _detect_page_kind(soup: BeautifulSoup, page_url: str, raw_product_count: int
         product_signals += 2
     if soup.select_one("[itemtype*='Product']"):
         product_signals += 2
+    generic_title_hits = 0
+    for marker in GENERIC_PRODUCT_PAGE_WORDS:
+        if marker and marker in title_text.lower():
+            generic_title_hits += 1
+        if marker and marker in h1_text.lower():
+            generic_title_hits += 1
+    if generic_title_hits >= 1:
+        listing_signals += min(3, generic_title_hits)
 
     if listing_signals >= 4 and product_signals <= 2:
         return "listing"
