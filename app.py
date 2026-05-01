@@ -104,6 +104,13 @@ from services.template_profiles import save_template_profile, list_template_prof
 from services.client_registry import list_client_channels, upsert_client_channel
 from services.readiness_service import analyze_template_readiness
 from services.supplier_profiles import list_supplier_profiles, upsert_supplier_profile, ensure_default_supplier_profiles
+from services.sportmaster_template_service import (
+    SPORTMASTER_CHANNEL_CODE,
+    SPORTMASTER_CLIENT_NAME,
+    build_sportmaster_scope_labels,
+    extract_sportmaster_template_metadata,
+    import_sportmaster_template,
+)
 from services.persistence_service import (
     persist_uploaded_file,
     list_uploaded_files,
@@ -2805,6 +2812,26 @@ def _build_ozon_template_category_options(
     labels: dict[str, str] = {"": "-- без категории --"}
     seen: set[str] = {""}
 
+    if str(channel_code or "").strip() == SPORTMASTER_CHANNEL_CODE:
+        scope_labels = build_sportmaster_scope_labels(conn)
+        for code in sorted(scope_labels.keys(), key=lambda x: scope_labels.get(x, x).lower()):
+            if not code or code in seen:
+                continue
+            labels[code] = scope_labels.get(code, code)
+            options.append(code)
+            seen.add(code)
+        return options, labels
+
+    if str(channel_code or "").strip() == "detmir":
+        scope_labels = _build_detmir_scope_labels(conn)
+        for code in sorted(scope_labels.keys(), key=lambda x: scope_labels.get(x, x).lower()):
+            if not code or code in seen:
+                continue
+            labels[code] = scope_labels.get(code, code)
+            options.append(code)
+            seen.add(code)
+        return options, labels
+
     try:
         pairs = list_cached_category_pairs(conn, limit=max(200, int(limit)))
     except Exception:
@@ -3315,6 +3342,8 @@ def ensure_template_columns_registered(
     channel_code: str,
     category_code: str | None,
     template_columns: list[object],
+    required_by_column: dict[str, int] | None = None,
+    mapping_by_column: dict[str, dict[str, object]] | None = None,
 ) -> dict[str, int]:
     if not channel_code:
         return {"attributes": 0, "requirements": 0, "rules": 0}
@@ -3330,6 +3359,12 @@ def ensure_template_columns_registered(
         code = to_attribute_code(col_name)
         if not code:
             continue
+        is_required = int((required_by_column or {}).get(col_name, 0) or 0)
+        saved_match = (mapping_by_column or {}).get(col_name) or {}
+        source_type = str(saved_match.get("source_type") or "attribute").strip() or "attribute"
+        source_name = str(saved_match.get("source_name") or code).strip() or code
+        transform_rule = saved_match.get("transform_rule")
+        requirement_notes = str(saved_match.get("notes") or "").strip() or "Автодобавлено из клиентского шаблона"
 
         existed_attr = conn.execute(
             "SELECT 1 FROM attribute_definitions WHERE code = ?",
@@ -3362,9 +3397,9 @@ def ensure_template_columns_registered(
             channel_code=channel_code,
             category_code=category_code or None,
             attribute_code=code,
-            is_required=0,
+            is_required=is_required,
             sort_order=1000 + int(idx),
-            notes="Автодобавлено из клиентского шаблона",
+            notes=requirement_notes,
         )
         if not existed_req:
             created_requirements += 1
@@ -3385,10 +3420,10 @@ def ensure_template_columns_registered(
                 channel_code=channel_code,
                 category_code=category_code or None,
                 target_field=col_name,
-                source_type="attribute",
-                source_name=code,
-                transform_rule=None,
-                is_required=0,
+                source_type=source_type,
+                source_name=source_name,
+                transform_rule=transform_rule,
+                is_required=is_required,
             )
             created_rules += 1
 
@@ -8324,6 +8359,49 @@ def show_template_tab():
                 st.session_state["template_client_code"] = channel_code
                 st.caption(f"Выбран клиент: {_client_label(channel_code)}")
 
+    if channel_code == SPORTMASTER_CHANNEL_CODE:
+        with st.expander("Импорт шаблонов Sportmaster в память", expanded=False):
+            st.caption(
+                f"{SPORTMASTER_CLIENT_NAME} хранит отдельный Excel-шаблон на каждую категорию. "
+                "Здесь можно один раз импортировать category-specific файлы в память PIM, "
+                "и потом категории, требования и профили будут открываться из базы."
+            )
+            sportmaster_files = st.file_uploader(
+                "Выбери один или несколько шаблонов Sportmaster",
+                type=["xlsx", "xls"],
+                accept_multiple_files=True,
+                key="sportmaster_template_batch",
+            )
+            if st.button("Импортировать шаблоны Sportmaster", key="sportmaster_template_import_btn", type="primary"):
+                if not sportmaster_files:
+                    st.error("Сначала выбери хотя бы один файл Sportmaster.")
+                else:
+                    imported_rows: list[dict[str, object]] = []
+                    for upload in sportmaster_files:
+                        result = import_sportmaster_template(
+                            conn,
+                            upload.getvalue(),
+                            original_file_name=getattr(upload, "name", None),
+                        )
+                        imported_rows.append(result)
+                    backup_result = backup_database_file(reason="sportmaster_templates")
+                    st.success(f"Импортировано шаблонов Sportmaster: {len(imported_rows)}")
+                    st.dataframe(
+                        pd.DataFrame(imported_rows)[[
+                            "attr_class",
+                            "attr_class_id",
+                            "category_code",
+                            "columns_total",
+                            "required_total",
+                            "profile_id",
+                        ]],
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+                    if backup_result.get("ok"):
+                        st.caption(f"Память Sportmaster зафиксирована: `{Path(str(backup_result['path'])).name}`")
+                    st.rerun()
+
     all_profiles = list_template_profiles(conn, channel_code=None)
     profile_scope_options = ["Текущий канал", "Все каналы"]
     profile_scope_value = st.session_state.get("template_profile_scope", "Текущий канал")
@@ -8341,9 +8419,16 @@ def show_template_tab():
         else all_profiles
     )
     category_options, category_labels = _build_ozon_template_category_options(conn, channel_code=channel_code, limit=5000)
+    category_select_label = "Категория шаблона/профиля"
+    if channel_code == SPORTMASTER_CHANNEL_CODE:
+        category_select_label = "Категория шаблона/профиля (Sportmaster)"
+    elif channel_code == "ozon":
+        category_select_label = "Категория шаблона/профиля (Ozon-каталог)"
+    elif channel_code == "detmir":
+        category_select_label = "Категория шаблона/профиля (Detmir overlay)"
     with t2:
         category_code = st.selectbox(
-            "Категория шаблона/профиля (Ozon-каталог)",
+            category_select_label,
             options=category_options,
             index=0,
             format_func=lambda x: category_labels.get(str(x), str(x)),
@@ -8382,7 +8467,12 @@ def show_template_tab():
             ),
         )
 
-    st.caption("Категория профиля берётся из Ozon-эталона (`ozon:description_category_id:type_id`).")
+    if channel_code == SPORTMASTER_CHANNEL_CODE:
+        st.caption("Категория профиля берётся из сохранённого шаблона Sportmaster (`sportmaster:attr_class_id`).")
+    elif channel_code == "detmir":
+        st.caption("Категория профиля берётся из overlay-категории Detmir (`detmir:category_id`).")
+    else:
+        st.caption("Категория профиля берётся из Ozon-эталона (`ozon:description_category_id:type_id`).")
     if not client_codes and not channel_code:
         st.info("В базе пока нет клиентов. Создай первого клиента и привяжи к нему шаблон.")
     if not all_profiles:
@@ -8505,6 +8595,37 @@ def show_template_tab():
 
         template_df = read_client_template_dataframe(safe_uploaded_bytes, sheet_name=template_sheet_name)
         template_signature = hashlib.md5(safe_uploaded_bytes).hexdigest()
+        sportmaster_metadata: dict[str, object] = {}
+        if channel_code == SPORTMASTER_CHANNEL_CODE:
+            try:
+                sportmaster_metadata = extract_sportmaster_template_metadata(safe_uploaded_bytes)
+            except Exception:
+                sportmaster_metadata = saved_template_metadata if isinstance(saved_template_metadata, dict) else {}
+        required_by_column: dict[str, int] = {}
+        mapping_by_column: dict[str, dict[str, object]] = {}
+        if isinstance(sportmaster_metadata, dict) and sportmaster_metadata.get("template_kind") == "sportmaster":
+            for spec in sportmaster_metadata.get("columns") or []:
+                column_name = str((spec or {}).get("header") or "").strip()
+                if not column_name:
+                    continue
+                required_by_column[column_name] = int((spec or {}).get("required") or 0)
+            auto_rows = auto_match_template_columns(conn, list(template_df.columns))
+            auto_rows = apply_saved_mapping_rules(
+                conn,
+                auto_rows,
+                channel_code=channel_code,
+                category_code=category_code or None,
+            )
+            for row in auto_rows:
+                column_name = str(row.get("template_column") or "").strip()
+                if not column_name:
+                    continue
+                mapping_by_column[column_name] = {
+                    "source_type": row.get("source_type") or "attribute",
+                    "source_name": row.get("source_name") or to_attribute_code(column_name),
+                    "transform_rule": row.get("transform_rule"),
+                    "notes": "Автодобавлено из шаблона Sportmaster",
+                }
         template_upload_registry_key = f"{channel_code}|{category_code}|{template_sheet_name}|{template_signature}|upload_saved"
         if uploaded is not None and st.session_state.get(template_upload_registry_key) != True:
             if channel_code:
@@ -8524,6 +8645,7 @@ def show_template_tab():
                     "sheet_name": template_sheet_name,
                     "data_start_row": int(template_data_start_row),
                     "template_signature": template_signature,
+                    **(sportmaster_metadata if isinstance(sportmaster_metadata, dict) else {}),
                 },
             )
             st.session_state[template_upload_registry_key] = True
@@ -8534,6 +8656,8 @@ def show_template_tab():
                 channel_code=channel_code,
                 category_code=category_code or None,
                 template_columns=list(template_df.columns),
+                required_by_column=required_by_column or None,
+                mapping_by_column=mapping_by_column or None,
             )
             st.session_state["template_autoreg_key"] = autoreg_key
             if (reg["attributes"] + reg["requirements"] + reg["rules"]) > 0:
