@@ -1379,8 +1379,8 @@ def _product_core_fill_stats(product_row) -> tuple[int, int]:
 
 def _product_stage_label(product_row) -> str:
     has_ozon = bool(
-        int(product_row.get("ozon_description_category_id") or 0) > 0
-        and int(product_row.get("ozon_type_id") or 0) > 0
+        _safe_int_id(product_row.get("ozon_description_category_id")) > 0
+        and _safe_int_id(product_row.get("ozon_type_id")) > 0
     ) if hasattr(product_row, "get") else False
     parse_status = str(product_row.get("supplier_parse_status") or "").strip().lower() if hasattr(product_row, "get") else ""
     filled, total = _product_core_fill_stats(product_row)
@@ -1866,7 +1866,7 @@ def _build_parsed_candidates(parsed: dict, product_row: dict) -> tuple[list[dict
 
 
 def _build_product_state_candidates(conn, product_row: dict) -> tuple[list[dict], dict[str, object]]:
-    product_id = int(product_row.get("id") or 0)
+    product_id = _safe_int_id(product_row.get("id"))
     candidates: list[dict] = []
     scalar_map: dict[str, object] = {
         "name": product_row.get("name"),
@@ -2012,7 +2012,7 @@ def _fill_channel_attrs_from_product_state(
     force: bool = False,
     target_channel_code: str | None = None,
 ) -> dict[str, int]:
-    product_id = int(product_row.get("id") or 0)
+    product_id = _safe_int_id(product_row.get("id"))
     if product_id <= 0 or not str(channel_code or "").strip():
         return {"saved": 0, "skipped": 0, "targets": 0}
     target_rows = _load_target_attribute_rows(conn, str(channel_code), category_code=category_code)
@@ -2069,9 +2069,9 @@ def _fill_ozon_attrs_from_parsed(
     source_url: str,
     force: bool = False,
 ) -> dict[str, int]:
-    product_id = int(product_row.get("id") or 0)
-    desc_id = int(product_row.get("ozon_description_category_id") or 0)
-    type_id = int(product_row.get("ozon_type_id") or 0)
+    product_id = _safe_int_id(product_row.get("id"))
+    desc_id = _safe_int_id(product_row.get("ozon_description_category_id"))
+    type_id = _safe_int_id(product_row.get("ozon_type_id"))
     if product_id <= 0 or desc_id <= 0 or type_id <= 0:
         return {"saved": 0, "skipped": 0}
 
@@ -4719,8 +4719,8 @@ def show_catalog_tab():
     def infer_catalog_template_category(product_rows: list[dict]) -> str:
         pair_counter: dict[str, int] = {}
         for row in product_rows:
-            desc_id = int(row.get("ozon_description_category_id") or 0)
-            type_id = int(row.get("ozon_type_id") or 0)
+            desc_id = _safe_int_id(row.get("ozon_description_category_id"))
+            type_id = _safe_int_id(row.get("ozon_type_id"))
             if desc_id <= 0 or type_id <= 0:
                 continue
             code = f"ozon:{desc_id}:{type_id}"
@@ -5019,12 +5019,12 @@ def show_catalog_tab():
                     errors += 1
                     continue
                 product_row = dict(current_product)
-                detmir_category_id = int(product_row.get("detmir_category_id") or 0)
+                detmir_category_id = _safe_int_id(product_row.get("detmir_category_id"))
                 if detmir_category_id <= 0:
                     detmir_match = detect_best_detmir_category_for_product(conn, product_row)
                     if detmir_match.get("ok"):
                         matched = detmir_match.get("category") or {}
-                        detmir_category_id = int(matched.get("category_id") or 0)
+                        detmir_category_id = _safe_int_id(matched.get("category_id"))
                         payload = {
                             "detmir_category_id": detmir_category_id or None,
                             "detmir_category_path": str(matched.get("full_path") or matched.get("name") or "").strip() or None,
@@ -5049,7 +5049,7 @@ def show_catalog_tab():
                         progress.progress(i / len(target_ids))
                         continue
 
-                detmir_scope = f"detmir:{int(detmir_category_id)}" if int(detmir_category_id) > 0 else ""
+                detmir_scope = f"detmir:{detmir_category_id}" if detmir_category_id > 0 else ""
                 if not detmir_scope:
                     missing_categories += 1
                     processed += 1
@@ -5100,9 +5100,9 @@ def show_catalog_tab():
     workflow_ozon_ready = sum(
         1
         for row in workflow_brief_rows
-        if int(row.get("ozon_description_category_id") or 0) > 0 and int(row.get("ozon_type_id") or 0) > 0
+        if _safe_int_id(row.get("ozon_description_category_id")) > 0 and _safe_int_id(row.get("ozon_type_id")) > 0
     )
-    workflow_detmir_ready = sum(1 for row in workflow_brief_rows if int(row.get("detmir_category_id") or 0) > 0)
+    workflow_detmir_ready = sum(1 for row in workflow_brief_rows if _safe_int_id(row.get("detmir_category_id")) > 0)
     workflow_with_images = sum(1 for row in workflow_brief_rows if str(row.get("image_url") or "").strip())
     workflow_parse_success = sum(1 for row in workflow_brief_rows if str(row.get("supplier_parse_status") or "").strip().lower() == "success")
 
@@ -6231,12 +6231,12 @@ def enrich_product_from_supplier(
         refreshed_row = get_product(conn, int(product_id))
         if refreshed_row:
             product_row = dict(refreshed_row)
-        if int(product_row.get("ozon_description_category_id") or 0) > 0 and int(product_row.get("ozon_type_id") or 0) > 0:
+        if _safe_int_id(product_row.get("ozon_description_category_id")) > 0 and _safe_int_id(product_row.get("ozon_type_id")) > 0:
             post_state_backfill = _fill_channel_attrs_from_product_state(
                 conn=conn,
                 product_row=product_row,
                 channel_code="ozon",
-                category_code=f"ozon:{int(product_row.get('ozon_description_category_id') or 0)}:{int(product_row.get('ozon_type_id') or 0)}",
+                category_code=f"ozon:{_safe_int_id(product_row.get('ozon_description_category_id'))}:{_safe_int_id(product_row.get('ozon_type_id'))}",
                 source_type=source_type,
                 source_url=f"{source_url} | product_state",
                 force=force,
