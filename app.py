@@ -6053,11 +6053,13 @@ def enrich_product_from_supplier(
                     or listing_like_source
                     or root_like_source
                 ):
+                    strict_relevance_settings = dict(settings or {})
+                    strict_relevance_settings["require_article_match"] = True
                     is_relevant, relevance_reason = _is_parsed_result_relevant(
                         product_row=product_row,
                         parsed=parsed,
                         source_url=str(source_url or effective_supplier_url or ""),
-                        settings=settings,
+                        settings=strict_relevance_settings,
                     )
                     if not is_relevant:
                         parsed = {}

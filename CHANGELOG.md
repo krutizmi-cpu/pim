@@ -16,7 +16,7 @@
   - `run_supplier_enrichment_batch(...)` теперь сохраняет короткие причины последних ошибок parser-flow и показывает их менеджеру прямо после запуска;
   - в блоке фокуса выбранного товара дополнительно выводится точная причина ошибки парсинга, если статус `error`;
   - в `services/supplier_parser.py` усилено понижение brand-like URL (`/brendy/`, `/brand/`, `/o-magazine/`), чтобы parser реже принимал страницу бренда за карточку товара;
-  - основной supplier-flow теперь тоже прогоняет relevance-check для результатов `listing -> product`, если исходный `supplier_url` был корневым или listing-like;
+  - основной supplier-flow теперь тоже прогоняет строгий relevance-check для результатов `listing -> product`, если исходный `supplier_url` был корневым или listing-like, и в таком режиме требует article/code match;
   - `Проверка парсинга и сервис` в `Каталог` перегруппирован по вкладкам:
     - `Ozon категории`
     - `Supplier/Web parser`
