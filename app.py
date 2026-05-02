@@ -2250,7 +2250,7 @@ def _fill_ozon_attrs_from_parsed(
         if not can_overwrite_field(conn, product_id, field_name, source_type, force=force):
             skipped += 1
             continue
-        coerced = _coerce_value_for_attr_type(value, str(row.get("data_type") or "text"))
+        coerced = _coerce_value_for_attr_type(value, str(_row_value(row, "data_type", "text") or "text"))
         try:
             set_product_attribute_value(conn, product_id, code, coerced)
             save_field_source(
