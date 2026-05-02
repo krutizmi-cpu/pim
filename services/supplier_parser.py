@@ -193,6 +193,11 @@ def _is_root_like_url(url: str) -> bool:
     return False
 
 
+def _is_brand_like_url(url: str) -> bool:
+    low = str(url or "").lower()
+    return bool(re.search(r"(/brend(y|i)?/|/brands?/|/manufacturers?/|/vendors?/|/o-magazine/)", low))
+
+
 def _is_blocked_search_domain(url: str, preferred_domain: str | None = None) -> bool:
     host = (urlparse(url).netloc or "").lower()
     if not host:
@@ -390,10 +395,16 @@ def _relevance_score(
 
     if _is_listing_like_url(low_url):
         score -= 1.2
+    if _is_brand_like_url(low_url):
+        score -= 4.2
     if _is_root_like_url(low_url):
         score -= 3.2
     if _clean_text(name).lower() in GENERIC_PRODUCT_PAGE_WORDS:
         score -= 2.0
+    if _clean_text(title).lower() in GENERIC_PRODUCT_PAGE_WORDS:
+        score -= 1.0
+    if _clean_text(name) and len(_clean_text(name).split()) <= 2 and _clean_text(name).lower() == _clean_text(title).lower():
+        score -= 0.8
     if not _clean_text(name):
         score -= 0.8
     return score
