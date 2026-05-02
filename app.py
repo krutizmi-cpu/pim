@@ -522,19 +522,59 @@ def build_workspace_summary(conn) -> dict[str, object]:
     }
 
 
-def render_sidebar_navigation(summary: dict[str, object]) -> str:
-    nav_options = [
-        ("⇣ Импорт", "import"),
-        ("▦ Каталог", "catalog"),
-        ("▣ Карточка", "product"),
-        ("◪ Клиентский шаблон", "template"),
-        ("◎ Ozon", "ozon"),
-        ("✦ Атрибуты", "attributes"),
-        ("⌁ Каналы", "channels"),
-        ("⚙︎ Настройки", "settings"),
-    ]
-    nav_labels = [label for label, _ in nav_options]
-    nav_map = {label: value for label, value in nav_options}
+WORKSPACE_NAV_OPTIONS: list[tuple[str, str]] = [
+    ("⇣ Импорт", "import"),
+    ("▦ Каталог", "catalog"),
+    ("▣ Карточка", "product"),
+    ("◪ Клиентский шаблон", "template"),
+    ("◎ Ozon", "ozon"),
+    ("✦ Атрибуты", "attributes"),
+    ("⌁ Каналы", "channels"),
+    ("⚙︎ Настройки", "settings"),
+]
+
+WORKSPACE_SECTION_META: dict[str, tuple[str, str]] = {
+    "import": ("Поступление и фиксация памяти", "Загрузи прайс, зафиксируй поставщика, сохрани импорт в каталог и сразу закрепи память в БД."),
+    "catalog": ("Каталог для ежедневной работы", "Фильтруй товары, запускай массовое наполнение и открывай карточку по артикулу без лишних технических шагов."),
+    "product": ("Карточка товара", "Финальная доводка master-карточки: категории, overlay клиентов, фото, AI и контроль качества перед выгрузкой."),
+    "template": ("Клиентские шаблоны", "Выбор клиента из базы, повторное открытие сохранённого шаблона и стабильный экспорт без новой ручной настройки."),
+    "ozon": ("Эталон Ozon и кэш памяти", "Категории, атрибуты и справочники Ozon живут как локальный эталон и должны переживать синки и перезапуски."),
+    "attributes": ("Справочник атрибутов", "Поддерживай мастер-слой и клиентские поля без путаницы и дублирования."),
+    "channels": ("Каналы и overlay клиентов", "Здесь живут channel rules, требования клиентов и интеграции вроде Детского Мира, но не общие настройки PIM."),
+    "settings": ("Настройки PIM", "Отдельное место для AI, парсинга, фото и рабочей конфигурации сервиса без засорения каталога и каналов."),
+}
+
+WORKSPACE_NAV_KEY_BY_LABEL = {label: key for label, key in WORKSPACE_NAV_OPTIONS}
+WORKSPACE_NAV_LABEL_BY_KEY = {key: label for label, key in WORKSPACE_NAV_OPTIONS}
+WORKSPACE_NAV_ALIASES = {
+    "📥 Импорт": "import",
+    "📚 Каталог": "catalog",
+    "🧾 Карточка": "product",
+    "🧠 Клиентский шаблон": "template",
+    "🛒 Ozon": "ozon",
+    "🧩 Атрибуты": "attributes",
+    "🔌 Каналы": "channels",
+    "🧭 Каналы": "channels",
+    "⚙️ Настройки": "settings",
+}
+
+
+def _resolve_workspace_nav_key(value: object, default: str = "catalog") -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return str(default)
+    if raw in WORKSPACE_NAV_LABEL_BY_KEY:
+        return raw
+    if raw in WORKSPACE_NAV_KEY_BY_LABEL:
+        return WORKSPACE_NAV_KEY_BY_LABEL[raw]
+    if raw in WORKSPACE_NAV_ALIASES:
+        return WORKSPACE_NAV_ALIASES[raw]
+    return str(default)
+
+
+def render_sidebar_navigation(summary: dict[str, object], selected_section: str) -> None:
+    section_key = _resolve_workspace_nav_key(selected_section, "catalog")
+    title, caption = WORKSPACE_SECTION_META.get(section_key, ("PIM", "Рабочая зона PIM."))
     with st.sidebar:
         st.markdown(
             f"""
@@ -547,36 +587,64 @@ def render_sidebar_navigation(summary: dict[str, object]) -> str:
   <div class="pim-side-kicker">Память</div>
   <div class="pim-side-note">Товаров: <strong>{int(summary.get('products_total') or 0)}</strong><br/>Клиентов: <strong>{int(summary.get('clients_total') or 0)}</strong><br/>Шаблонов: <strong>{int(summary.get('uploaded_templates_total') or 0)}</strong><br/>Ozon backup: <strong>{int(summary.get('ozon_backups_total') or 0)}</strong></div>
 </div>
+<div class="pim-side-card">
+  <div class="pim-side-kicker">Текущий раздел</div>
+  <div class="pim-side-title">{title}</div>
+  <div class="pim-side-note">{caption}</div>
+  <div class="pim-chip-row" style="margin-top:0.7rem;">
+    <span class="pim-chip">Товаров <strong>{int(summary.get('products_total') or 0)}</strong></span>
+    <span class="pim-chip">Импортов <strong>{int(summary.get('imports_total') or 0)}</strong></span>
+    <span class="pim-chip">Клиентов <strong>{int(summary.get('clients_total') or 0)}</strong></span>
+    <span class="pim-chip">Профилей <strong>{int(summary.get('template_profiles_total') or 0)}</strong></span>
+    <span class="pim-chip">Ozon cat/type <strong>{int(summary.get('ozon_pairs_total') or 0)}</strong></span>
+    <span class="pim-chip">Ozon атрибутов <strong>{int(summary.get('ozon_attributes_total') or 0)}</strong></span>
+  </div>
+  <div class="pim-side-note" style="margin-top:0.7rem;">Ориентир: 5–10 тыс. карточек в месяц силами одного менеджера.</div>
+</div>
             """,
             unsafe_allow_html=True,
         )
-        selected_label = st.radio(
-            "Раздел работы",
-            options=nav_labels,
-            index=1 if "workspace_nav_label" not in st.session_state else nav_labels.index(st.session_state["workspace_nav_label"]) if st.session_state["workspace_nav_label"] in nav_labels else 1,
-            key="workspace_nav_label",
-        )
         st.caption(f"База: `{summary.get('active_db_path')}`")
-    return nav_map[selected_label]
+
+
+def render_workspace_top_navigation() -> str:
+    nav_labels = [label for label, _ in WORKSPACE_NAV_OPTIONS]
+    default_key = _resolve_workspace_nav_key(st.session_state.get("workspace_nav_section"), "catalog")
+    default_label = WORKSPACE_NAV_LABEL_BY_KEY.get(default_key, nav_labels[1] if len(nav_labels) > 1 else nav_labels[0])
+    if str(st.session_state.get("workspace_nav_header_label") or "") not in nav_labels:
+        st.session_state["workspace_nav_header_label"] = default_label
+
+    with st.container(border=True):
+        st.caption("Разделы PIM")
+        if hasattr(st, "segmented_control"):
+            selected_label = st.segmented_control(
+                "Разделы PIM",
+                options=nav_labels,
+                default=str(st.session_state.get("workspace_nav_header_label") or default_label),
+                key="workspace_nav_header_label",
+                label_visibility="collapsed",
+            )
+        else:
+            selected_label = st.radio(
+                "Разделы PIM",
+                options=nav_labels,
+                index=nav_labels.index(str(st.session_state.get("workspace_nav_header_label") or default_label)),
+                key="workspace_nav_header_label",
+                horizontal=True,
+                label_visibility="collapsed",
+            )
+    selected_key = WORKSPACE_NAV_KEY_BY_LABEL.get(str(selected_label or default_label), default_key)
+    st.session_state["workspace_nav_section"] = str(selected_key)
+    return str(selected_key)
 
 
 def request_workspace_navigation(nav_label: str) -> None:
-    st.session_state["workspace_nav_target"] = str(nav_label)
+    st.session_state["workspace_nav_target"] = _resolve_workspace_nav_key(nav_label, "catalog")
     st.rerun()
 
 
 def render_workspace_hero(section_key: str, summary: dict[str, object]) -> None:
-    section_meta = {
-        "import": ("Поступление и фиксация памяти", "Загрузи прайс, зафиксируй поставщика, сохрани импорт в каталог и сразу закрепи память в БД."),
-        "catalog": ("Каталог для ежедневной работы", "Фильтруй товары, запускай массовое наполнение и открывай карточку по артикулу без лишних технических шагов."),
-        "product": ("Карточка товара", "Финальная доводка master-карточки: категории, overlay клиентов, фото, AI и контроль качества перед выгрузкой."),
-        "template": ("Клиентские шаблоны", "Выбор клиента из базы, повторное открытие сохранённого шаблона и стабильный экспорт без новой ручной настройки."),
-        "ozon": ("Эталон Ozon и кэш памяти", "Категории, атрибуты и справочники Ozon живут как локальный эталон и должны переживать синки и перезапуски."),
-        "attributes": ("Справочник атрибутов", "Поддерживай мастер-слой и клиентские поля без путаницы и дублирования."),
-        "channels": ("Каналы и overlay клиентов", "Здесь живут channel rules, требования клиентов и интеграции вроде Детского Мира, но не общие настройки PIM."),
-        "settings": ("Настройки PIM", "Отдельное место для AI, парсинга, фото и рабочей конфигурации сервиса без засорения каталога и каналов."),
-    }
-    title, caption = section_meta.get(section_key, ("PIM", "Рабочая зона PIM."))
+    title, caption = WORKSPACE_SECTION_META.get(section_key, ("PIM", "Рабочая зона PIM."))
     st.markdown(
         f"""
 <div class="pim-shell">
@@ -4680,7 +4748,7 @@ def show_catalog_tab():
             st.markdown("<br>", unsafe_allow_html=True)
             if st.button("Открыть выбранный товар в Карточке", type="primary", key="catalog_open_selected_in_card"):
                 st.session_state["selected_product_id"] = int(selected_id)
-                request_workspace_navigation("🧾 Карточка")
+                request_workspace_navigation("product")
 
         selected_row = next((row for _, row in df.iterrows() if int(row["id"]) == int(selected_id)), None)
         if selected_row is not None:
@@ -5246,7 +5314,7 @@ def show_catalog_tab():
                         run_label=f"Detmir / {workflow_scope}",
                     )
                 if st.button("Открыть Каналы", use_container_width=True, key="catalog_workflow_open_channels"):
-                    request_workspace_navigation("🧭 Каналы")
+                    request_workspace_navigation("channels")
                 st.caption(
                     "Если Detmir-категории и атрибуты ещё не синхронизированы, сначала зайди в `Каналы -> Детский Мир API`, затем вернись сюда."
                 )
@@ -5387,7 +5455,7 @@ def show_catalog_tab():
                             st.session_state["template_saved_file_id"] = int(export_template_file_id)
                         st.session_state["template_selected_ids_from_catalog"] = [int(x) for x in workflow_target_ids]
                         st.session_state["template_selected_ids"] = [int(x) for x in workflow_target_ids]
-                        request_workspace_navigation("🧩 Клиентский шаблон")
+                        request_workspace_navigation("template")
                 with ex2:
                     if st.button("Проверить readiness пачки", use_container_width=True, key="catalog_export_check_readiness"):
                         if not workflow_target_ids:
@@ -5454,7 +5522,8 @@ def show_catalog_tab():
                     "Но обычную рабочую выгрузку теперь можно собирать прямо из `Каталога`."
                 )
 
-    with st.expander("Низкоуровневые операции и сервис", expanded=False):
+    with st.expander("Проверка парсинга и сервис", expanded=False):
+        st.caption("Для проверки чистого parser-flow без AI используй кнопки `Только supplier/web enrichment` ниже.")
         cextra1, cextra2, cextra3 = st.columns(3)
         with cextra1:
             if st.button("Автопривязать Ozon категории (текущая страница)", help="Сначала назначить эталонную Ozon категорию для товаров этой страницы"):
@@ -6537,9 +6606,6 @@ def show_product_tab(summary: dict[str, object] | None = None):
             "которые были заполнены автоэвристикой слишком агрессивно. Их можно заполнить только вручную при необходимости."
         )
 
-    if summary:
-        render_workspace_hero("product", summary)
-
     top1, top2, top3, top4 = st.columns(4)
     top1.metric("Артикул", product["article"] or "-")
     top2.metric("Бренд", product["brand"] or "-")
@@ -6600,7 +6666,7 @@ def show_product_tab(summary: dict[str, object] | None = None):
             headb1, headb2 = st.columns(2)
             with headb1:
                 if st.button("← В каталог", use_container_width=True, key=f"product_back_to_catalog_{int(product_id)}"):
-                    request_workspace_navigation("📚 Каталог")
+                    request_workspace_navigation("catalog")
             with headb2:
                 if st.button(
                     "Заполнить карточку автоматически",
@@ -9200,7 +9266,7 @@ def show_template_tab():
                     with a2:
                         if st.button("Открыть товар в карточке", key="gap_open_product"):
                             st.session_state["selected_product_id"] = int(action_product_id)
-                            request_workspace_navigation("🧾 Карточка")
+                            request_workspace_navigation("product")
 
     conn.close()
 
@@ -11239,13 +11305,14 @@ def main():
     apply_app_theme()
     pending_nav_target = st.session_state.pop("workspace_nav_target", None)
     if pending_nav_target:
-        st.session_state["workspace_nav_label"] = str(pending_nav_target)
+        resolved_pending_section = _resolve_workspace_nav_key(pending_nav_target, "catalog")
+        st.session_state["workspace_nav_section"] = str(resolved_pending_section)
+        st.session_state["workspace_nav_header_label"] = WORKSPACE_NAV_LABEL_BY_KEY.get(str(resolved_pending_section), "▦ Каталог")
     shell_conn = get_db()
     summary = build_workspace_summary(shell_conn)
     shell_conn.close()
-    selected_section = render_sidebar_navigation(summary)
-    if selected_section != "product":
-        render_workspace_hero(selected_section, summary)
+    selected_section = render_workspace_top_navigation()
+    render_sidebar_navigation(summary, selected_section)
     active_db = summary.get("active_db_path") or str(Path("data/catalog.db"))
     low_db = str(active_db).lower()
     if "\\temp\\pim\\catalog.db" in low_db or "/tmp/pim/catalog.db" in low_db:
