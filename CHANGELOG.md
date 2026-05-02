@@ -2,6 +2,37 @@
 
 ## 2026-05-01
 
+### `pending` Add AI verifier + batch rewrite + image readiness stages
+
+- Day 2 conveyor groundwork added:
+  - `Fast batch` and `Deep repair` modes are now explicit in Catalog and Card AI flows;
+  - `AI verifier` now checks whether parser result looks relevant before mass rewrite;
+  - batch AI run now reports:
+    - `AI verified`
+    - `AI rejected parser result`
+    - `rewrite ready`
+    - `image ready / image gaps`
+- Description generation was split conceptually:
+  - main product description is now generated separately from SEO fields;
+  - `seo_meta_title`, `seo_meta_description`, `seo_keywords` are stored outside the main description text in fast-batch mode.
+- Catalog operational screen now understands AI/image stages:
+  - added `AI stage`;
+  - added `Image stage`;
+  - added `Кол-во фото`;
+  - queue logic now distinguishes:
+    - `Нужен AI-run`
+    - `Низкая уверенность parser/AI`
+    - `AI отклонил parser result`
+    - `Фото меньше 3`
+- Product card AI block now has:
+  - explicit `Fast batch / Deep repair` switch;
+  - button `AI: Проверить parser result`;
+  - button `AI: Чистое описание + SEO поля`;
+  - button `AI: План 3–5 фото`.
+- Template/export layer now prepares gallery memory more realistically:
+  - `media_gallery` can merge `generated_images`;
+  - exported media gallery is capped to first `5` normalized images.
+
 ### `pending` Add 5-day execution roadmap for 1000 SKU/day conveyor
 
 - В корень проекта добавлен файл [ROADMAP_5_DAYS_1000_SKU.md](ROADMAP_5_DAYS_1000_SKU.md).

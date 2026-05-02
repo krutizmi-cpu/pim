@@ -166,10 +166,13 @@ from services.ai_content_service import (
     check_ai_connection,
     generate_selling_title_for_product,
     generate_seo_description_for_product,
+    generate_product_copy_pack_for_product,
     generate_ai_attribute_suggestions_for_product,
     apply_ai_attribute_suggestions,
     run_ai_enrichment_for_product,
     build_marketing_image_prompts_for_product,
+    build_image_gallery_plan_for_product,
+    verify_parser_result_for_product,
     generate_images_from_prompts,
 )
 
@@ -1481,24 +1484,169 @@ def _barcode_status_label(product_row) -> str:
     return "Есть" if barcode else "Нет"
 
 
-def _operational_queue_label(product_row) -> str:
+SERVICE_SIGNAL_CODES = (
+    "service_ai_verdict",
+    "service_ai_confidence",
+    "service_ai_summary",
+    "service_ai_mode",
+    "service_image_stage",
+    "service_gallery_count",
+    "service_gallery_missing_slots",
+    "service_image_queue",
+)
+
+
+def _decode_service_attr_value(row) -> object:
+    if row is None:
+        return None
+    if row["value_number"] is not None:
+        return row["value_number"]
+    if row["value_boolean"] is not None:
+        return bool(row["value_boolean"])
+    if row["value_json"] is not None:
+        try:
+            return json.loads(row["value_json"])
+        except Exception:
+            return row["value_json"]
+    return row["value_text"]
+
+
+def _load_service_signal_map(conn, product_ids: list[int], codes: tuple[str, ...] = SERVICE_SIGNAL_CODES) -> dict[int, dict[str, object]]:
+    ids = [int(x) for x in product_ids if int(x) > 0]
+    if not ids:
+        return {}
+    placeholders_ids = ",".join(["?"] * len(ids))
+    placeholders_codes = ",".join(["?"] * len(codes))
+    rows = conn.execute(
+        f"""
+        SELECT product_id, attribute_code, value_text, value_number, value_boolean, value_json
+        FROM product_attribute_values
+        WHERE product_id IN ({placeholders_ids})
+          AND attribute_code IN ({placeholders_codes})
+        """,
+        tuple(ids) + tuple(codes),
+    ).fetchall()
+    result: dict[int, dict[str, object]] = {}
+    for row in rows:
+        pid = int(row["product_id"])
+        result.setdefault(pid, {})[str(row["attribute_code"])] = _decode_service_attr_value(row)
+    return result
+
+
+def _load_latest_field_source_type_map(conn, product_ids: list[int], field_names: tuple[str, ...] = ("name", "description")) -> dict[int, dict[str, str]]:
+    ids = [int(x) for x in product_ids if int(x) > 0]
+    if not ids:
+        return {}
+    placeholders_ids = ",".join(["?"] * len(ids))
+    placeholders_fields = ",".join(["?"] * len(field_names))
+    rows = conn.execute(
+        f"""
+        SELECT s.product_id, s.field_name, s.source_type
+        FROM product_data_sources s
+        JOIN (
+            SELECT product_id, field_name, MAX(id) AS max_id
+            FROM product_data_sources
+            WHERE product_id IN ({placeholders_ids})
+              AND field_name IN ({placeholders_fields})
+            GROUP BY product_id, field_name
+        ) latest
+          ON latest.max_id = s.id
+        """,
+        tuple(ids) + tuple(field_names),
+    ).fetchall()
+    result: dict[int, dict[str, str]] = {}
+    for row in rows:
+        pid = int(row["product_id"])
+        result.setdefault(pid, {})[str(row["field_name"])] = str(row["source_type"] or "").strip().lower()
+    return result
+
+
+def _photo_count_for_product(product_row, service_state: dict[str, object] | None = None) -> int:
+    state = service_state or {}
+    count = _safe_int_id(state.get("service_gallery_count"))
+    if count > 0:
+        return count
+    return 1 if str(product_row.get("image_url") or "").strip() else 0
+
+
+def _ai_stage_info(
+    product_row,
+    service_state: dict[str, object] | None = None,
+    latest_sources: dict[str, str] | None = None,
+) -> tuple[str, str]:
+    parse_status = str(product_row.get("supplier_parse_status") or "").strip().lower() if hasattr(product_row, "get") else ""
+    state = service_state or {}
+    sources = latest_sources or {}
+    verdict = str(state.get("service_ai_verdict") or "").strip().lower()
+    confidence = _safe_float_value(state.get("service_ai_confidence"), default=0.0)
+    title_ai = str(sources.get("name") or "").strip().lower() == "ai"
+    desc_ai = str(sources.get("description") or "").strip().lower() == "ai"
+
+    if parse_status != "success":
+        return "Ожидает parser", "Сначала parser"
+    if verdict == "reject":
+        return "AI отклонил parser result", "AI отклонил parser result"
+    if verdict == "review" or (verdict == "accept" and confidence < 0.62):
+        return "Нужна быстрая AI-проверка", "Низкая уверенность parser/AI"
+    if title_ai and desc_ai:
+        return "AI rewrite ready", "AI rewrite ready"
+    if verdict == "accept":
+        return "AI verified", "Нужен AI-run"
+    return "Нужен AI-run", "Нужен AI-run"
+
+
+def _image_stage_info(product_row, service_state: dict[str, object] | None = None) -> tuple[str, str, int]:
+    state = service_state or {}
+    photo_count = _photo_count_for_product(product_row, state)
+    main_image = bool(str(product_row.get("image_url") or "").strip()) if hasattr(product_row, "get") else False
+    stage = str(state.get("service_image_stage") or "").strip().lower()
+    queue = str(state.get("service_image_queue") or "").strip()
+    if not stage:
+        if not main_image:
+            return "Нет главного фото", "Нет фото", photo_count
+        if photo_count < 3:
+            return "Фото меньше 3", "Фото меньше 3", photo_count
+        if photo_count <= 5:
+            return "Фото готовы", "Фото готовы", photo_count
+        return "Расширенная галерея", "Фото готовы", photo_count
+    if stage == "no_main_image":
+        return "Нет главного фото", queue or "Нет фото", photo_count
+    if stage == "under_min":
+        return "Фото меньше 3", queue or "Фото меньше 3", photo_count
+    if stage == "target_ready":
+        return "Фото готовы", queue or "Фото готовы", photo_count
+    if stage == "rich_gallery":
+        return "Расширенная галерея", queue or "Фото готовы", photo_count
+    return humanize_attribute_code(stage), queue or "Фото готовы", photo_count
+
+
+def _operational_queue_label(
+    product_row,
+    service_state: dict[str, object] | None = None,
+    latest_sources: dict[str, str] | None = None,
+) -> str:
     has_ozon = bool(
         _safe_int_id(product_row.get("ozon_description_category_id")) > 0
         and _safe_int_id(product_row.get("ozon_type_id")) > 0
     ) if hasattr(product_row, "get") else False
     parse_status = str(product_row.get("supplier_parse_status") or "").strip().lower() if hasattr(product_row, "get") else ""
-    has_photo = bool(str(product_row.get("image_url") or "").strip()) if hasattr(product_row, "get") else False
     has_barcode = bool(str(product_row.get("barcode") or "").strip()) if hasattr(product_row, "get") else False
     _, parser_queue = _parser_stage_info(product_row)
+    _, ai_queue = _ai_stage_info(product_row, service_state, latest_sources)
+    _, image_queue, photo_count = _image_stage_info(product_row, service_state)
 
     if not has_ozon:
         return "Нет Ozon-категории"
     if parse_status != "success":
         return parser_queue
-    if not has_photo:
+    if photo_count <= 0:
         return "Нет фото"
+    if photo_count < 3:
+        return image_queue
     if not has_barcode:
         return "Нет штрихкода"
+    if ai_queue in {"AI отклонил parser result", "Низкая уверенность parser/AI", "Нужен AI-run"}:
+        return ai_queue
     return "Готово к AI/клиенту"
 
 
@@ -1721,14 +1869,26 @@ def compute_best_template_profile_readiness(conn, product_row, limit_profiles: i
     return best
 
 
-def build_catalog_operational_view(df: pd.DataFrame) -> pd.DataFrame:
+def build_catalog_operational_view(
+    conn,
+    df: pd.DataFrame,
+    service_signals: dict[int, dict[str, object]] | None = None,
+    latest_sources: dict[int, dict[str, str]] | None = None,
+) -> pd.DataFrame:
     if df is None or df.empty:
         return df
+    service_map = service_signals or {}
+    source_map = latest_sources or {}
     rows: list[dict[str, object]] = []
     for _, row in df.iterrows():
         row_dict = row.to_dict()
+        product_id = _safe_int_id(row_dict.get("id"))
+        state = service_map.get(product_id, {})
+        latest = source_map.get(product_id, {})
         filled, total = _product_core_fill_stats(row_dict)
         parser_stage, _ = _parser_stage_info(row_dict)
+        ai_stage, _ = _ai_stage_info(row_dict, state, latest)
+        image_stage, _, photo_count = _image_stage_info(row_dict, state)
         rows.append(
             {
                 "article": row_dict.get("article") or row_dict.get("supplier_article") or row_dict.get("internal_article"),
@@ -1737,9 +1897,12 @@ def build_catalog_operational_view(df: pd.DataFrame) -> pd.DataFrame:
                 "ozon_category_path": _short_text(row_dict.get("ozon_category_path") or row_dict.get("category"), 68),
                 "stage": _product_stage_label(row_dict),
                 "parser_stage": parser_stage,
-                "queue": _operational_queue_label(row_dict),
+                "ai_stage": ai_stage,
+                "image_stage": image_stage,
+                "queue": _operational_queue_label(row_dict, state, latest),
                 "supplier_parse_status": _parse_status_label(row_dict.get("supplier_parse_status")),
-                "photo_status": "Есть" if str(row_dict.get("image_url") or "").strip() else "Нет",
+                "photo_status": "Есть" if photo_count > 0 else "Нет",
+                "photo_count": int(photo_count),
                 "barcode_status": _barcode_status_label(row_dict),
                 "fill_score": f"{filled}/{total}",
                 "updated_at": row_dict.get("updated_at"),
@@ -4793,6 +4956,10 @@ def show_catalog_tab():
     if batch_id:
         st.caption("Показана только последняя загруженная партия")
 
+    page_product_ids = [int(x) for x in df["id"].tolist()]
+    page_service_signals = _load_service_signal_map(conn, page_product_ids)
+    page_latest_sources = _load_latest_field_source_type_map(conn, page_product_ids)
+
     summary1, summary2, summary3, summary4, summary5 = st.columns([1, 1, 1, 1, 1.2])
     summary1.metric("На странице", int(len(df)))
     summary2.metric("С supplier_url", int((df["supplier_url"].fillna("").astype(str).str.strip() != "").sum()) if "supplier_url" in df.columns else 0)
@@ -4806,14 +4973,19 @@ def show_catalog_tab():
             file_name=f"pim_products_page_{int(page)}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
-    operational_df = build_catalog_operational_view(df)
+    operational_df = build_catalog_operational_view(
+        conn,
+        df,
+        service_signals=page_service_signals,
+        latest_sources=page_latest_sources,
+    )
     operational_df_display = operational_df.copy() if operational_df is not None else pd.DataFrame()
     if operational_df is not None and not operational_df.empty:
         queue_counts = operational_df["queue"].fillna("Без очереди").astype(str).value_counts().to_dict()
         oq1, oq2, oq3, oq4 = st.columns(4)
         oq1.metric("Нужен parser-run", int(queue_counts.get("Нужен parser-run", 0)))
-        oq2.metric("Не найден релевантный товар", int(queue_counts.get("Не найден релевантный товар", 0)))
-        oq3.metric("Нет фото", int(queue_counts.get("Нет фото", 0)))
+        oq2.metric("Нужен AI-run", int(queue_counts.get("Нужен AI-run", 0)) + int(queue_counts.get("Низкая уверенность parser/AI", 0)))
+        oq3.metric("Фото < 3", int(queue_counts.get("Фото меньше 3", 0)) + int(queue_counts.get("Нет фото", 0)))
         oq4.metric("Готово к AI/клиенту", int(queue_counts.get("Готово к AI/клиенту", 0)))
         queue_priority = [
             "Нужен parser-run",
@@ -4822,7 +4994,11 @@ def show_catalog_tab():
             "Ошибка parser-flow",
             "Нет supplier-домена",
             "Нет Ozon-категории",
+            "Нужен AI-run",
+            "Низкая уверенность parser/AI",
+            "AI отклонил parser result",
             "Нет фото",
+            "Фото меньше 3",
             "Нет штрихкода",
             "Готово к AI/клиенту",
         ]
@@ -4889,24 +5065,33 @@ def show_catalog_tab():
         selected_row = next((row for _, row in df.iterrows() if int(row["id"]) == int(selected_id)), None)
         if selected_row is not None:
             selected_row_dict = selected_row.to_dict()
+            selected_service_state = page_service_signals.get(int(selected_row_dict.get("id") or 0), {})
+            selected_latest_sources = page_latest_sources.get(int(selected_row_dict.get("id") or 0), {})
             quick_ozon_ready = compute_quick_ozon_readiness(conn, selected_row_dict)
             quick_template_ready = compute_best_template_profile_readiness(conn, selected_row_dict)
             filled_core, total_core = _product_core_fill_stats(selected_row_dict)
             parser_stage_label, parser_queue_label = _parser_stage_info(selected_row_dict)
-            sf1, sf2, sf3, sf4, sf5, sf6 = st.columns(6)
+            ai_stage_label, ai_queue_label = _ai_stage_info(selected_row_dict, selected_service_state, selected_latest_sources)
+            image_stage_label, image_queue_label, image_photo_count = _image_stage_info(selected_row_dict, selected_service_state)
+            sf1, sf2, sf3, sf4, sf5, sf6, sf7, sf8 = st.columns(8)
             sf1.metric("Артикул", str(selected_row_dict.get("article") or selected_row_dict.get("supplier_article") or selected_row_dict.get("internal_article") or "-"))
             sf2.metric("Статус карточки", _product_stage_label(selected_row_dict))
             sf3.metric("Парсинг", _parse_status_label(selected_row_dict.get("supplier_parse_status")))
             sf4.metric("Заполнено ядро", f"{filled_core}/{total_core}")
             sf5.metric("Ozon ready", f"{int(quick_ozon_ready.get('readiness_pct') or 0)}%")
             sf6.metric("Шаблон ready", f"{int(quick_template_ready.get('readiness_pct') or 0)}%")
+            sf7.metric("AI stage", ai_stage_label)
+            sf8.metric("Фото", int(image_photo_count))
             st.caption(
                 f"Поставщик: {selected_row_dict.get('supplier_name') or '-'} | "
                 f"Ozon: {selected_row_dict.get('ozon_category_path') or selected_row_dict.get('category') or '-'} | "
-                f"Фото: {'есть' if str(selected_row_dict.get('image_url') or '').strip() else 'нет'} | "
+                f"Фото stage: {image_stage_label} | "
                 f"Штрихкод: {_barcode_status_label(selected_row_dict)}"
             )
-            st.caption(f"Parser stage: {parser_stage_label} | Рабочая очередь: {parser_queue_label}")
+            st.caption(
+                f"Parser stage: {parser_stage_label} | AI очередь: {ai_queue_label} | "
+                f"Фото очередь: {image_queue_label} | Рабочая очередь: {_operational_queue_label(selected_row_dict, selected_service_state, selected_latest_sources)}"
+            )
             parse_comment = str(selected_row_dict.get("supplier_parse_comment") or "").strip()
             if parse_comment and str(selected_row_dict.get("supplier_parse_status") or "").strip().lower() == "error":
                 st.error(f"Причина ошибки парсинга: {parse_comment}")
@@ -5084,6 +5269,15 @@ def show_catalog_tab():
             st.success(ai_cfg_msg)
         else:
             st.warning(ai_cfg_msg)
+        ai_mode = st.radio(
+            "AI-режим конвейера",
+            options=["fast_batch", "deep_repair"],
+            index=0,
+            horizontal=True,
+            key="catalog_ai_mode",
+            format_func=lambda x: "Fast batch" if x == "fast_batch" else "Deep repair",
+            help="Fast batch — обязательный массовый verifier + rewrite после parser. Deep repair — более тяжёлый режим для спорных и сложных SKU.",
+        )
         aic1, aic2, aic3, aic4 = st.columns(4)
         with aic1:
             ai_batch_include_supplier = st.checkbox(
@@ -5111,8 +5305,8 @@ def show_catalog_tab():
                 key="catalog_ai_include_attributes",
             )
         st.caption(
-            "Этот режим уже ближе к целевому conveyor: домен поставщика -> поиск карточки товара -> AI-проверка и рерайт -> Ozon/client-ready данные. "
-            "Для больших пакетов итоговая скорость всё ещё упирается в parser confidence и время ответа моделей."
+            "Этот режим уже ближе к целевому conveyor: домен поставщика -> поиск карточки товара -> AI verifier -> массовый рерайт -> Ozon/client-ready данные. "
+            "Fast batch нужен для основного потока, Deep repair оставляй для тяжёлых SKU и ручного восстановления."
         )
     dcfg1, dcfg2 = st.columns([1, 2])
     with dcfg1:
@@ -5202,7 +5396,7 @@ def show_catalog_tab():
         if failed_details:
             st.warning("Причины последних ошибок parser-flow:\n\n- " + "\n- ".join(failed_details))
 
-    def run_ai_enrichment_batch(candidate_ids: list[int], run_limit: int, run_label: str) -> None:
+    def run_ai_enrichment_batch(candidate_ids: list[int], run_limit: int, run_label: str, mode: str = "fast_batch") -> None:
         if not candidate_ids:
             st.info(f"Для режима `{run_label}` нет товаров для AI-дозаполнения.")
             return
@@ -5233,6 +5427,11 @@ def show_catalog_tab():
         description_applied = 0
         attributes_saved = 0
         photos_found = 0
+        ai_verified = 0
+        ai_rejected = 0
+        ai_rewrite_ready = 0
+        image_ready = 0
+        image_under_min = 0
         for i, pid in enumerate(target_ids, start=1):
             try:
                 if bool(ai_batch_include_supplier):
@@ -5254,14 +5453,26 @@ def show_catalog_tab():
                     include_description=bool(ai_batch_include_description),
                     include_attributes=bool(ai_batch_include_attributes),
                     force=bool(enrich_force),
+                    mode=str(mode or "fast_batch"),
                 )
                 if ai_res.get("ok"):
                     ai_success += 1
+                    verdict = str(ai_res.get("verification_verdict") or "").strip().lower()
+                    if verdict == "accept":
+                        ai_verified += 1
+                    elif verdict == "reject":
+                        ai_rejected += 1
+                    if bool(ai_res.get("title_applied")) and bool(ai_res.get("description_applied")):
+                        ai_rewrite_ready += 1
                     if bool(ai_res.get("title_applied")):
                         title_applied += 1
                     if bool(ai_res.get("description_applied")):
                         description_applied += 1
                     attributes_saved += int(ai_res.get("attributes_saved") or 0)
+                    if str(ai_res.get("image_stage") or "").strip() in {"target_ready", "rich_gallery"}:
+                        image_ready += 1
+                    elif str(ai_res.get("image_stage") or "").strip() in {"no_main_image", "under_min"}:
+                        image_under_min += 1
                     if ai_res.get("errors"):
                         ai_errors += 1
                 else:
@@ -5272,10 +5483,12 @@ def show_catalog_tab():
             progress.progress(i / len(target_ids))
         skipped_by_limit = max(0, len(candidate_ids) - len(target_ids))
         st.success(
-            f"[{run_label}] AI-пакет завершён: обработано {processed}, "
+            f"[{run_label}] AI-пакет ({str(mode or 'fast_batch')}) завершён: обработано {processed}, "
             f"supplier/web ok {supplier_success}, AI ok {ai_success}, AI ошибок {ai_errors}, "
+            f"AI verified {ai_verified}, AI rejected {ai_rejected}, rewrite ready {ai_rewrite_ready}, "
             f"новых названий {title_applied}, описаний {description_applied}, "
             f"сохранено AI-атрибутов {attributes_saved}, найдено фото {photos_found}, "
+            f"image ready {image_ready}, image gaps {image_under_min}, "
             f"Ozon категорий назначено {ozon_assigned} из {ozon_processed}, "
             f"подтянуто Ozon-атрибутов {ozon_attr_imported}, "
             f"отложено по лимиту {skipped_by_limit}."
@@ -5490,6 +5703,7 @@ def show_catalog_tab():
                         candidate_ids=[int(x) for x in workflow_target_ids],
                         run_limit=max(len(workflow_target_ids), 1),
                         run_label=f"AI / {workflow_scope}",
+                        mode=str(ai_mode or "fast_batch"),
                     )
                     if bool(fill_detmir_after_ai) and workflow_target_ids:
                         run_detmir_overlay_batch(
@@ -5908,7 +6122,7 @@ def show_catalog_tab():
 
     if operational_df_display is not None and not operational_df_display.empty:
         st.markdown("### Таблица товаров")
-        st.caption("Главный рабочий список: артикул, этап, parser-stage, очередь, фото, штрихкод и последнее обновление.")
+        st.caption("Главный рабочий список: артикул, этап, parser-stage, AI-stage, image-stage, очередь, фото, штрихкод и последнее обновление.")
         op_cols = [
             c
             for c in [
@@ -5918,9 +6132,12 @@ def show_catalog_tab():
                 "ozon_category_path",
                 "stage",
                 "parser_stage",
+                "ai_stage",
+                "image_stage",
                 "queue",
                 "supplier_parse_status",
                 "photo_status",
+                "photo_count",
                 "barcode_status",
                 "fill_score",
                 "updated_at",
@@ -5933,8 +6150,11 @@ def show_catalog_tab():
                 extra_map={
                     "stage": "Этап карточки",
                     "parser_stage": "Parser stage",
+                    "ai_stage": "AI stage",
+                    "image_stage": "Image stage",
                     "queue": "Очередь",
                     "photo_status": "Фото",
+                    "photo_count": "Кол-во фото",
                     "barcode_status": "Штрихкод",
                     "fill_score": "Ядро",
                 },
@@ -7419,10 +7639,49 @@ def show_product_tab(summary: dict[str, object] | None = None):
         ai_prompt1_key = f"ai_img_prompt_1_{int(product_id)}"
         ai_prompt2_key = f"ai_img_prompt_2_{int(product_id)}"
         ai_source_label = f"{str(ai_settings.get('provider') or '-')}/{str(ai_settings.get('chat_model') or '-')}"
+        ai_mode_key = f"ai_mode_{int(product_id)}"
+        ai_verify_key = f"ai_verify_result_{int(product_id)}"
+        ai_image_plan_key = f"ai_image_plan_{int(product_id)}"
+
+        ai_mode = st.radio(
+            "Режим AI",
+            options=["fast_batch", "deep_repair"],
+            index=0,
+            horizontal=True,
+            key=ai_mode_key,
+            format_func=lambda x: "Fast batch" if x == "fast_batch" else "Deep repair",
+            help="Fast batch — verifier + массовый рерайт. Deep repair — более тяжёлый режим для спорных SKU и редких ручных вмешательств.",
+        )
+
+        current_verify_state = st.session_state.get(ai_verify_key) or {}
+        if current_verify_state:
+            st.caption(
+                f"AI verifier: {str(current_verify_state.get('verdict') or '-')} | "
+                f"confidence {int(_safe_float_value(current_verify_state.get('confidence'), 0.0) * 100)}% | "
+                f"{str(current_verify_state.get('summary') or '-')}"
+            )
+        current_image_plan = st.session_state.get(ai_image_plan_key) or {}
+        if current_image_plan:
+            st.caption(
+                f"Image plan: {str(current_image_plan.get('queue') or '-')} | "
+                f"фото {int(current_image_plan.get('gallery_count') or 0)} | "
+                f"не хватает слотов {int(current_image_plan.get('missing_slots') or 0)}."
+            )
 
         d1, d2, d3, d4 = st.columns([1, 1, 1, 1])
         with d1:
-            if st.button("AI: Продающее название", key=f"btn_ai_title_{int(product_id)}"):
+            if st.button("AI: Проверить parser result", key=f"btn_ai_verify_{int(product_id)}"):
+                verify_result = verify_parser_result_for_product(conn, int(product_id), ai_settings, mode=str(ai_mode))
+                if verify_result.get("ok"):
+                    st.session_state[ai_verify_key] = verify_result
+                    st.success(
+                        f"Verifier: {verify_result.get('verdict')} "
+                        f"({int(_safe_float_value(verify_result.get('confidence'), 0.0) * 100)}%)."
+                    )
+                else:
+                    st.error(f"Не удалось проверить parser result: {verify_result.get('error')}")
+        with d2:
+            if st.button("AI: Быстрый рерайт названия", key=f"btn_ai_title_{int(product_id)}"):
                 title_result = generate_selling_title_for_product(conn, int(product_id), ai_settings)
                 if title_result.get("ok"):
                     generated_title = str(title_result.get("title") or "").strip()
@@ -7434,20 +7693,29 @@ def show_product_tab(summary: dict[str, object] | None = None):
                     )
                 else:
                     st.error(f"Не удалось сгенерировать название: {title_result.get('error')}")
-        with d2:
-            if st.button("AI: Сгенерировать SEO-описание", key=f"btn_ai_desc_{int(product_id)}"):
-                desc_result = generate_seo_description_for_product(conn, int(product_id), ai_settings)
+        with d3:
+            if st.button("AI: Чистое описание + SEO поля", key=f"btn_ai_desc_{int(product_id)}"):
+                if str(ai_mode) == "deep_repair":
+                    desc_result = generate_seo_description_for_product(conn, int(product_id), ai_settings)
+                    generated_desc = str(desc_result.get("text") or "").strip() if desc_result.get("ok") else ""
+                else:
+                    desc_result = generate_product_copy_pack_for_product(conn, int(product_id), ai_settings, mode=str(ai_mode))
+                    generated_desc = str(desc_result.get("description") or "").strip() if desc_result.get("ok") else ""
                 if desc_result.get("ok"):
-                    generated_desc = str(desc_result.get("text") or "").strip()
                     st.session_state[ai_desc_key] = generated_desc
                     st.session_state[ai_desc_widget_key] = generated_desc
                     st.success(
                         f"AI-черновик описания готов "
-                        f"(модель: {desc_result.get('model')}, атрибутов в контексте: {int(desc_result.get('attr_count') or 0)})."
+                        f"(модель: {desc_result.get('model')})."
                     )
+                    if str(ai_mode) != "deep_repair":
+                        st.caption(
+                            f"SEO вынесено отдельно: meta title `{str(desc_result.get('meta_title') or '-')[:64]}`, "
+                            f"meta description `{str(desc_result.get('meta_description') or '-')[:96]}`."
+                        )
                 else:
                     st.error(f"Не удалось сгенерировать описание: {desc_result.get('error')}")
-        with d3:
+        with d4:
             if st.button("AI: Найти пустые Ozon-атрибуты", key=f"btn_ai_attrs_{int(product_id)}"):
                 attr_result = generate_ai_attribute_suggestions_for_product(conn, int(product_id), ai_settings, limit=20)
                 if attr_result.get("ok"):
@@ -7458,7 +7726,25 @@ def show_product_tab(summary: dict[str, object] | None = None):
                     )
                 else:
                     st.error(f"Не удалось получить AI-подсказки атрибутов: {attr_result.get('error')}")
-        with d4:
+
+        imgc1, imgc2 = st.columns([1, 1])
+        with imgc1:
+            if st.button("AI: План 3–5 фото", key=f"btn_ai_photo_plan_{int(product_id)}"):
+                image_plan = build_image_gallery_plan_for_product(conn, int(product_id))
+                st.session_state[ai_image_plan_key] = image_plan
+                prompt_result = {
+                    "context_prompt": str(image_plan.get("context_prompt") or ""),
+                    "color_prompt": str(image_plan.get("color_prompt") or ""),
+                }
+                st.session_state[ai_img_key] = prompt_result
+                st.session_state[ai_prompt1_key] = str(prompt_result.get("context_prompt") or "")
+                st.session_state[ai_prompt2_key] = str(prompt_result.get("color_prompt") or "")
+                st.success(
+                    f"План фото готов: {image_plan.get('queue')} | "
+                    f"фото {int(image_plan.get('gallery_count') or 0)} | "
+                    f"не хватает {int(image_plan.get('missing_slots') or 0)}."
+                )
+        with imgc2:
             if st.button("AI: Подготовить 2 промпта для фото", key=f"btn_ai_photo_prompts_{int(product_id)}"):
                 prompt_result = build_marketing_image_prompts_for_product(conn, int(product_id))
                 st.session_state[ai_img_key] = prompt_result
@@ -7510,7 +7796,7 @@ def show_product_tab(summary: dict[str, object] | None = None):
             "Черновик AI-описания",
             height=220,
             key=ai_desc_widget_key,
-            placeholder="Сначала нажми `AI: Сгенерировать SEO-описание`.",
+            placeholder="Сначала нажми `AI: Чистое описание + SEO поля`.",
         )
         st.session_state[ai_desc_key] = ai_desc_text
 

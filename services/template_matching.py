@@ -509,7 +509,7 @@ def build_product_value_map(conn, product_id: int) -> dict[str, object]:
         SELECT value_text, value_json
         FROM product_attribute_values
         WHERE product_id = ?
-          AND attribute_code IN ('gallery_images', 'main_image')
+          AND attribute_code IN ('gallery_images', 'main_image', 'generated_images')
         ORDER BY id
         """,
         (int(product_id),),
@@ -531,6 +531,8 @@ def build_product_value_map(conn, product_id: int) -> dict[str, object]:
             continue
         seen_media.add(normalized)
         deduped_media_values.append(normalized)
+        if len(deduped_media_values) >= 5:
+            break
     if image_url:
         value_map["image_url"] = image_url
     value_map["media_gallery"] = deduped_media_values

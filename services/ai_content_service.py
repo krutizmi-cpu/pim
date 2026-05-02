@@ -10,7 +10,7 @@ from urllib.parse import quote
 
 import httpx
 
-from services.attribute_service import set_product_attribute_value
+from services.attribute_service import set_product_attribute_value, upsert_attribute_definition
 from services.source_priority import can_overwrite_field
 from services.source_tracking import save_field_source
 
@@ -484,6 +484,419 @@ def _attributes_for_prompt(attr_rows: list[dict[str, Any]]) -> str:
     return "\n".join(lines) if lines else "- Нет заполненных атрибутов"
 
 
+def _parse_json_response(text: str, error_message: str) -> dict[str, Any]:
+    raw = str(text or "").strip()
+    if not raw:
+        raise ValueError(error_message)
+    try:
+        parsed = json.loads(raw)
+        if isinstance(parsed, dict):
+            return parsed
+    except Exception:
+        pass
+    match = re.search(r"\{.*\}", raw, flags=re.DOTALL)
+    if not match:
+        raise ValueError(error_message)
+    try:
+        parsed = json.loads(match.group(0))
+    except Exception as exc:
+        raise ValueError(error_message) from exc
+    if not isinstance(parsed, dict):
+        raise ValueError(error_message)
+    return parsed
+
+
+def _store_service_signal(
+    conn: sqlite3.Connection,
+    product_id: int,
+    attribute_code: str,
+    value: Any,
+    *,
+    source_type: str = "ai_service",
+    source_url: str | None = None,
+    confidence: float | None = None,
+) -> None:
+    code = str(attribute_code or "").strip()
+    if not code:
+        return
+    attr = conn.execute(
+        "SELECT code, data_type FROM attribute_definitions WHERE code = ? LIMIT 1",
+        (code,),
+    ).fetchone()
+    inferred_data_type = "text"
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        inferred_data_type = "number"
+    elif isinstance(value, (list, dict)):
+        inferred_data_type = "json"
+    if not attr:
+        upsert_attribute_definition(
+            conn,
+            code=code,
+            name=code,
+            data_type=inferred_data_type,
+            scope="service",
+            entity_type="product",
+            description="Service signal for AI verifier / image readiness conveyor",
+        )
+        attr = {"code": code, "data_type": inferred_data_type}
+
+    payload = {
+        "value_text": None,
+        "value_number": None,
+        "value_boolean": None,
+        "value_json": None,
+    }
+    data_type = str(attr["data_type"] or inferred_data_type).strip().lower()
+    if value is None:
+        payload = payload
+    elif data_type == "number":
+        try:
+            payload["value_number"] = float(value)
+        except Exception:
+            payload["value_text"] = str(value)
+    elif data_type == "json":
+        payload["value_json"] = json.dumps(value, ensure_ascii=False)
+    elif data_type == "boolean":
+        payload["value_boolean"] = 1 if bool(value) else 0
+    else:
+        payload["value_text"] = str(value)
+
+    existing = conn.execute(
+        """
+        SELECT id
+        FROM product_attribute_values
+        WHERE product_id = ?
+          AND attribute_code = ?
+          AND IFNULL(channel_code, '') = ''
+          AND IFNULL(locale, '') = ''
+        LIMIT 1
+        """,
+        (int(product_id), code),
+    ).fetchone()
+    if existing:
+        conn.execute(
+            """
+            UPDATE product_attribute_values
+            SET value_text = ?,
+                value_number = ?,
+                value_boolean = ?,
+                value_json = ?,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (
+                payload["value_text"],
+                payload["value_number"],
+                payload["value_boolean"],
+                payload["value_json"],
+                int(existing["id"]),
+            ),
+        )
+    else:
+        conn.execute(
+            """
+            INSERT INTO product_attribute_values
+            (
+                product_id,
+                attribute_code,
+                value_text,
+                value_number,
+                value_boolean,
+                value_json,
+                locale,
+                channel_code,
+                created_at,
+                updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            """,
+            (
+                int(product_id),
+                code,
+                payload["value_text"],
+                payload["value_number"],
+                payload["value_boolean"],
+                payload["value_json"],
+            ),
+        )
+    conn.execute(
+        """
+        INSERT INTO product_data_sources (
+            product_id,
+            field_name,
+            source_type,
+            source_value_raw,
+            source_url,
+            confidence,
+            is_manual
+        )
+        VALUES (?, ?, ?, ?, ?, ?, 0)
+        """,
+        (
+            int(product_id),
+            f"attr:{code}",
+            str(source_type or "ai_service"),
+            None if value is None else (json.dumps(value, ensure_ascii=False) if isinstance(value, (list, dict)) else str(value)),
+            source_url,
+            confidence,
+        ),
+    )
+
+
+def _collect_gallery_urls(conn: sqlite3.Connection, product_id: int, limit: int = 8) -> list[str]:
+    rows = conn.execute(
+        """
+        SELECT attribute_code, value_text, value_json
+        FROM product_attribute_values
+        WHERE product_id = ?
+          AND attribute_code IN ('main_image', 'gallery_images', 'generated_images')
+        ORDER BY id DESC
+        """,
+        (int(product_id),),
+    ).fetchall()
+    values: list[str] = []
+    seen: set[str] = set()
+    for row in rows:
+        raw = row["value_json"] if row["value_json"] not in (None, "") else row["value_text"]
+        if raw in (None, ""):
+            continue
+        parsed_values: list[str]
+        if isinstance(raw, str) and raw.strip().startswith("["):
+            try:
+                loaded = json.loads(raw)
+                parsed_values = [str(x).strip() for x in loaded if str(x).strip()] if isinstance(loaded, list) else [str(raw).strip()]
+            except Exception:
+                parsed_values = [x.strip() for x in re.split(r"[\n,;]+", str(raw)) if x.strip()]
+        else:
+            parsed_values = [x.strip() for x in re.split(r"[\n,;]+", str(raw)) if x.strip()]
+        for item in parsed_values:
+            if not item or item in seen:
+                continue
+            seen.add(item)
+            values.append(item)
+            if len(values) >= int(limit):
+                return values
+    product = _product_row(conn, int(product_id))
+    primary = _clean_text(product.get("image_url")) if product else ""
+    if primary and primary not in seen:
+        values.insert(0, primary)
+    return values[: int(limit)]
+
+
+def verify_parser_result_for_product(
+    conn: sqlite3.Connection,
+    product_id: int,
+    settings: dict[str, Any],
+    *,
+    mode: str = "fast_batch",
+) -> dict[str, Any]:
+    product = _product_row(conn, int(product_id))
+    if not product:
+        return {"ok": False, "error": "Товар не найден."}
+
+    attr_rows = _collect_product_attributes(conn, int(product_id), limit=40)
+    attrs_block = _attributes_for_prompt(attr_rows[:18])
+    gallery_urls = _collect_gallery_urls(conn, int(product_id), limit=5)
+
+    system_prompt = (
+        "Ты senior PIM-верификатор. Твоя задача — быстро оценить, похож ли текущий parser result на нужный SKU, "
+        "и можно ли безопасно запускать массовый AI-рерайт. Отвечай только JSON."
+    )
+    user_prompt = f"""
+Проверь текущую карточку после parser/web слоя.
+
+Товар:
+- Текущее название: {_clean_text(product.get('name')) or '-'}
+- Артикул: {_clean_text(product.get('article') or product.get('supplier_article')) or '-'}
+- Бренд: {_clean_text(product.get('brand')) or '-'}
+- Штрихкод: {_clean_text(product.get('barcode')) or '-'}
+- Категория: {_clean_text(product.get('ozon_category_path') or product.get('category')) or '-'}
+- URL поставщика: {_clean_text(product.get('supplier_url')) or '-'}
+- Статус parser: {_clean_text(product.get('supplier_parse_status')) or '-'}
+- Комментарий parser: {_clean_text(product.get('supplier_parse_comment')) or '-'}
+- Кол-во фото в галерее: {len(gallery_urls)}
+
+Уже собранные характеристики:
+{attrs_block}
+
+Верни JSON:
+{{
+  "verdict": "accept|review|reject",
+  "confidence": 0.0,
+  "summary": "коротко по-русски",
+  "risky_fields": ["field1", "field2"],
+  "rewrite_ready": true
+}}
+
+Правила:
+- accept: товар выглядит релевантным и можно запускать массовый рерайт;
+- review: есть сомнения, но parser result частично полезен;
+- reject: похоже на чужой товар/категорию/мусор;
+- если parser_status=error или явный нерелевантный candidate, reject/review вероятнее;
+- не выдумывай факты, оцени только релевантность и пригодность к AI-рерайту.
+"""
+    temperature = 0.05 if str(mode or "").strip().lower() == "fast_batch" else 0.15
+    max_tokens = 260 if str(mode or "").strip().lower() == "fast_batch" else 420
+    result = _chat_completion(
+        settings=settings,
+        system_prompt=system_prompt,
+        user_prompt=user_prompt,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        force_json=True,
+    )
+    if not result.get("ok"):
+        return result
+    try:
+        parsed = _parse_json_response(str(result.get("text") or ""), "AI verifier вернул невалидный JSON.")
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+    verdict = str(parsed.get("verdict") or "").strip().lower()
+    if verdict not in {"accept", "review", "reject"}:
+        verdict = "review"
+    confidence = max(0.0, min(1.0, float(parsed.get("confidence") or 0.0)))
+    risky_fields_raw = parsed.get("risky_fields")
+    risky_fields = [str(x).strip() for x in risky_fields_raw if str(x).strip()] if isinstance(risky_fields_raw, list) else []
+    return {
+        "ok": True,
+        "verdict": verdict,
+        "confidence": confidence,
+        "summary": _clean_text(parsed.get("summary")),
+        "risky_fields": risky_fields,
+        "rewrite_ready": bool(parsed.get("rewrite_ready", verdict == "accept")),
+        "provider": result.get("provider"),
+        "model": result.get("model"),
+        "usage": result.get("usage"),
+    }
+
+
+def generate_product_copy_pack_for_product(
+    conn: sqlite3.Connection,
+    product_id: int,
+    settings: dict[str, Any],
+    *,
+    mode: str = "fast_batch",
+) -> dict[str, Any]:
+    product = _product_row(conn, int(product_id))
+    if not product:
+        return {"ok": False, "error": "Товар не найден."}
+    attr_rows = _collect_product_attributes(conn, int(product_id), limit=70)
+    attrs_block = _attributes_for_prompt(attr_rows[:20])
+    gallery_urls = _collect_gallery_urls(conn, int(product_id), limit=5)
+    product_name = _clean_text(product.get("name"))
+    article = _clean_text(product.get("article") or product.get("supplier_article"))
+    category_path = _clean_text(product.get("ozon_category_path") or product.get("category"))
+    brand = _clean_text(product.get("brand"))
+    photo_count = len(gallery_urls)
+    mode_key = str(mode or "").strip().lower()
+
+    system_prompt = (
+        "Ты senior e-commerce редактор карточек товара. "
+        "Твоя задача — подготовить чистое товарное описание и отдельные SEO-поля, не смешивая их между собой. "
+        "Отвечай только JSON."
+    )
+    user_prompt = f"""
+Подготовь товарный copy-pack для карточки.
+
+Входные данные:
+- Название: {product_name or '-'}
+- Артикул: {article or '-'}
+- Бренд: {brand or '-'}
+- Категория: {category_path or '-'}
+- Фото найдено: {photo_count}
+- Атрибуты/характеристики:
+{attrs_block}
+
+Верни JSON:
+{{
+  "description": "чистое описание товара без markdown и без SEO-хвоста",
+  "meta_title": "до 70 символов",
+  "meta_description": "до 170 символов",
+  "keywords": ["ключ 1", "ключ 2", "ключ 3"],
+  "tone": "коротко какой стиль выбран"
+}}
+
+Правила:
+- description: 2-3 коротких абзаца или 1 компактный текст, без markdown-заголовков, без списков meta/seo внутри;
+- не вставляй слова вроде лучший, уникальный, хит продаж;
+- не выдумывай характеристики, которых нет во входных данных;
+- описание должно звучать как нормальная карточка товара, а не как сырой supplier text;
+- meta_title и meta_description держи отдельно, не смешивай их с основным описанием;
+- keywords верни массивом из 3-6 релевантных фраз;
+- режим: {"короткий быстрый batch-рерайт" if mode_key == "fast_batch" else "более тщательный deep repair рерайт"}.
+"""
+    max_tokens = 560 if mode_key == "fast_batch" else 900
+    temperature = min(0.4, float(settings.get("temperature", 0.3))) if mode_key == "fast_batch" else min(0.6, float(settings.get("temperature", 0.3)) + 0.05)
+    result = _chat_completion(
+        settings=settings,
+        system_prompt=system_prompt,
+        user_prompt=user_prompt,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        force_json=True,
+    )
+    if not result.get("ok"):
+        return result
+    try:
+        parsed = _parse_json_response(str(result.get("text") or ""), "AI copy-pack вернул невалидный JSON.")
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+    description = str(parsed.get("description") or "").strip()
+    meta_title = _clean_text(parsed.get("meta_title"))
+    meta_description = _clean_text(parsed.get("meta_description"))
+    keywords_raw = parsed.get("keywords")
+    keywords = [str(x).strip() for x in keywords_raw if str(x).strip()] if isinstance(keywords_raw, list) else []
+    if not description:
+        return {"ok": False, "error": "AI не вернул основное описание товара."}
+    return {
+        "ok": True,
+        "description": description,
+        "meta_title": meta_title,
+        "meta_description": meta_description,
+        "keywords": keywords,
+        "tone": _clean_text(parsed.get("tone")),
+        "provider": result.get("provider"),
+        "model": result.get("model"),
+        "usage": result.get("usage"),
+    }
+
+
+def build_image_gallery_plan_for_product(conn: sqlite3.Connection, product_id: int) -> dict[str, Any]:
+    product = _product_row(conn, int(product_id))
+    if not product:
+        return {"stage": "missing_product", "gallery_count": 0, "target_min": 3, "target_max": 5}
+    gallery_urls = _collect_gallery_urls(conn, int(product_id), limit=8)
+    main_image = _clean_text(product.get("image_url")) or (gallery_urls[0] if gallery_urls else "")
+    gallery_count = len(gallery_urls)
+    if not main_image:
+        stage = "no_main_image"
+        queue = "Нет главного фото"
+    elif gallery_count < 3:
+        stage = "under_min"
+        queue = "Фото меньше 3"
+    elif gallery_count <= 5:
+        stage = "target_ready"
+        queue = "Фото готовы"
+    else:
+        stage = "rich_gallery"
+        queue = "Фото готовы"
+    prompts = build_marketing_image_prompts_for_product(conn, int(product_id))
+    return {
+        "stage": stage,
+        "queue": queue,
+        "gallery_count": gallery_count,
+        "target_min": 3,
+        "target_max": 5,
+        "missing_slots": max(0, 3 - gallery_count),
+        "main_image": main_image,
+        "gallery_urls": gallery_urls[:5],
+        "context_prompt": str(prompts.get("context_prompt") or ""),
+        "color_prompt": str(prompts.get("color_prompt") or ""),
+    }
+
+
 def generate_seo_description_for_product(
     conn: sqlite3.Connection,
     product_id: int,
@@ -810,6 +1223,7 @@ def run_ai_enrichment_for_product(
     include_description: bool = True,
     include_attributes: bool = True,
     force: bool = False,
+    mode: str = "fast_batch",
 ) -> dict[str, Any]:
     product = _product_row(conn, int(product_id))
     if not product:
@@ -823,12 +1237,62 @@ def run_ai_enrichment_for_product(
         "attributes_skipped": 0,
         "title_candidate": "",
         "description_candidate": "",
+        "verification_verdict": "",
+        "verification_confidence": 0.0,
+        "verification_summary": "",
+        "rewrite_ready": False,
+        "image_stage": "",
+        "gallery_count": 0,
         "errors": [],
     }
 
     ai_source_label = f"{str(settings.get('provider') or '-')}/{str(settings.get('chat_model') or '-')}"
+    mode_key = str(mode or "").strip().lower() or "fast_batch"
 
-    if include_title:
+    verify_res = verify_parser_result_for_product(conn, int(product_id), settings, mode=mode_key)
+    if verify_res.get("ok"):
+        result["verification_verdict"] = str(verify_res.get("verdict") or "")
+        result["verification_confidence"] = float(verify_res.get("confidence") or 0.0)
+        result["verification_summary"] = str(verify_res.get("summary") or "")
+        result["rewrite_ready"] = bool(verify_res.get("rewrite_ready"))
+        _store_service_signal(
+            conn,
+            int(product_id),
+            "service_ai_verdict",
+            result["verification_verdict"],
+            source_url=ai_source_label,
+            confidence=result["verification_confidence"],
+        )
+        _store_service_signal(
+            conn,
+            int(product_id),
+            "service_ai_confidence",
+            result["verification_confidence"],
+            source_url=ai_source_label,
+            confidence=result["verification_confidence"],
+        )
+        _store_service_signal(
+            conn,
+            int(product_id),
+            "service_ai_summary",
+            result["verification_summary"],
+            source_url=ai_source_label,
+            confidence=result["verification_confidence"],
+        )
+        _store_service_signal(
+            conn,
+            int(product_id),
+            "service_ai_mode",
+            mode_key,
+            source_url=ai_source_label,
+            confidence=result["verification_confidence"],
+        )
+    else:
+        result["errors"].append(f"verify: {verify_res.get('error')}")
+
+    allow_rewrite = bool(force) or str(result.get("verification_verdict") or "") in {"accept", "review"}
+
+    if include_title and allow_rewrite:
         title_res = generate_selling_title_for_product(conn, int(product_id), settings)
         if title_res.get("ok"):
             title_candidate = _clean_text(title_res.get("title"))
@@ -856,11 +1320,23 @@ def run_ai_enrichment_for_product(
                 result["title_applied"] = True
         else:
             result["errors"].append(f"title: {title_res.get('error')}")
+    elif include_title and not allow_rewrite:
+        result["errors"].append("title: AI verifier не подтвердил parser result для массового рерайта")
 
-    if include_description:
-        desc_res = generate_seo_description_for_product(conn, int(product_id), settings)
+    if include_description and allow_rewrite:
+        if mode_key == "deep_repair":
+            desc_res = generate_seo_description_for_product(conn, int(product_id), settings)
+            description_candidate = str(desc_res.get("text") or "").strip() if desc_res.get("ok") else ""
+            meta_title = ""
+            meta_description = ""
+            keywords: list[str] = []
+        else:
+            desc_res = generate_product_copy_pack_for_product(conn, int(product_id), settings, mode=mode_key)
+            description_candidate = str(desc_res.get("description") or "").strip() if desc_res.get("ok") else ""
+            meta_title = _clean_text(desc_res.get("meta_title"))
+            meta_description = _clean_text(desc_res.get("meta_description"))
+            keywords = desc_res.get("keywords") if isinstance(desc_res.get("keywords"), list) else []
         if desc_res.get("ok"):
-            description_candidate = str(desc_res.get("text") or "").strip()
             result["description_candidate"] = description_candidate
             if description_candidate and can_overwrite_field(conn, int(product_id), "description", "ai", force=bool(force)):
                 conn.execute(
@@ -883,10 +1359,19 @@ def run_ai_enrichment_for_product(
                 )
                 conn.commit()
                 result["description_applied"] = True
+            if mode_key != "deep_repair":
+                if meta_title:
+                    _store_service_signal(conn, int(product_id), "seo_meta_title", meta_title, source_url=ai_source_label, confidence=0.68)
+                if meta_description:
+                    _store_service_signal(conn, int(product_id), "seo_meta_description", meta_description, source_url=ai_source_label, confidence=0.68)
+                if keywords:
+                    _store_service_signal(conn, int(product_id), "seo_keywords", keywords[:6], source_url=ai_source_label, confidence=0.66)
         else:
             result["errors"].append(f"description: {desc_res.get('error')}")
+    elif include_description and not allow_rewrite:
+        result["errors"].append("description: AI verifier не подтвердил parser result для массового рерайта")
 
-    if include_attributes:
+    if include_attributes and allow_rewrite:
         attr_res = generate_ai_attribute_suggestions_for_product(conn, int(product_id), settings, limit=20)
         if attr_res.get("ok"):
             apply_res = apply_ai_attribute_suggestions(
@@ -900,7 +1385,18 @@ def run_ai_enrichment_for_product(
             result["attributes_skipped"] = int(apply_res.get("skipped") or 0)
         else:
             result["errors"].append(f"attributes: {attr_res.get('error')}")
+    elif include_attributes and not allow_rewrite:
+        result["errors"].append("attributes: AI verifier не подтвердил parser result для массового заполнения")
 
+    image_plan = build_image_gallery_plan_for_product(conn, int(product_id))
+    result["image_stage"] = str(image_plan.get("stage") or "")
+    result["gallery_count"] = int(image_plan.get("gallery_count") or 0)
+    _store_service_signal(conn, int(product_id), "service_image_stage", result["image_stage"], source_url=ai_source_label, confidence=0.9)
+    _store_service_signal(conn, int(product_id), "service_gallery_count", result["gallery_count"], source_url=ai_source_label, confidence=0.9)
+    _store_service_signal(conn, int(product_id), "service_gallery_missing_slots", int(image_plan.get("missing_slots") or 0), source_url=ai_source_label, confidence=0.9)
+    _store_service_signal(conn, int(product_id), "service_image_queue", str(image_plan.get("queue") or ""), source_url=ai_source_label, confidence=0.9)
+
+    conn.commit()
     return result
 
 
