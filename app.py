@@ -135,7 +135,7 @@ from services.certificate_registry import (
     list_fsa_documents,
     delete_fsa_document,
 )
-from services.ozon_api_service import AUTO_MANUAL_ONLY_OZON_CODES, is_configured, sync_category_tree, list_cached_categories, list_cached_category_pairs, get_ozon_cache_stats, get_ozon_sync_coverage, sync_missing_category_attributes, sync_category_attributes, list_cached_attributes, sync_attribute_dictionary_values, sync_all_category_dictionary_values, list_cached_attribute_values, import_cached_attributes_to_pim, import_all_cached_attributes_to_pim, suggest_mappings_for_cached_attributes, save_suggested_mappings, analyze_product_ozon_coverage, ensure_ozon_master_attributes, build_product_ozon_payload, materialize_product_ozon_attributes, preview_product_ozon_dictionary_gaps, build_product_ozon_api_attributes, build_bulk_ozon_api_payloads, build_ozon_attributes_update_request, submit_ozon_attributes_update, list_ozon_update_jobs, get_ozon_update_job, retry_ozon_update_job, list_ozon_update_job_items, save_dictionary_override, list_dictionary_overrides, delete_dictionary_override, sync_all_categories_and_attributes
+from services.ozon_api_service import AUTO_MANUAL_ONLY_OZON_CODES, is_configured, sync_category_tree, list_cached_categories, list_cached_category_pairs, get_ozon_cache_stats, get_ozon_sync_coverage, sync_missing_category_attributes, sync_category_attributes, list_cached_attributes, sync_attribute_dictionary_values, sync_all_category_dictionary_values, list_cached_attribute_values, import_cached_attributes_to_pim, import_all_cached_attributes_to_pim, suggest_mappings_for_cached_attributes, save_suggested_mappings, analyze_product_ozon_coverage, ensure_ozon_master_attributes, build_product_ozon_payload, materialize_product_ozon_attributes, preview_product_ozon_dictionary_gaps, build_product_ozon_api_attributes, build_bulk_ozon_api_payloads, build_ozon_attributes_update_request, submit_ozon_attributes_update, list_ozon_update_jobs, get_ozon_update_job, retry_ozon_update_job, list_ozon_update_job_items, save_dictionary_override, list_dictionary_overrides, delete_dictionary_override, sync_all_categories_and_attributes, load_saved_credentials as load_saved_ozon_credentials, save_credentials as save_ozon_credentials, clear_saved_credentials as clear_saved_ozon_credentials, resolve_credentials as resolve_ozon_credentials, check_connection as check_ozon_connection
 from services.ozon_category_match import bulk_assign_ozon_categories
 from services.detmir_api_service import (
     load_detmir_settings,
@@ -9763,18 +9763,30 @@ def show_template_tab():
 def show_ozon_tab():
     conn = get_db()
     st.subheader("Ozon")
-    st.caption("Ozon для нас, это эталон структуры и атрибутов. Здесь синхронизируем дерево категорий и характеристики категорий в локальный кэш PIM.")
+    st.caption(
+        "Ozon для нас одновременно эталон структуры и клиент-канал. "
+        "Здесь синхронизируем schema-ядро, собираем publish-пачки и отправляем карточки в Ozon API."
+    )
+    saved_client_id, saved_api_key = load_saved_ozon_credentials(conn)
+    if "ozon_client_id_input" not in st.session_state:
+        st.session_state["ozon_client_id_input"] = saved_client_id or ""
+    if "ozon_api_key_input" not in st.session_state:
+        st.session_state["ozon_api_key_input"] = saved_api_key or ""
     with st.expander("Инструкция по разделу Ozon и расшифровка кнопок", expanded=False):
         st.markdown(
             """
 **Порядок работы (рекомендуемый)**
-1. `Синхронизировать дерево категорий Ozon`
-2. `Запустить полную синхронизацию Ozon в фоне`
-3. Проверить блок покрытия синхронизации (`Пары для проверки`, `Пары с атрибутами`, `Пропущено пар`, `%`)
-4. Если есть пропуски: `Досинхронизировать пропущенные категории`
-5. При необходимости импортировать в мастер: `Импортировать все атрибуты Ozon из кэша в PIM`
+1. `Сохранить Ozon как клиента` и `Проверить подключение`
+2. `Синхронизировать дерево категорий Ozon`
+3. `Запустить полную синхронизацию Ozon в фоне`
+4. Проверить блок покрытия синхронизации (`Пары для проверки`, `Пары с атрибутами`, `Пропущено пар`, `%`)
+5. Если есть пропуски: `Досинхронизировать пропущенные категории`
+6. При необходимости импортировать в мастер: `Импортировать все атрибуты Ozon из кэша в PIM`
+7. В блоке publish собрать пачку и `Отправить карточки в Ozon API`
 
 **Кнопки верхнего блока**
+- `Сохранить Ozon как клиента`: сохраняет `Client ID / API Key` в постоянную память PIM, чтобы не вставлять их заново.
+- `Проверить подключение`: делает быстрый запрос к Ozon API и подтверждает, что креды рабочие.
 - `Синхронизировать дерево категорий Ozon`: обновляет локальный кэш дерева категорий Ozon.
 - `Запустить полную синхронизацию Ozon в фоне`: фоном проходит по категориям и подтягивает атрибуты, не блокируя UI.
 - `Импортировать все атрибуты Ozon из кэша в PIM`: переносит уже загруженные атрибуты из кэша в master-слой PIM.
@@ -9794,7 +9806,7 @@ def show_ozon_tab():
 - `Массовая проверка готовности по выбранным товарам`: отчёт готовности по группе товаров.
 - `Массово заполнить Ozon-атрибуты для выбранных`: автозаполнение по группе товаров.
 - `Сформировать dictionary gaps по выбранным (Excel)`: выгрузка проблем словарного сопоставления.
-- `Отправить batch в Ozon (/v1/product/attributes/update)`: отправка подготовленного batch в Ozon API.
+- `Отправить карточки в Ozon API`: отправка подготовленного batch в Ozon API.
 
 **Кнопки dictionary overrides**
 - `Сохранить dictionary override`: сохранить ручное правило raw -> dictionary value.
@@ -9810,15 +9822,43 @@ def show_ozon_tab():
 
     c1, c2 = st.columns(2)
     with c1:
-        client_id = st.text_input("Client ID Ozon", value="")
+        client_id = st.text_input("Client ID Ozon", key="ozon_client_id_input")
     with c2:
-        api_key = st.text_input("API Key Ozon", value="", type="password")
+        api_key = st.text_input("API Key Ozon", key="ozon_api_key_input", type="password")
 
-    configured = is_configured(client_id or None, api_key or None)
+    resolved_client_id, resolved_api_key = resolve_ozon_credentials(conn, client_id or None, api_key or None)
+    configured = is_configured(resolved_client_id or None, resolved_api_key or None)
+    cc1, cc2, cc3, cc4 = st.columns([1, 1, 1, 2])
+    with cc1:
+        if st.button("Сохранить Ozon как клиента", key="ozon_save_client_settings_btn"):
+            if not (str(client_id or "").strip() and str(api_key or "").strip()):
+                st.warning("Сначала заполни Client ID и API Key Ozon.")
+            else:
+                save_ozon_credentials(conn, client_id, api_key)
+                st.success("Ozon-креды сохранены в постоянную память PIM.")
+    with cc2:
+        if st.button("Проверить подключение", key="ozon_check_connection_btn", disabled=not configured):
+            check_result = check_ozon_connection(conn, client_id=client_id or None, api_key=api_key or None)
+            if check_result.get("ok"):
+                st.success(str(check_result.get("message") or "Подключение к Ozon API подтверждено."))
+            else:
+                st.error(str(check_result.get("message") or "Не удалось подключиться к Ozon API."))
+    with cc3:
+        if st.button("Очистить сохранённые ключи", key="ozon_clear_saved_client_settings_btn"):
+            clear_saved_ozon_credentials(conn)
+            st.session_state["ozon_client_id_input"] = ""
+            st.session_state["ozon_api_key_input"] = ""
+            st.success("Сохранённые Ozon-креды очищены из памяти PIM.")
+            st.rerun()
+    with cc4:
+        if saved_client_id and saved_api_key:
+            st.caption("Ozon сохранён в памяти PIM и может использоваться как клиент без повторного ввода ключей.")
+        else:
+            st.caption("Сохрани Ozon в памяти PIM, чтобы отправлять карточки и синхронизировать schema без ручного ввода ключей.")
     if configured:
-        st.success("Ozon-креды заданы, можно синхронизировать дерево и атрибуты.")
+        st.success("Ozon-креды доступны. Можно синхронизировать schema-ядро и отправлять карточки как в клиентский канал.")
     else:
-        st.warning("Ozon-креды не заданы в этой сессии. Можно вставить их сюда вручную и сразу выполнить синхронизацию.")
+        st.warning("Ozon-креды не заданы. Можно вставить их вручную или сохранить Ozon как клиента в памяти PIM.")
 
     with st.expander("Фиксация кэша Ozon (backup / restore)", expanded=False):
         st.caption(
@@ -9954,7 +9994,7 @@ def show_ozon_tab():
     top1, top2, top3, top4 = st.columns(4)
     with top1:
         if st.button("Синхронизировать дерево категорий Ozon", type="primary", disabled=not configured, help="Обновить локальный кэш дерева категорий Ozon"):
-            result = sync_category_tree(conn, client_id=client_id or None, api_key=api_key or None)
+            result = sync_category_tree(conn, client_id=resolved_client_id or None, api_key=resolved_api_key or None)
             st.success(f"Дерево категорий обновлено, записей: {result['total']}")
             backup_result = backup_database_file(reason="ozon_category_tree_sync")
             if backup_result.get("ok"):
@@ -9962,7 +10002,7 @@ def show_ozon_tab():
             st.rerun()
     with top2:
         if st.button("Запустить полную синхронизацию Ozon в фоне", disabled=not configured, help="Фоновая загрузка атрибутов по категориям Ozon"):
-            ok, message = _start_ozon_bg_sync(client_id=client_id or "", api_key=api_key or "")
+            ok, message = _start_ozon_bg_sync(client_id=resolved_client_id or "", api_key=resolved_api_key or "")
             if ok:
                 st.success(message)
             else:
@@ -10050,8 +10090,8 @@ def show_ozon_tab():
         if st.button("Досинхронизировать пропущенные категории", disabled=not configured, help="Обработать только пары cat/type без атрибутов в кэше"):
             miss_result = sync_missing_category_attributes(
                 conn,
-                client_id=client_id or None,
-                api_key=api_key or None,
+                client_id=resolved_client_id or None,
+                api_key=resolved_api_key or None,
                 only_leaf=bool(coverage_only_leaf),
                 include_disabled=bool(coverage_include_disabled),
                 limit=int(missing_sync_limit),
@@ -10128,8 +10168,8 @@ def show_ozon_tab():
                         conn,
                         description_category_id=int(selected_row["description_category_id"]),
                         type_id=int(selected_row["type_id"]),
-                        client_id=client_id or None,
-                        api_key=api_key or None,
+                        client_id=resolved_client_id or None,
+                        api_key=resolved_api_key or None,
                     )
                     st.success(f"Атрибуты обновлены: всего {result['total']}, обязательных {result['required']}")
                     backup_result = backup_database_file(reason="ozon_selected_category_sync")
@@ -10238,8 +10278,8 @@ def show_ozon_tab():
                             conn,
                             description_category_id=int(selected_row["description_category_id"]),
                             type_id=int(selected_row["type_id"]),
-                            client_id=client_id or None,
-                            api_key=api_key or None,
+                            client_id=resolved_client_id or None,
+                            api_key=resolved_api_key or None,
                         )
                         st.success(f"Синхронизировано справочников: {result['synced_attributes']}, значений: {result['synced_values']}")
 
@@ -10254,8 +10294,8 @@ def show_ozon_tab():
                                 description_category_id=int(selected_row["description_category_id"]),
                                 type_id=int(selected_row["type_id"]),
                                 attribute_id=int(selected_dict_row["attribute_id"]),
-                                client_id=client_id or None,
-                                api_key=api_key or None,
+                                client_id=resolved_client_id or None,
+                                api_key=resolved_api_key or None,
                             )
                             st.success(f"Значения справочника обновлены: {result['inserted']} | attr={result['attribute_id']} | dict={result['dictionary_id']}")
                     with d2:
@@ -10324,6 +10364,11 @@ def show_ozon_tab():
                     bulk_select_key = f"ozon_bulk_product_ids_{selected_product_id}"
                     if bulk_select_key not in st.session_state:
                         st.session_state[bulk_select_key] = [int(selected_product_id)]
+                    catalog_shortlist_for_ozon = [
+                        int(x)
+                        for x in (st.session_state.get("template_selected_ids_from_catalog") or [])
+                        if str(x).strip()
+                    ]
                     with excel_col3:
                         st.download_button(
                             "Скачать шаблон Excel",
@@ -10354,6 +10399,20 @@ def show_ozon_tab():
                                     st.error(parsed.get("message") or "Не удалось обработать Excel.")
 
                     parse_summary = st.session_state.get(f"ozon_excel_parse_{selected_product_id}")
+                    shortlist_col1, shortlist_col2 = st.columns([1, 2])
+                    with shortlist_col1:
+                        if st.button("Подтянуть shortlist из Каталога", key=f"ozon_pull_catalog_shortlist_{selected_product_id}"):
+                            if not catalog_shortlist_for_ozon:
+                                st.warning("В каталоге пока нет shortlist для Ozon-пачки.")
+                            else:
+                                st.session_state[bulk_select_key] = [int(x) for x in catalog_shortlist_for_ozon]
+                                st.success(f"В Ozon-пачку подтянуто товаров из Каталога: {len(catalog_shortlist_for_ozon)}.")
+                                st.rerun()
+                    with shortlist_col2:
+                        if catalog_shortlist_for_ozon:
+                            st.caption(f"Shortlist из Каталога доступен для Ozon publish: {len(catalog_shortlist_for_ozon)} товаров.")
+                        else:
+                            st.caption("Если уже выбрал пачку в Каталоге, здесь можно одним нажатием подтянуть её в Ozon publish-flow.")
                     if parse_summary and parse_summary.get("ok"):
                         s1, s2, s3 = st.columns(3)
                         s1.metric("Входных значений", int(parse_summary.get("input_values") or 0))
@@ -10662,7 +10721,7 @@ def show_ozon_tab():
                                 key=f"ozon_bulk_package_export_{selected_product_id}",
                             )
                             if st.button(
-                                "Отправить batch в Ozon (/v1/product/attributes/update)",
+                                "Отправить карточки в Ozon API",
                                 disabled=(not configured),
                                 key=f"ozon_send_update_{selected_product_id}",
                             ):
@@ -10674,8 +10733,8 @@ def show_ozon_tab():
                                     required_only=required_only_mode,
                                     dictionary_min_score=float(dictionary_min_score),
                                     offer_id_field=str(offer_id_field),
-                                    client_id=client_id or None,
-                                    api_key=api_key or None,
+                                    client_id=resolved_client_id or None,
+                                    api_key=resolved_api_key or None,
                                 )
                                 if send_result.get("ok"):
                                     response = send_result.get("response") or {}
@@ -10693,6 +10752,10 @@ def show_ozon_tab():
                                 f"skipped={bulk_payload.get('summary', {}).get('attributes_skipped', 0)}, "
                                 f"missing_offer_id={bulk_payload.get('summary', {}).get('missing_offer_id', 0)} | "
                                 f"request_items={update_request.get('summary', {}).get('items_total', 0)}"
+                            )
+                            st.caption(
+                                "Текущий publish-flow Ozon использует `/v1/product/attributes/update`: "
+                                "отправляет category/type и собранные атрибуты по пачке товаров."
                             )
 
                         st.markdown("### Preview полуавтозаполнения Ozon")
@@ -10955,8 +11018,8 @@ def show_ozon_tab():
                                                 result = retry_ozon_update_job(
                                                     conn=conn,
                                                     job_id=int(job_id),
-                                                    client_id=client_id or None,
-                                                    api_key=api_key or None,
+                                                    client_id=resolved_client_id or None,
+                                                    api_key=resolved_api_key or None,
                                                 )
                                                 if result.get("ok"):
                                                     ok_count += 1
@@ -11078,8 +11141,8 @@ def show_ozon_tab():
                                             res = retry_ozon_update_job(
                                                 conn=conn,
                                                 job_id=int(jid),
-                                                client_id=client_id or None,
-                                                api_key=api_key or None,
+                                                client_id=resolved_client_id or None,
+                                                api_key=resolved_api_key or None,
                                             )
                                             if res.get("ok"):
                                                 ok_count += 1
@@ -11146,8 +11209,8 @@ def show_ozon_tab():
                                             retry_result = retry_ozon_update_job(
                                                 conn=conn,
                                                 job_id=int(selected_job_id),
-                                                client_id=client_id or None,
-                                                api_key=api_key or None,
+                                                client_id=resolved_client_id or None,
+                                                api_key=resolved_api_key or None,
                                             )
                                             if retry_result.get("ok"):
                                                 st.success(

@@ -2,6 +2,17 @@
 
 ## 2026-05-01
 
+### `pending` Connect Ozon as persistent client channel for API publish
+
+- Ozon now has a proper client-mode layer on top of schema sync:
+  - `Client ID / API Key` can be saved in persistent PIM memory;
+  - connection can be checked directly from the UI;
+  - all Ozon actions now resolve saved-or-current credentials instead of session-only input.
+- Ozon publish-flow became less technical:
+  - button renamed to `Отправить карточки в Ozon API`;
+  - publish block can pull shortlist from `Каталог`;
+  - Ozon section explicitly explains that current publish uses `/v1/product/attributes/update`.
+
 ### `pending` Add AI verifier + batch rewrite + image readiness stages
 
 - Day 2 conveyor groundwork added:

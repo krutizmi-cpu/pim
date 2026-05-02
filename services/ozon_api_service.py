@@ -22,6 +22,8 @@ DEFAULT_TIMEOUT = 30.0
 OZON_OFFER_ID_FIELDS = ("article", "internal_article", "supplier_article")
 OZON_LAST_FULL_SYNC_KEY = "ozon_last_full_sync_at"
 OZON_LAST_FULL_SYNC_STATUS_KEY = "ozon_last_full_sync_status"
+OZON_CLIENT_ID_SETTING_KEY = "ozon.client_id"
+OZON_API_KEY_SETTING_KEY = "ozon.api_key"
 
 
 def get_env_credentials() -> tuple[str | None, str | None]:
@@ -195,6 +197,75 @@ def _set_setting(conn: sqlite3.Connection, key: str, value: str | None) -> None:
         (str(key), value),
     )
     conn.commit()
+
+
+def load_saved_credentials(conn: sqlite3.Connection) -> tuple[str | None, str | None]:
+    client_id = _get_setting(conn, OZON_CLIENT_ID_SETTING_KEY)
+    api_key = _get_setting(conn, OZON_API_KEY_SETTING_KEY)
+    return (
+        str(client_id).strip() if client_id not in (None, "") else None,
+        str(api_key).strip() if api_key not in (None, "") else None,
+    )
+
+
+def save_credentials(
+    conn: sqlite3.Connection,
+    client_id: str | None,
+    api_key: str | None,
+) -> None:
+    _set_setting(conn, OZON_CLIENT_ID_SETTING_KEY, str(client_id).strip() if client_id not in (None, "") else None)
+    _set_setting(conn, OZON_API_KEY_SETTING_KEY, str(api_key).strip() if api_key not in (None, "") else None)
+
+
+def clear_saved_credentials(conn: sqlite3.Connection) -> None:
+    _set_setting(conn, OZON_CLIENT_ID_SETTING_KEY, None)
+    _set_setting(conn, OZON_API_KEY_SETTING_KEY, None)
+
+
+def resolve_credentials(
+    conn: sqlite3.Connection | None = None,
+    client_id: str | None = None,
+    api_key: str | None = None,
+) -> tuple[str | None, str | None]:
+    resolved_client_id = str(client_id).strip() if client_id not in (None, "") else None
+    resolved_api_key = str(api_key).strip() if api_key not in (None, "") else None
+    if resolved_client_id and resolved_api_key:
+        return resolved_client_id, resolved_api_key
+    if conn is not None:
+        saved_client_id, saved_api_key = load_saved_credentials(conn)
+        resolved_client_id = resolved_client_id or saved_client_id
+        resolved_api_key = resolved_api_key or saved_api_key
+    if resolved_client_id and resolved_api_key:
+        return resolved_client_id, resolved_api_key
+    env_client_id, env_api_key = get_env_credentials()
+    return resolved_client_id or env_client_id, resolved_api_key or env_api_key
+
+
+def check_connection(
+    conn: sqlite3.Connection | None = None,
+    client_id: str | None = None,
+    api_key: str | None = None,
+) -> dict[str, Any]:
+    resolved_client_id, resolved_api_key = resolve_credentials(conn, client_id=client_id, api_key=api_key)
+    if not resolved_client_id or not resolved_api_key:
+        return {"ok": False, "message": "Не заданы Ozon Client ID / API Key"}
+    try:
+        response = _post(
+            "/v1/description-category/tree",
+            {},
+            client_id=resolved_client_id,
+            api_key=resolved_api_key,
+            max_retries=2,
+            retry_backoff_seconds=0.8,
+        )
+        categories = response.get("result") or []
+        return {
+            "ok": True,
+            "message": f"Подключение к Ozon API подтверждено. Категорий в ответе: {len(categories)}.",
+            "categories_count": len(categories),
+        }
+    except Exception as e:
+        return {"ok": False, "message": str(e)}
 
 
 def _list_category_pairs_for_sync(
