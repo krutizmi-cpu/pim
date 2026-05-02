@@ -2,6 +2,24 @@
 
 ## 2026-05-01
 
+### `pending` Add 5-day execution roadmap for 1000 SKU/day conveyor
+
+- В корень проекта добавлен файл [ROADMAP_5_DAYS_1000_SKU.md](ROADMAP_5_DAYS_1000_SKU.md).
+- Это не общая идея, а рабочий execution-plan на ближайшие 5 дней.
+- Что зафиксировано:
+  - не подключаем `ChatGPT/Codex OAuth` как backend AI-контур;
+  - parser должен уметь стартовать от главной страницы поставщика / домена, а не от URL карточки товара;
+  - AI остаётся обязательным слоем:
+    - verification parser result;
+    - массовый рерайт названия и описания;
+    - дозаполнение client-ready полей;
+  - целевой operating mode:
+    - `Каталог` как command center;
+    - `Карточка` как repair mode;
+    - `3–5 фото` на карточку;
+    - readiness queues;
+    - `1000 SKU/day` силами `1 менеджера`.
+
 ### `pending` Fix supplier/web parser runtime bug and regroup catalog service actions
 
 - Починен реальный runtime-баг в чистом parser-flow из `Каталог -> Проверка парсинга и сервис`.
