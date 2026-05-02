@@ -50,6 +50,10 @@ PIM-система для контент-отдела, где:
   - импорт Ozon-атрибутов в master.
   - Ozon-креды теперь можно хранить в постоянной памяти PIM как клиентский канал для API-отправки карточек;
   - publish-flow Ozon использует shortlist из Каталога и текущий endpoint `/v1/product/attributes/update`.
+- Wildberries:
+  - появился первый API-workspace в разделе `Каналы`;
+  - токен WB можно хранить в постоянной памяти PIM;
+  - уже доступны seller-info check, parent categories, subjects, subject characteristics и первый draft upload flow в Content API.
 - Клиентские шаблоны:
   - авто-матчинг + ручной матчинг;
   - сохранение mapping rules;

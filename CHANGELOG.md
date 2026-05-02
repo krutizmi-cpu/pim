@@ -13,6 +13,19 @@
   - publish block can pull shortlist from `Каталог`;
   - Ozon section explicitly explains that current publish uses `/v1/product/attributes/update`.
 
+### `pending` Add Wildberries client API workspace
+
+- New `Wildberries API: клиент и карточки` block added in `Каналы`.
+- WB token can now be saved in persistent PIM memory and checked via seller-info API.
+- First operational WB flow added:
+  - load parent categories;
+  - search subjects;
+  - inspect subject characteristics;
+  - pull shortlist from `Каталог`;
+  - build draft cards JSON;
+  - send draft cards to `POST /content/v2/cards/upload`;
+  - inspect `failed product cards with errors`.
+
 ### `pending` Add AI verifier + batch rewrite + image readiness stages
 
 - Day 2 conveyor groundwork added:

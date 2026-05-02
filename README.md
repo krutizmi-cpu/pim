@@ -64,6 +64,10 @@
   - там же есть проверка подключения к `Ozon Seller API`;
   - shortlist из `Каталога` можно подтянуть прямо в Ozon publish-flow;
   - текущая отправка карточек в Ozon идёт через `/v1/product/attributes/update`.
+- Wildberries как клиент:
+  - в разделе `Каналы` появился блок `Wildberries API: клиент и карточки`;
+  - там можно сохранить WB token, проверить seller-info, подтянуть parent categories / subjects / characteristics;
+  - также уже есть первый draft-flow: shortlist из `Каталога` -> draft JSON -> `POST /content/v2/cards/upload` -> просмотр failed card errors.
 - Проверка parser-flow:
   - в `Каталог` есть отдельный блок `Проверка парсинга и сервис`;
   - для чистой проверки supplier/web parser нужно использовать вкладку `Supplier/Web parser`, а не общий AI-конвейер;

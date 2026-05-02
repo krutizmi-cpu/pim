@@ -158,6 +158,19 @@ from services.detmir_api_service import (
     detect_best_category_for_product as detect_best_detmir_category_for_product,
     analyze_product_detmir_readiness,
 )
+from services.wildberries_api_service import (
+    load_settings as load_wb_settings,
+    save_settings as save_wb_settings,
+    clear_settings as clear_wb_settings,
+    is_configured as wb_is_configured,
+    check_connection as check_wb_connection,
+    list_parent_categories as list_wb_parent_categories,
+    search_subjects as search_wb_subjects,
+    get_subject_characteristics as get_wb_subject_characteristics,
+    build_card_draft as build_wb_card_draft,
+    upload_product_cards as upload_wb_product_cards,
+    list_failed_cards as list_wb_failed_cards,
+)
 from services.dimension_fallback import infer_category_fields, infer_dimensions_from_catalog, infer_dimensions_from_category_defaults, is_dimension_payload_suspicious
 from services.ai_content_service import (
     load_ai_settings,
@@ -11754,6 +11767,261 @@ def show_channels_tab():
             )
         else:
             st.info("Карточки Detmir пока не синхронизированы или не подходят под текущий фильтр.")
+
+    with st.expander("Wildberries API: клиент и карточки", expanded=False):
+        st.caption(
+            "Wildberries для PIM — ещё один клиентский канал. "
+            "Здесь сохраняем токен, читаем schema WB и готовим draft-карточки для отправки в Content API."
+        )
+        wb_settings = load_wb_settings(conn)
+        if "wb_api_token_input" not in st.session_state:
+            st.session_state["wb_api_token_input"] = str(wb_settings.get("api_token") or "")
+        wb_token = st.text_input(
+            "WB API token",
+            key="wb_api_token_input",
+            type="password",
+        )
+        wb_ready = wb_is_configured(conn=conn, api_token=str(wb_token or "").strip() or None)
+        wb1, wb2, wb3, wb4 = st.columns([1, 1, 1, 2])
+        with wb1:
+            if st.button("Сохранить Wildberries", key="wb_save_settings_btn"):
+                if not str(wb_token or "").strip():
+                    st.warning("Сначала вставь WB API token.")
+                else:
+                    save_wb_settings(conn, {"api_token": str(wb_token or "").strip()})
+                    st.success("WB token сохранён в памяти PIM.")
+        with wb2:
+            if st.button("Проверить WB API", key="wb_check_btn", disabled=not wb_ready):
+                wb_check = check_wb_connection(conn=conn, api_token=str(wb_token or "").strip() or None)
+                if wb_check.get("ok"):
+                    st.success(
+                        f"WB API отвечает. Продавец: {wb_check.get('seller_name') or '-'}"
+                        + (f" | ТМ: {wb_check.get('trade_mark')}" if wb_check.get("trade_mark") else "")
+                    )
+                else:
+                    st.error(str(wb_check.get("message") or "Не удалось подключиться к WB API."))
+        with wb3:
+            if st.button("Очистить WB token", key="wb_clear_settings_btn"):
+                clear_wb_settings(conn)
+                st.session_state["wb_api_token_input"] = ""
+                st.success("WB token очищен из памяти PIM.")
+                st.rerun()
+        with wb4:
+            if wb_ready:
+                st.caption("WB-клиент подключён. Можно читать schema и отправлять draft-карточки в Content API.")
+            else:
+                st.caption("Сохрани токен WB, чтобы использовать этот канал как клиента внутри PIM.")
+
+        schema_c1, schema_c2 = st.columns([1, 2])
+        with schema_c1:
+            if st.button("Загрузить parent-категории WB", key="wb_load_parents_btn", disabled=not wb_ready):
+                try:
+                    st.session_state["wb_parent_categories"] = list_wb_parent_categories(
+                        conn=conn,
+                        api_token=str(wb_token or "").strip() or None,
+                    )
+                    st.success(f"Parent-категории WB загружены: {len(st.session_state['wb_parent_categories'])}.")
+                except Exception as e:
+                    st.error(str(e))
+        with schema_c2:
+            parent_categories = st.session_state.get("wb_parent_categories") or []
+            if parent_categories:
+                st.caption(f"В памяти сессии WB parent-категорий: {len(parent_categories)}.")
+            else:
+                st.caption("Сначала подтяни parent-категории WB, затем выбери предмет и посмотри характеристики.")
+
+        parent_categories = st.session_state.get("wb_parent_categories") or []
+        selected_parent_id = None
+        if parent_categories:
+            parent_options = [int(x.get("parentID") or x.get("id") or 0) for x in parent_categories if int(x.get("parentID") or x.get("id") or 0) > 0]
+            parent_map = {
+                int(x.get("parentID") or x.get("id") or 0): x
+                for x in parent_categories
+                if int(x.get("parentID") or x.get("id") or 0) > 0
+            }
+            if parent_options:
+                selected_parent_id = st.selectbox(
+                    "Parent-категория WB",
+                    options=parent_options,
+                    format_func=lambda pid: str(parent_map[int(pid)].get("name") or parent_map[int(pid)].get("parentName") or f"parentID={pid}"),
+                    key="wb_selected_parent_id",
+                )
+
+        sb1, sb2, sb3 = st.columns([2, 1, 1])
+        with sb1:
+            wb_subject_search = st.text_input(
+                "Поиск предмета WB",
+                value="",
+                placeholder="Например: велосипед, шлем, велосумка",
+                key="wb_subject_search",
+            )
+        with sb2:
+            wb_subject_limit = st.number_input("Лимит предметов", min_value=10, max_value=500, value=50, step=10, key="wb_subject_limit")
+        with sb3:
+            if st.button("Найти предметы WB", key="wb_find_subjects_btn", disabled=not wb_ready):
+                try:
+                    st.session_state["wb_subjects"] = search_wb_subjects(
+                        conn=conn,
+                        api_token=str(wb_token or "").strip() or None,
+                        name=wb_subject_search or None,
+                        parent_id=int(selected_parent_id) if selected_parent_id else None,
+                        limit=int(wb_subject_limit),
+                    )
+                    st.success(f"Предметов WB найдено: {len(st.session_state['wb_subjects'])}.")
+                except Exception as e:
+                    st.error(str(e))
+
+        wb_subjects = st.session_state.get("wb_subjects") or []
+        selected_subject_id = None
+        if wb_subjects:
+            subject_options = [int(x.get("subjectID") or 0) for x in wb_subjects if int(x.get("subjectID") or 0) > 0]
+            subject_map = {int(x.get("subjectID") or 0): x for x in wb_subjects if int(x.get("subjectID") or 0) > 0}
+            if subject_options:
+                selected_subject_id = st.selectbox(
+                    "Предмет WB",
+                    options=subject_options,
+                    format_func=lambda sid: (
+                        f"{subject_map[int(sid)].get('subjectName') or '-'} | subjectID={sid}"
+                        + (
+                            f" | parent={subject_map[int(sid)].get('parentName')}"
+                            if subject_map[int(sid)].get("parentName")
+                            else ""
+                        )
+                    ),
+                    key="wb_selected_subject_id",
+                )
+                if st.button("Показать характеристики предмета WB", key="wb_load_subject_charcs_btn", disabled=not wb_ready):
+                    try:
+                        st.session_state["wb_subject_characteristics"] = get_wb_subject_characteristics(
+                            conn=conn,
+                            api_token=str(wb_token or "").strip() or None,
+                            subject_id=int(selected_subject_id),
+                        )
+                        st.success(
+                            f"Характеристик предмета WB загружено: {len(st.session_state['wb_subject_characteristics'])}."
+                        )
+                    except Exception as e:
+                        st.error(str(e))
+
+        wb_charcs = st.session_state.get("wb_subject_characteristics") or []
+        if wb_charcs:
+            wb_char_df = pd.DataFrame(wb_charcs)
+            show_cols = [c for c in ["charcID", "name", "required", "unitName", "maxCount", "charcType"] if c in wb_char_df.columns]
+            st.dataframe(wb_char_df[show_cols], use_container_width=True, hide_index=True)
+
+        st.markdown("### Draft-пачка Wildberries")
+        wb_catalog_shortlist = [
+            int(x)
+            for x in (st.session_state.get("template_selected_ids_from_catalog") or [])
+            if str(x).strip()
+        ]
+        wb_products = conn.execute(
+            "SELECT id, article, name FROM products ORDER BY id DESC LIMIT 1000"
+        ).fetchall()
+        wb_product_options = [int(r["id"]) for r in wb_products]
+        wb_product_label_map = {
+            int(r["id"]): f"{r['article'] or '-'} | {r['name'] or '-'}"
+            for r in wb_products
+        }
+        wb_select_key = "wb_selected_product_ids"
+        if wb_select_key not in st.session_state:
+            st.session_state[wb_select_key] = []
+        wbp1, wbp2, wbp3 = st.columns([1, 1, 2])
+        with wbp1:
+            if st.button("Подтянуть shortlist из Каталога", key="wb_pull_catalog_shortlist_btn"):
+                st.session_state[wb_select_key] = [int(x) for x in wb_catalog_shortlist]
+                st.success(f"В WB-пачку подтянуто товаров: {len(wb_catalog_shortlist)}.")
+                st.rerun()
+        with wbp2:
+            if st.button("Очистить WB-пачку", key="wb_clear_selected_ids_btn"):
+                st.session_state[wb_select_key] = []
+                st.rerun()
+        with wbp3:
+            st.caption(
+                f"Shortlist из Каталога: {len(wb_catalog_shortlist)} | "
+                f"Сейчас выбрано для WB: {len(st.session_state.get(wb_select_key) or [])}"
+            )
+
+        selected_wb_product_ids = st.multiselect(
+            "Товары для WB draft / publish",
+            options=wb_product_options,
+            default=st.session_state.get(wb_select_key) or [],
+            format_func=lambda x: wb_product_label_map.get(int(x), f"ID {x}"),
+            key=wb_select_key,
+        )
+        draft_characteristics_json = st.text_area(
+            "Доп. характеристики WB JSON",
+            value="[]",
+            height=120,
+            key="wb_draft_characteristics_json",
+            help='Опционально: [{"id": 123, "value": ["значение"]}]',
+        )
+        wb_draft_cards: list[dict[str, Any]] = []
+        if selected_subject_id and selected_wb_product_ids:
+            try:
+                extra_characteristics = json.loads(draft_characteristics_json or "[]")
+                if not isinstance(extra_characteristics, list):
+                    extra_characteristics = []
+            except Exception:
+                extra_characteristics = []
+            for pid in selected_wb_product_ids:
+                try:
+                    wb_draft_cards.append(
+                        build_wb_card_draft(
+                            conn,
+                            product_id=int(pid),
+                            subject_id=int(selected_subject_id),
+                            extra_characteristics=extra_characteristics,
+                        )
+                    )
+                except Exception:
+                    continue
+        if wb_draft_cards:
+            st.caption(
+                "Это первый draft-поток WB: title/description/brand/dimensions/sizes берутся из master-карточки. "
+                "Для category-specific атрибутов можно временно подмешать JSON выше."
+            )
+            st.download_button(
+                "Скачать draft JSON для Wildberries",
+                data=json.dumps(wb_draft_cards, ensure_ascii=False, indent=2).encode("utf-8"),
+                file_name="wildberries_cards_draft.json",
+                mime="application/json",
+                key="wb_download_draft_json_btn",
+            )
+            st.code(json.dumps(wb_draft_cards[:2], ensure_ascii=False, indent=2), language="json")
+            if st.button("Отправить draft-карточки в Wildberries", key="wb_upload_cards_btn", disabled=not wb_ready):
+                upload_result = upload_wb_product_cards(
+                    conn=conn,
+                    api_token=str(wb_token or "").strip() or None,
+                    cards=wb_draft_cards,
+                )
+                if upload_result.get("ok"):
+                    st.success("Draft-карточки отправлены в Wildberries Content API.")
+                    st.json(upload_result.get("response") or {})
+                else:
+                    st.error(str(upload_result.get("message") or "Не удалось отправить карточки в Wildberries."))
+
+        ferr1, ferr2 = st.columns([1, 3])
+        with ferr1:
+            if st.button("Проверить failed drafts WB", key="wb_failed_cards_btn", disabled=not wb_ready):
+                try:
+                    st.session_state["wb_failed_cards_result"] = list_wb_failed_cards(
+                        conn=conn,
+                        api_token=str(wb_token or "").strip() or None,
+                        limit=100,
+                    )
+                    st.success("Список failed product cards WB обновлён.")
+                except Exception as e:
+                    st.error(str(e))
+        with ferr2:
+            st.caption(
+                "WB создаёт и обновляет карточки асинхронно. Если ответ `200`, но карточка не создалась, "
+                "нужно смотреть `List of Failed Product Cards with Errors`."
+            )
+        wb_failed_cards_result = st.session_state.get("wb_failed_cards_result") or {}
+        wb_failed_cards_data = wb_failed_cards_result.get("data") or []
+        if wb_failed_cards_data:
+            st.dataframe(pd.DataFrame(wb_failed_cards_data), use_container_width=True, hide_index=True)
 
     channels = conn.execute(
         "SELECT channel_code, channel_name, is_active FROM channel_profiles ORDER BY channel_name"
