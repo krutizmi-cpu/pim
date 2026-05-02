@@ -6037,6 +6037,33 @@ def enrich_product_from_supplier(
                     max_hops=max_hops,
                 )
                 source_url = parsed.get("resolved_url") or effective_supplier_url
+                listing_like_source = False
+                root_like_source = False
+                if _supplier_parser is not None:
+                    try:
+                        if hasattr(_supplier_parser, "_is_listing_like_url"):
+                            listing_like_source = bool(_supplier_parser._is_listing_like_url(effective_supplier_url))
+                        if hasattr(_supplier_parser, "_is_root_like_url"):
+                            root_like_source = bool(_supplier_parser._is_root_like_url(effective_supplier_url))
+                    except Exception:
+                        listing_like_source = False
+                        root_like_source = False
+                if parsed and has_meaningful_supplier_data(parsed) and (
+                    bool(parsed.get("resolved_from_listing"))
+                    or listing_like_source
+                    or root_like_source
+                ):
+                    is_relevant, relevance_reason = _is_parsed_result_relevant(
+                        product_row=product_row,
+                        parsed=parsed,
+                        source_url=str(source_url or effective_supplier_url or ""),
+                        settings=settings,
+                    )
+                    if not is_relevant:
+                        parsed = {}
+                        source_type = "web_search_fallback"
+                        source_url = effective_supplier_url
+                        fallback_rejected_reason = relevance_reason
             except Exception as parse_error:
                 parsed = {}
                 source_type = "web_search_fallback"
