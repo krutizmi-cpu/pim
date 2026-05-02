@@ -1425,6 +1425,83 @@ def _parse_status_label(status: object) -> str:
     return "Не запускался"
 
 
+def _supplier_url_shape(url: object) -> str:
+    text = str(url or "").strip()
+    if not text:
+        return "none"
+    try:
+        if _supplier_parser is not None and hasattr(_supplier_parser, "_is_root_like_url") and _supplier_parser._is_root_like_url(text):
+            return "root"
+        if _supplier_parser is not None and hasattr(_supplier_parser, "_is_listing_like_url") and _supplier_parser._is_listing_like_url(text):
+            return "listing"
+    except Exception:
+        pass
+    return "direct"
+
+
+def _parse_source_type_from_comment(comment: object) -> str:
+    text = str(comment or "").strip()
+    if not text:
+        return ""
+    match = re.search(r"\bsource=([a-z0-9_]+)\b", text)
+    return str(match.group(1) or "").strip().lower() if match else ""
+
+
+def _parser_stage_info(product_row) -> tuple[str, str]:
+    supplier_url = str(product_row.get("supplier_url") or "").strip() if hasattr(product_row, "get") else ""
+    parse_status = str(product_row.get("supplier_parse_status") or "").strip().lower() if hasattr(product_row, "get") else ""
+    parse_comment = str(product_row.get("supplier_parse_comment") or "").strip() if hasattr(product_row, "get") else ""
+    url_shape = _supplier_url_shape(supplier_url)
+    source_type = _parse_source_type_from_comment(parse_comment)
+
+    if not supplier_url:
+        return "Нет supplier-домена", "Нет supplier-домена"
+    if parse_status == "success":
+        if source_type in {"web_search_fallback", "web_search_fallback_domain", "domain_search_fallback", "yandex_search_fallback", "ozon_search_fallback"}:
+            return "Найдено через интернет", "Успех: web fallback"
+        if "listing->product resolved" in parse_comment or url_shape in {"root", "listing"}:
+            return "Найдено от домена поставщика", "Успех: supplier domain"
+        return "Прямая карточка поставщика", "Успех: supplier page"
+    if parse_status == "error":
+        low_comment = parse_comment.lower()
+        if "access blocked" in low_comment:
+            return "Сайт блокирует парсер", "Сайт блокирует доступ"
+        if "fallback_rejected=" in low_comment:
+            return "Нерелевантный кандидат", "Не найден релевантный товар"
+        if "не удалось получить полезные данные" in low_comment:
+            return "Карточка не найдена", "Не найден релевантный товар"
+        return "Ошибка parser-flow", "Ошибка parser-flow"
+    if url_shape in {"root", "listing"}:
+        return "Ожидает поиск по домену", "Нужен parser-run"
+    return "Не запускался", "Нужен parser-run"
+
+
+def _barcode_status_label(product_row) -> str:
+    barcode = str(product_row.get("barcode") or "").strip() if hasattr(product_row, "get") else ""
+    return "Есть" if barcode else "Нет"
+
+
+def _operational_queue_label(product_row) -> str:
+    has_ozon = bool(
+        _safe_int_id(product_row.get("ozon_description_category_id")) > 0
+        and _safe_int_id(product_row.get("ozon_type_id")) > 0
+    ) if hasattr(product_row, "get") else False
+    parse_status = str(product_row.get("supplier_parse_status") or "").strip().lower() if hasattr(product_row, "get") else ""
+    has_photo = bool(str(product_row.get("image_url") or "").strip()) if hasattr(product_row, "get") else False
+    has_barcode = bool(str(product_row.get("barcode") or "").strip()) if hasattr(product_row, "get") else False
+    _, parser_queue = _parser_stage_info(product_row)
+
+    if not has_ozon:
+        return "Нет Ozon-категории"
+    if parse_status != "success":
+        return parser_queue
+    if not has_photo:
+        return "Нет фото"
+    if not has_barcode:
+        return "Нет штрихкода"
+    return "Готово к AI/клиенту"
+
+
 def _product_core_fill_stats(product_row) -> tuple[int, int]:
     fields = [
         "name",
@@ -1651,6 +1728,7 @@ def build_catalog_operational_view(df: pd.DataFrame) -> pd.DataFrame:
     for _, row in df.iterrows():
         row_dict = row.to_dict()
         filled, total = _product_core_fill_stats(row_dict)
+        parser_stage, _ = _parser_stage_info(row_dict)
         rows.append(
             {
                 "article": row_dict.get("article") or row_dict.get("supplier_article") or row_dict.get("internal_article"),
@@ -1658,8 +1736,11 @@ def build_catalog_operational_view(df: pd.DataFrame) -> pd.DataFrame:
                 "supplier_name": row_dict.get("supplier_name"),
                 "ozon_category_path": _short_text(row_dict.get("ozon_category_path") or row_dict.get("category"), 68),
                 "stage": _product_stage_label(row_dict),
+                "parser_stage": parser_stage,
+                "queue": _operational_queue_label(row_dict),
                 "supplier_parse_status": _parse_status_label(row_dict.get("supplier_parse_status")),
                 "photo_status": "Есть" if str(row_dict.get("image_url") or "").strip() else "Нет",
+                "barcode_status": _barcode_status_label(row_dict),
                 "fill_score": f"{filled}/{total}",
                 "updated_at": row_dict.get("updated_at"),
             }
@@ -4725,6 +4806,39 @@ def show_catalog_tab():
             file_name=f"pim_products_page_{int(page)}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
+    operational_df = build_catalog_operational_view(df)
+    operational_df_display = operational_df.copy() if operational_df is not None else pd.DataFrame()
+    if operational_df is not None and not operational_df.empty:
+        queue_counts = operational_df["queue"].fillna("Без очереди").astype(str).value_counts().to_dict()
+        oq1, oq2, oq3, oq4 = st.columns(4)
+        oq1.metric("Нужен parser-run", int(queue_counts.get("Нужен parser-run", 0)))
+        oq2.metric("Не найден релевантный товар", int(queue_counts.get("Не найден релевантный товар", 0)))
+        oq3.metric("Нет фото", int(queue_counts.get("Нет фото", 0)))
+        oq4.metric("Готово к AI/клиенту", int(queue_counts.get("Готово к AI/клиенту", 0)))
+        queue_priority = [
+            "Нужен parser-run",
+            "Не найден релевантный товар",
+            "Сайт блокирует доступ",
+            "Ошибка parser-flow",
+            "Нет supplier-домена",
+            "Нет Ozon-категории",
+            "Нет фото",
+            "Нет штрихкода",
+            "Готово к AI/клиенту",
+        ]
+        queue_options = ["Все на странице"] + [q for q in queue_priority if q in queue_counts]
+        selected_queue = st.selectbox(
+            "Операционная очередь страницы",
+            options=queue_options,
+            index=0,
+            key="catalog_operational_queue_filter",
+            help="Это рабочий фокус по текущей странице каталога: сначала добивай проблемные очереди, а не все товары подряд.",
+        )
+        if selected_queue != "Все на странице":
+            operational_df_display = operational_df[operational_df["queue"] == selected_queue].copy()
+            st.caption(f"Рабочий фокус страницы: `{selected_queue}`.")
+        else:
+            st.caption("Рабочий фокус страницы: показаны все товары текущей страницы.")
     media_settings = load_media_settings(conn)
     media_public_base_url = str(media_settings.get("public_base_url") or "").strip()
 
@@ -4778,6 +4892,7 @@ def show_catalog_tab():
             quick_ozon_ready = compute_quick_ozon_readiness(conn, selected_row_dict)
             quick_template_ready = compute_best_template_profile_readiness(conn, selected_row_dict)
             filled_core, total_core = _product_core_fill_stats(selected_row_dict)
+            parser_stage_label, parser_queue_label = _parser_stage_info(selected_row_dict)
             sf1, sf2, sf3, sf4, sf5, sf6 = st.columns(6)
             sf1.metric("Артикул", str(selected_row_dict.get("article") or selected_row_dict.get("supplier_article") or selected_row_dict.get("internal_article") or "-"))
             sf2.metric("Статус карточки", _product_stage_label(selected_row_dict))
@@ -4788,8 +4903,10 @@ def show_catalog_tab():
             st.caption(
                 f"Поставщик: {selected_row_dict.get('supplier_name') or '-'} | "
                 f"Ozon: {selected_row_dict.get('ozon_category_path') or selected_row_dict.get('category') or '-'} | "
-                f"Фото: {'есть' if str(selected_row_dict.get('image_url') or '').strip() else 'нет'}"
+                f"Фото: {'есть' if str(selected_row_dict.get('image_url') or '').strip() else 'нет'} | "
+                f"Штрихкод: {_barcode_status_label(selected_row_dict)}"
             )
+            st.caption(f"Parser stage: {parser_stage_label} | Рабочая очередь: {parser_queue_label}")
             parse_comment = str(selected_row_dict.get("supplier_parse_comment") or "").strip()
             if parse_comment and str(selected_row_dict.get("supplier_parse_status") or "").strip().lower() == "error":
                 st.error(f"Причина ошибки парсинга: {parse_comment}")
@@ -4970,32 +5087,32 @@ def show_catalog_tab():
         aic1, aic2, aic3, aic4 = st.columns(4)
         with aic1:
             ai_batch_include_supplier = st.checkbox(
-                "Сначала supplier/web enrichment",
+                "Сначала найти данные на сайте и в интернете",
                 value=True,
                 key="catalog_ai_include_supplier",
-                help="Сначала попробует supplier_url и web-поиск, затем AI-дозаполнение.",
+                help="Сначала попробует найти карточку товара по домену поставщика и через web fallback, затем передаст результат в AI-слой.",
             )
         with aic2:
             ai_batch_include_title = st.checkbox(
-                "AI-продающее название",
+                "AI-рерайт названия",
                 value=True,
                 key="catalog_ai_include_title",
             )
         with aic3:
             ai_batch_include_description = st.checkbox(
-                "AI-описание",
+                "AI-рерайт описания",
                 value=True,
                 key="catalog_ai_include_description",
             )
         with aic4:
             ai_batch_include_attributes = st.checkbox(
-                "AI-Ozon атрибуты",
+                "AI-дозаполнение Ozon атрибутов",
                 value=True,
                 key="catalog_ai_include_attributes",
             )
         st.caption(
-            "Этот режим лучше соответствует реальному потоку: Ozon категория -> supplier/web данные -> AI название/описание/атрибуты. "
-            "Для больших пакетов упирается в время ответа моделей и лимиты провайдера."
+            "Этот режим уже ближе к целевому conveyor: домен поставщика -> поиск карточки товара -> AI-проверка и рерайт -> Ozon/client-ready данные. "
+            "Для больших пакетов итоговая скорость всё ещё упирается в parser confidence и время ответа моделей."
         )
     dcfg1, dcfg2 = st.columns([1, 2])
     with dcfg1:
@@ -5361,14 +5478,14 @@ def show_catalog_tab():
         with flow2:
             with st.container(border=True):
                 st.markdown("#### 2. Массовое наполнение")
-                st.caption("Заполнить master-карточки, Ozon-атрибуты и переиспользуемые данные для клиентов.")
+                st.caption("Массово найти данные по товарам, переписать контент и подготовить master-карточки под клиентов.")
                 fill_detmir_after_ai = st.checkbox(
                     "После AI сразу подготовить Detmir overlay",
                     value=True,
                     key="catalog_fill_detmir_after_ai",
                     help="После supplier/web + AI система сразу перенесёт уже найденные значения в Detmir overlay.",
                 )
-                if st.button("Заполнить всё для области", type="primary", use_container_width=True, key="catalog_workflow_fill_all"):
+                if st.button("Запустить массовое заполнение для области", type="primary", use_container_width=True, key="catalog_workflow_fill_all"):
                     run_ai_enrichment_batch(
                         candidate_ids=[int(x) for x in workflow_target_ids],
                         run_limit=max(len(workflow_target_ids), 1),
@@ -5789,10 +5906,9 @@ def show_catalog_tab():
                         key="catalog_export_images_selected_zip",
                     )
 
-    operational_df = build_catalog_operational_view(df)
-    if operational_df is not None and not operational_df.empty:
+    if operational_df_display is not None and not operational_df_display.empty:
         st.markdown("### Таблица товаров")
-        st.caption("Главный рабочий список: артикул, этап, парсинг, фото и последнее обновление.")
+        st.caption("Главный рабочий список: артикул, этап, parser-stage, очередь, фото, штрихкод и последнее обновление.")
         op_cols = [
             c
             for c in [
@@ -5801,19 +5917,25 @@ def show_catalog_tab():
                 "supplier_name",
                 "ozon_category_path",
                 "stage",
+                "parser_stage",
+                "queue",
                 "supplier_parse_status",
                 "photo_status",
+                "barcode_status",
                 "fill_score",
                 "updated_at",
             ]
-            if c in operational_df.columns
+            if c in operational_df_display.columns
         ]
         st.dataframe(
             with_ru_columns(
-                operational_df[op_cols],
+                operational_df_display[op_cols],
                 extra_map={
                     "stage": "Этап карточки",
+                    "parser_stage": "Parser stage",
+                    "queue": "Очередь",
                     "photo_status": "Фото",
+                    "barcode_status": "Штрихкод",
                     "fill_score": "Ядро",
                 },
             ),
