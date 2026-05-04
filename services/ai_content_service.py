@@ -272,6 +272,18 @@ def _extract_message_text(content: Any) -> str:
     return str(content)
 
 
+def _extract_http_error_text(exc: Exception) -> str:
+    if isinstance(exc, httpx.HTTPStatusError):
+        try:
+            response_text = str(exc.response.text or "").strip()
+        except Exception:
+            response_text = ""
+        if response_text:
+            compact = " ".join(response_text.split())
+            return f"{str(exc)} | body={compact[:600]}"
+    return str(exc)
+
+
 def _chat_completion(
     settings: dict[str, Any],
     system_prompt: str,
@@ -301,11 +313,29 @@ def _chat_completion(
         payload["response_format"] = {"type": "json_object"}
 
     headers = _build_request_headers(settings)
-    try:
+
+    def _send_chat_request(payload_to_send: dict[str, Any]) -> dict[str, Any]:
         with httpx.Client(timeout=_build_http_timeout(provider, for_chat=True)) as client:
-            response = client.post(f"{base_url}/chat/completions", headers=headers, json=payload)
+            response = client.post(f"{base_url}/chat/completions", headers=headers, json=payload_to_send)
             response.raise_for_status()
-            data = response.json()
+            return response.json()
+
+    try:
+        try:
+            data = _send_chat_request(payload)
+        except Exception as request_error:
+            can_retry_openrouter = (
+                provider == "openrouter"
+                and force_json
+                and isinstance(request_error, httpx.HTTPStatusError)
+                and int(request_error.response.status_code) == 400
+                and "response_format" in payload
+            )
+            if not can_retry_openrouter:
+                raise
+            retry_payload = dict(payload)
+            retry_payload.pop("response_format", None)
+            data = _send_chat_request(retry_payload)
         choices = data.get("choices") or []
         if not choices:
             return {"ok": False, "error": "AI не вернул choices."}
@@ -322,7 +352,7 @@ def _chat_completion(
             "usage": usage,
         }
     except Exception as e:
-        return {"ok": False, "error": str(e)}
+        return {"ok": False, "error": _extract_http_error_text(e)}
 
 
 def check_ai_connection(settings: dict[str, Any]) -> dict[str, Any]:

@@ -79,6 +79,8 @@ LIKELY_BLOCKED_SUPPLIER_DOMAINS = (
     "sportmaster.ru",
 )
 
+MIN_IMAGE_SIDE_PX = 1000
+
 DIMENSION_PATTERNS = {
     "weight": [r"вес[^\d]{0,20}(\d+[\.,]?\d*)\s*(кг|г)", r"weight[^\d]{0,20}(\d+[\.,]?\d*)\s*(kg|g)"],
     "gross_weight": [r"вес\s*брутто[^\d]{0,20}(\d+[\.,]?\d*)\s*(кг|г)", r"gross\s*weight[^\d]{0,20}(\d+[\.,]?\d*)\s*(kg|g)"],
@@ -456,6 +458,45 @@ def _normalize_image_url(url: str | None, page_url: str | None = None) -> str | 
     return text
 
 
+def _extract_image_size_hint(url: str | None) -> tuple[int | None, int | None]:
+    text = str(url or "").strip().lower()
+    if not text:
+        return None, None
+    patterns = [
+        r"w(?P<w>\d{2,5})h(?P<h>\d{2,5})",
+        r"(?P<w>\d{2,5})[xх](?P<h>\d{2,5})(?=[^a-z0-9]|$)",
+        r"(?:[?&](?:w|width)=(?P<w>\d{2,5}))(?:[^\d]+(?:h|height)=(?P<h>\d{2,5}))?",
+        r"(?:[?&](?:h|height)=(?P<h>\d{2,5}))(?:[^\d]+(?:w|width)=(?P<w>\d{2,5}))?",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if not match:
+            continue
+        width_raw = match.groupdict().get("w")
+        height_raw = match.groupdict().get("h")
+        try:
+            width = int(width_raw) if width_raw else None
+        except Exception:
+            width = None
+        try:
+            height = int(height_raw) if height_raw else None
+        except Exception:
+            height = None
+        if width or height:
+            return width, height
+    return None, None
+
+
+def _is_definitely_low_resolution_image(url: str | None, min_side_px: int = MIN_IMAGE_SIDE_PX) -> bool:
+    width, height = _extract_image_size_hint(url)
+    if width is None and height is None:
+        return False
+    if width is not None and height is not None:
+        return min(width, height) < int(min_side_px)
+    known_side = width if width is not None else height
+    return bool(known_side is not None and known_side < int(min_side_px))
+
+
 def _extract_srcset_urls(srcset: str | None) -> list[str]:
     text = _clean_text(srcset)
     if not text:
@@ -552,6 +593,8 @@ def _score_image_candidate(url: str, hints: list[str] | None = None) -> float:
         score -= 8.0
     if any(token in low for token in ("banner", "slider", "promo", "adv", "advert", "news")):
         score -= 5.0
+    if _is_definitely_low_resolution_image(low):
+        score -= 7.5
     if "/images/" in low or "images-resize" in low:
         score += 1.5
     size_match = re.search(r"w(\d+)h(\d+)", low)
@@ -579,7 +622,9 @@ def _prioritize_image_urls(image_urls: list[str], hints: list[str] | None = None
         score = _score_image_candidate(candidate, hints=hints) - (idx * 0.01)
         scored.append((score, candidate))
     scored.sort(key=lambda item: (-item[0], item[1]))
-    return [url for _, url in scored]
+    ordered = [url for _, url in scored]
+    filtered = [url for url in ordered if not _is_definitely_low_resolution_image(url)]
+    return filtered
 
 
 def _extract_attributes(soup: BeautifulSoup) -> dict[str, str]:

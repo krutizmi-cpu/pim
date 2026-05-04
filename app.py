@@ -2200,6 +2200,72 @@ def _parse_domain_list(value: object) -> list[str]:
     return out
 
 
+_CATEGORY_CONFLICT_TOKENS = {
+    "строительство",
+    "ремонт",
+    "ручки",
+    "фурнитура",
+    "двер",
+    "мебел",
+    "замки и фурнитура",
+}
+
+_BICYCLE_CONTEXT_TOKENS = {
+    "вело",
+    "велосип",
+    "bike",
+    "bicycle",
+    "cycling",
+    "cycle",
+    "u-lock",
+}
+
+_BICYCLE_CATEGORY_TOKENS = {
+    "вело",
+    "велосип",
+    "спортив",
+    "экипиров",
+    "аксессуар",
+    "bike",
+    "cycle",
+}
+
+
+def _should_override_parsed_category_with_name_inference(
+    product_row: dict,
+    parsed: dict[str, object],
+    category_inferred: dict[str, object],
+) -> bool:
+    inference_score = float(category_inferred.get("category_inference_score") or 0.0)
+    if inference_score < 1.15:
+        return False
+    parsed_blob = " ".join(
+        [
+            str(parsed.get("category") or ""),
+            str(parsed.get("base_category") or ""),
+            str(parsed.get("subcategory") or ""),
+        ]
+    ).strip().lower()
+    if not parsed_blob:
+        return False
+    source_name = " ".join(
+        [
+            str(product_row.get("name") or ""),
+            str(parsed.get("name") or ""),
+        ]
+    ).strip().lower()
+    if not source_name:
+        return False
+    has_bicycle_context = any(token in source_name for token in _BICYCLE_CONTEXT_TOKENS)
+    parsed_looks_bicycle = any(token in parsed_blob for token in _BICYCLE_CATEGORY_TOKENS)
+    parsed_looks_conflicting = any(token in parsed_blob for token in _CATEGORY_CONFLICT_TOKENS)
+    if has_bicycle_context and parsed_looks_conflicting:
+        return True
+    if has_bicycle_context and not parsed_looks_bicycle and inference_score >= 1.25:
+        return True
+    return False
+
+
 def _row_value(row: object, key: str, default: object = None) -> object:
     if row is None:
         return default
@@ -6513,7 +6579,15 @@ def enrich_product_from_supplier(
             "package_height",
         ]
         has_dims = any(parsed.get(k) not in (None, "", 0, 0.0) for k in dim_fields)
-        need_fallback = (not has_meaningful_supplier_data(parsed)) or bool(parsed.get("listing_only")) or (not has_dims) or is_dimension_payload_suspicious(parsed) or (not supplier_url)
+        has_photo_payload = bool(str(parsed.get("image_url") or "").strip()) or bool(parsed.get("image_urls") or [])
+        need_fallback = (
+            (not has_meaningful_supplier_data(parsed))
+            or bool(parsed.get("listing_only"))
+            or (not has_dims)
+            or is_dimension_payload_suspicious(parsed)
+            or (not has_photo_payload)
+            or (not supplier_url)
+        )
 
         if need_fallback and (enable_web_fallback or enable_ozon_fallback or enable_yandex_fallback):
             preferred_domain = ""
@@ -6632,6 +6706,16 @@ def enrich_product_from_supplier(
         if category_inferred.get("subcategory"):
             parsed["subcategory"] = category_inferred.get("subcategory")
             field_source_types["subcategory"] = "name_category_inference"
+        if _should_override_parsed_category_with_name_inference(product_row, parsed, category_inferred):
+            if category_inferred.get("category"):
+                parsed["category"] = category_inferred.get("category")
+                field_source_types["category"] = "name_category_inference"
+            if category_inferred.get("base_category"):
+                parsed["base_category"] = category_inferred.get("base_category")
+                field_source_types["base_category"] = "name_category_inference"
+            if category_inferred.get("subcategory"):
+                parsed["subcategory"] = category_inferred.get("subcategory")
+                field_source_types["subcategory"] = "name_category_inference"
         if category_inferred.get("wheel_diameter_inch") is not None:
             parsed["wheel_diameter_inch"] = category_inferred.get("wheel_diameter_inch")
             field_source_types["wheel_diameter_inch"] = "name_category_inference"
