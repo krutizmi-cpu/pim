@@ -11,6 +11,9 @@
 - Fixed the misleading `Не задан base_url` behavior for OpenRouter draft configs:
   - provider defaults are now applied before connection check and save;
   - OpenRouter no longer requires manual `Base URL` input in the normal path.
+- OpenRouter model check is now more tolerant:
+  - if `/models` does not confirm an alias/free model,
+  - PIM now falls back to a short real chat-ping before declaring the model unavailable.
 
 ### `pending` Connect Ozon as persistent client channel for API publish
 

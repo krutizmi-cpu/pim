@@ -326,10 +326,41 @@ def _chat_completion(
 
 
 def check_ai_connection(settings: dict[str, Any]) -> dict[str, Any]:
+    provider = str(settings.get("provider") or "").strip().lower()
+    model = str(settings.get("chat_model") or "").strip()
     model_check = _check_model_endpoint(settings)
     if not model_check.get("ok"):
+        if provider == "openrouter":
+            chat_check = _chat_completion(
+                settings=settings,
+                system_prompt="Ты сервис проверки соединения.",
+                user_prompt="Ответь ровно: OK",
+                temperature=0.0,
+                max_tokens=12,
+            )
+            if chat_check.get("ok"):
+                return {
+                    "ok": True,
+                    "provider": provider,
+                    "model": model,
+                    "mode": "openrouter_chat_fallback",
+                    "text": (
+                        f"Модель `{model}` не подтвердилась через `/models`, "
+                        "но реальный chat-ping прошёл успешно."
+                    ),
+                    "warning": model_check.get("error"),
+                    "usage": chat_check.get("usage"),
+                }
+            return {
+                "ok": False,
+                "provider": provider,
+                "model": model,
+                "error": (
+                    f"{model_check.get('error') or 'Проверка `/models` не прошла.'} "
+                    f"И реальный chat-ping тоже не прошёл: {chat_check.get('error') or 'без текста ошибки'}"
+                ),
+            }
         return model_check
-    provider = str(settings.get("provider") or "").strip().lower()
     if provider == "nvidia":
         return {
             **model_check,
@@ -347,7 +378,7 @@ def check_ai_connection(settings: dict[str, Any]) -> dict[str, Any]:
     return {
         "ok": True,
         "provider": provider,
-        "model": str(settings.get("chat_model") or "").strip(),
+        "model": model,
         "mode": "model_endpoint_only",
         "text": (
             f"{model_check.get('text')} Короткий chat-ping не завершился быстро: "
