@@ -868,8 +868,15 @@ def _current_ai_form_settings(saved_settings: dict[str, Any]) -> dict[str, Any]:
         "openrouter_referer": str(st.session_state.get("ai_cfg_or_referer", saved_settings.get("openrouter_referer") or "") or "").strip(),
         "openrouter_title": str(st.session_state.get("ai_cfg_or_title", saved_settings.get("openrouter_title") or "pim") or "pim").strip() or "pim",
     }
-    if not str(settings.get("base_url") or "").strip():
-        settings["base_url"] = str(defaults.get("base_url") or "").strip()
+    known_provider_base_urls = {
+        str(item.get("base_url") or "").strip()
+        for item in PROVIDER_DEFAULTS.values()
+        if str(item.get("base_url") or "").strip()
+    }
+    current_base_url = str(settings.get("base_url") or "").strip()
+    default_base_url = str(defaults.get("base_url") or "").strip()
+    if (not current_base_url) or (current_base_url in known_provider_base_urls and current_base_url != default_base_url):
+        settings["base_url"] = default_base_url
     if not str(settings.get("chat_model") or "").strip():
         settings["chat_model"] = str(defaults.get("chat_model") or "").strip()
     if not str(settings.get("image_model") or "").strip():
@@ -877,10 +884,21 @@ def _current_ai_form_settings(saved_settings: dict[str, Any]) -> dict[str, Any]:
     return settings
 
 
-def _apply_ai_provider_defaults_to_state(provider: str) -> None:
+def _apply_ai_provider_defaults_to_state(provider: str, *, force_provider_base_url: bool = False) -> None:
     key = str(provider or "openai").strip().lower()
     defaults = PROVIDER_DEFAULTS.get(key, PROVIDER_DEFAULTS["openai"])
-    if not str(st.session_state.get("ai_cfg_base_url") or "").strip():
+    known_provider_base_urls = {
+        str(item.get("base_url") or "").strip()
+        for item in PROVIDER_DEFAULTS.values()
+        if str(item.get("base_url") or "").strip()
+    }
+    current_base_url = str(st.session_state.get("ai_cfg_base_url") or "").strip()
+    default_base_url = str(defaults.get("base_url") or "").strip()
+    if (
+        force_provider_base_url
+        or not current_base_url
+        or (current_base_url in known_provider_base_urls and current_base_url != default_base_url)
+    ):
         st.session_state["ai_cfg_base_url"] = str(defaults.get("base_url") or "").strip()
     if not str(st.session_state.get("ai_cfg_chat_model") or "").strip():
         st.session_state["ai_cfg_chat_model"] = str(defaults.get("chat_model") or "").strip()
@@ -972,6 +990,7 @@ def render_ai_settings_panel(conn) -> None:
     current_provider = str(form_settings.get("provider") or "openai").strip().lower()
     if current_provider not in provider_options:
         current_provider = "openai"
+    previous_provider = str(st.session_state.get("ai_cfg_provider_last_applied") or current_provider).strip().lower()
     a1, a2, a3 = st.columns(3)
     with a1:
         ai_provider = st.selectbox(
@@ -981,7 +1000,9 @@ def render_ai_settings_panel(conn) -> None:
             format_func=lambda x: {"openai": "OpenAI", "openrouter": "OpenRouter", "nvidia": "NVIDIA"}.get(x, x),
             key="ai_cfg_provider",
         )
-        _apply_ai_provider_defaults_to_state(str(ai_provider))
+        provider_changed = str(ai_provider).strip().lower() != previous_provider
+        _apply_ai_provider_defaults_to_state(str(ai_provider), force_provider_base_url=provider_changed)
+        st.session_state["ai_cfg_provider_last_applied"] = str(ai_provider).strip().lower()
     with a2:
         ai_chat_model = st.text_input(
             "Модель",
