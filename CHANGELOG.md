@@ -2,6 +2,16 @@
 
 ## 2026-05-01
 
+### `pending` Simplify AI provider setup for OpenRouter and parser flow
+
+- AI settings panel is now simpler for day-to-day use:
+  - main flow reduced to `provider -> model -> API key`;
+  - service URLs and provider defaults are auto-filled;
+  - advanced fields moved under `Расширенные настройки AI`.
+- Fixed the misleading `Не задан base_url` behavior for OpenRouter draft configs:
+  - provider defaults are now applied before connection check and save;
+  - OpenRouter no longer requires manual `Base URL` input in the normal path.
+
 ### `pending` Connect Ozon as persistent client channel for API publish
 
 - Ozon now has a proper client-mode layer on top of schema sync:

@@ -173,6 +173,7 @@ from services.wildberries_api_service import (
 )
 from services.dimension_fallback import infer_category_fields, infer_dimensions_from_catalog, infer_dimensions_from_category_defaults, is_dimension_payload_suspicious
 from services.ai_content_service import (
+    PROVIDER_DEFAULTS,
     load_ai_settings,
     save_ai_settings,
     ai_is_configured,
@@ -852,20 +853,41 @@ def _coerce_state_number(key: str, default_value: object, caster):
 
 def _current_ai_form_settings(saved_settings: dict[str, Any]) -> dict[str, Any]:
     provider = str(st.session_state.get("ai_cfg_provider", saved_settings.get("provider") or "openai")).strip().lower()
-    return {
+    defaults = PROVIDER_DEFAULTS.get(provider, PROVIDER_DEFAULTS["openai"])
+    settings = {
         "enabled": bool(st.session_state.get("ai_cfg_enabled", saved_settings.get("enabled", True))),
         "provider": provider,
-        "base_url": str(st.session_state.get("ai_cfg_base_url", saved_settings.get("base_url") or "") or "").strip(),
-        "chat_model": str(st.session_state.get("ai_cfg_chat_model", saved_settings.get("chat_model") or "") or "").strip(),
-        "image_model": str(st.session_state.get("ai_cfg_image_model", saved_settings.get("image_model") or "") or "").strip(),
+        "base_url": str(st.session_state.get("ai_cfg_base_url", saved_settings.get("base_url") or defaults.get("base_url") or "") or "").strip(),
+        "chat_model": str(st.session_state.get("ai_cfg_chat_model", saved_settings.get("chat_model") or defaults.get("chat_model") or "") or "").strip(),
+        "image_model": str(st.session_state.get("ai_cfg_image_model", saved_settings.get("image_model") or defaults.get("image_model") or "") or "").strip(),
         "api_key": str(st.session_state.get("ai_cfg_api_key", saved_settings.get("api_key") or "") or "").strip(),
         "use_env_api_key": bool(st.session_state.get("ai_cfg_use_env_key", saved_settings.get("use_env_api_key", True))),
         "temperature": float(st.session_state.get("ai_cfg_temperature", saved_settings.get("temperature", 0.3)) or 0.3),
         "max_tokens": int(float(st.session_state.get("ai_cfg_max_tokens", saved_settings.get("max_tokens", 1800)) or 1800)),
         "image_size": str(st.session_state.get("ai_cfg_image_size", saved_settings.get("image_size") or "1024x1024") or "1024x1024").strip(),
         "openrouter_referer": str(st.session_state.get("ai_cfg_or_referer", saved_settings.get("openrouter_referer") or "") or "").strip(),
-        "openrouter_title": str(st.session_state.get("ai_cfg_or_title", saved_settings.get("openrouter_title") or "pim") or "pim").strip(),
+        "openrouter_title": str(st.session_state.get("ai_cfg_or_title", saved_settings.get("openrouter_title") or "pim") or "pim").strip() or "pim",
     }
+    if not str(settings.get("base_url") or "").strip():
+        settings["base_url"] = str(defaults.get("base_url") or "").strip()
+    if not str(settings.get("chat_model") or "").strip():
+        settings["chat_model"] = str(defaults.get("chat_model") or "").strip()
+    if not str(settings.get("image_model") or "").strip():
+        settings["image_model"] = str(defaults.get("image_model") or "").strip()
+    return settings
+
+
+def _apply_ai_provider_defaults_to_state(provider: str) -> None:
+    key = str(provider or "openai").strip().lower()
+    defaults = PROVIDER_DEFAULTS.get(key, PROVIDER_DEFAULTS["openai"])
+    if not str(st.session_state.get("ai_cfg_base_url") or "").strip():
+        st.session_state["ai_cfg_base_url"] = str(defaults.get("base_url") or "").strip()
+    if not str(st.session_state.get("ai_cfg_chat_model") or "").strip():
+        st.session_state["ai_cfg_chat_model"] = str(defaults.get("chat_model") or "").strip()
+    if not str(st.session_state.get("ai_cfg_image_model") or "").strip():
+        st.session_state["ai_cfg_image_model"] = str(defaults.get("image_model") or "").strip()
+    if key == "openrouter" and not str(st.session_state.get("ai_cfg_or_title") or "").strip():
+        st.session_state["ai_cfg_or_title"] = "pim"
 
 
 def render_ai_settings_panel(conn) -> None:
@@ -886,6 +908,7 @@ def render_ai_settings_panel(conn) -> None:
     _coerce_state_number("ai_cfg_max_tokens", ai_settings.get("max_tokens", 1800), int)
     st.session_state.setdefault("ai_cfg_use_env_key", bool(ai_settings.get("use_env_api_key", True)))
     st.session_state.setdefault("ai_cfg_enabled", bool(ai_settings.get("enabled", True)))
+    _apply_ai_provider_defaults_to_state(str(st.session_state.get("ai_cfg_provider") or ai_settings.get("provider") or "openai"))
 
     form_settings = _current_ai_form_settings(ai_settings)
     cfg_ok, cfg_msg = ai_is_configured(form_settings)
@@ -958,48 +981,78 @@ def render_ai_settings_panel(conn) -> None:
             format_func=lambda x: {"openai": "OpenAI", "openrouter": "OpenRouter", "nvidia": "NVIDIA"}.get(x, x),
             key="ai_cfg_provider",
         )
+        _apply_ai_provider_defaults_to_state(str(ai_provider))
     with a2:
-        ai_chat_model = st.text_input("Chat model", value=str(form_settings.get("chat_model") or ""), key="ai_cfg_chat_model")
+        ai_chat_model = st.text_input(
+            "Модель",
+            value=str(_current_ai_form_settings(ai_settings).get("chat_model") or ""),
+            key="ai_cfg_chat_model",
+            placeholder="Например: openai/gpt-4o-mini или tencent/hunyuan-a13b-instruct:free",
+        )
     with a3:
-        ai_image_model = st.text_input("Image model", value=str(form_settings.get("image_model") or ""), key="ai_cfg_image_model")
+        ai_api_key = st.text_input(
+            "API key",
+            value=str(form_settings.get("api_key") or ""),
+            type="password",
+            key="ai_cfg_api_key",
+            help="Для OpenRouter обычно достаточно только ключа и названия модели.",
+        )
 
-    b1, b2, b3 = st.columns(3)
-    with b1:
-        ai_base_url = st.text_input("Base URL", value=str(form_settings.get("base_url") or ""), key="ai_cfg_base_url")
-    with b2:
-        ai_temperature = st.number_input("Температура", min_value=0.0, max_value=1.5, value=float(form_settings.get("temperature") or 0.3), step=0.1, key="ai_cfg_temperature")
-    with b3:
-        ai_max_tokens = st.number_input("Max tokens", min_value=256, max_value=65536, value=int(form_settings.get("max_tokens") or 1800), step=64, key="ai_cfg_max_tokens")
-
-    c1, c2, c3 = st.columns(3)
-    image_size_options = ["1024x1024", "1536x1024", "1024x1536"]
-    current_image_size = str(form_settings.get("image_size") or "1024x1024")
-    if current_image_size not in image_size_options:
-        current_image_size = "1024x1024"
-    with c1:
-        ai_image_size = st.selectbox("Размер изображения", options=image_size_options, index=image_size_options.index(current_image_size), key="ai_cfg_image_size")
-    with c2:
-        ai_use_env_key = st.checkbox("Брать API key из env", value=bool(form_settings.get("use_env_api_key", True)), key="ai_cfg_use_env_key")
-    with c3:
+    quick1, quick2 = st.columns([1, 2])
+    with quick1:
         ai_enabled = st.checkbox("AI включен", value=bool(form_settings.get("enabled", True)), key="ai_cfg_enabled")
+    with quick2:
+        provider_note = {
+            "openrouter": "Для OpenRouter service URL и служебные заголовки подставляются автоматически. Обычно достаточно выбрать модель и вставить API key.",
+            "nvidia": "Для NVIDIA базовый URL подставляется автоматически. Если модель медленная, лучше вынести её в отдельный профиль для deep repair.",
+            "openai": "Для OpenAI базовый URL и image model подставляются автоматически. Обычно достаточно модели и ключа.",
+        }.get(str(ai_provider), "Базовые настройки провайдера подставляются автоматически.")
+        st.caption(provider_note)
 
-    ai_api_key = st.text_input(
-        "API key",
-        value=str(form_settings.get("api_key") or ""),
-        type="password",
-        key="ai_cfg_api_key",
-        help="Если поле пустое и включён режим env, система попробует взять ключ из переменных окружения.",
-    )
+    with st.expander("Расширенные настройки AI", expanded=False):
+        advanced_form_settings = _current_ai_form_settings(ai_settings)
+        b1, b2, b3 = st.columns(3)
+        with b1:
+            ai_base_url = st.text_input("Base URL", value=str(advanced_form_settings.get("base_url") or ""), key="ai_cfg_base_url")
+        with b2:
+            ai_temperature = st.number_input("Температура", min_value=0.0, max_value=1.5, value=float(advanced_form_settings.get("temperature") or 0.3), step=0.1, key="ai_cfg_temperature")
+        with b3:
+            ai_max_tokens = st.number_input("Max tokens", min_value=256, max_value=65536, value=int(advanced_form_settings.get("max_tokens") or 1800), step=64, key="ai_cfg_max_tokens")
 
-    if str(ai_provider) == "openrouter":
-        d1, d2 = st.columns(2)
-        with d1:
-            ai_openrouter_referer = st.text_input("OpenRouter Referer", value=str(form_settings.get("openrouter_referer") or ""), key="ai_cfg_or_referer")
-        with d2:
-            ai_openrouter_title = st.text_input("OpenRouter App Title", value=str(form_settings.get("openrouter_title") or "pim"), key="ai_cfg_or_title")
-    else:
-        ai_openrouter_referer = str(form_settings.get("openrouter_referer") or "")
-        ai_openrouter_title = str(form_settings.get("openrouter_title") or "pim")
+        c1, c2, c3 = st.columns(3)
+        image_size_options = ["1024x1024", "1536x1024", "1024x1536"]
+        current_image_size = str(advanced_form_settings.get("image_size") or "1024x1024")
+        if current_image_size not in image_size_options:
+            current_image_size = "1024x1024"
+        with c1:
+            ai_image_model = st.text_input("Image model", value=str(advanced_form_settings.get("image_model") or ""), key="ai_cfg_image_model")
+            ai_image_size = st.selectbox("Размер изображения", options=image_size_options, index=image_size_options.index(current_image_size), key="ai_cfg_image_size")
+        with c2:
+            ai_use_env_key = st.checkbox("Брать API key из env", value=bool(advanced_form_settings.get("use_env_api_key", True)), key="ai_cfg_use_env_key")
+        with c3:
+            if str(ai_provider) == "openrouter":
+                ai_openrouter_referer = st.text_input("OpenRouter Referer", value=str(advanced_form_settings.get("openrouter_referer") or ""), key="ai_cfg_or_referer")
+                ai_openrouter_title = st.text_input("OpenRouter App Title", value=str(advanced_form_settings.get("openrouter_title") or "pim"), key="ai_cfg_or_title")
+            else:
+                ai_openrouter_referer = str(advanced_form_settings.get("openrouter_referer") or "")
+                ai_openrouter_title = str(advanced_form_settings.get("openrouter_title") or "pim")
+
+    if "ai_temperature" not in locals():
+        ai_temperature = float(_current_ai_form_settings(ai_settings).get("temperature") or 0.3)
+    if "ai_max_tokens" not in locals():
+        ai_max_tokens = int(_current_ai_form_settings(ai_settings).get("max_tokens") or 1800)
+    if "ai_base_url" not in locals():
+        ai_base_url = str(_current_ai_form_settings(ai_settings).get("base_url") or "")
+    if "ai_image_model" not in locals():
+        ai_image_model = str(_current_ai_form_settings(ai_settings).get("image_model") or "")
+    if "ai_use_env_key" not in locals():
+        ai_use_env_key = bool(_current_ai_form_settings(ai_settings).get("use_env_api_key", True))
+    if "ai_openrouter_referer" not in locals():
+        ai_openrouter_referer = str(_current_ai_form_settings(ai_settings).get("openrouter_referer") or "")
+    if "ai_openrouter_title" not in locals():
+        ai_openrouter_title = str(_current_ai_form_settings(ai_settings).get("openrouter_title") or "pim")
+    if "ai_image_size" not in locals():
+        ai_image_size = str(_current_ai_form_settings(ai_settings).get("image_size") or "1024x1024")
 
     ai_profile_name = st.text_input(
         "Имя профиля AI",
