@@ -2230,6 +2230,25 @@ _BICYCLE_CATEGORY_TOKENS = {
     "cycle",
 }
 
+_WEAK_IMAGE_ASSET_TOKENS = {
+    "logo",
+    "favicon",
+    "sprite",
+    "icon-",
+    "/icon",
+    "header-logo",
+    "footer-logo",
+    "banner",
+    "slider",
+    "promo",
+    "advert",
+    "news",
+    "visa",
+    "master",
+    "mir.svg",
+    "dlya-velocity",
+}
+
 
 def _should_override_parsed_category_with_name_inference(
     product_row: dict,
@@ -2264,6 +2283,49 @@ def _should_override_parsed_category_with_name_inference(
     if has_bicycle_context and not parsed_looks_bicycle and inference_score >= 1.25:
         return True
     return False
+
+
+def _extract_image_size_hint_local(url: str | None) -> tuple[int | None, int | None]:
+    text = str(url or "").strip().lower()
+    if not text:
+        return None, None
+    for pattern in (
+        r"w(?P<w>\d{2,5})h(?P<h>\d{2,5})",
+        r"(?P<w>\d{2,5})[xх](?P<h>\d{2,5})(?=[^a-z0-9]|$)",
+        r"(?:[?&](?:w|width)=(?P<w>\d{2,5}))(?:[^\d]+(?:h|height)=(?P<h>\d{2,5}))?",
+        r"(?:[?&](?:h|height)=(?P<h>\d{2,5}))(?:[^\d]+(?:w|width)=(?P<w>\d{2,5}))?",
+    ):
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if not match:
+            continue
+        width_raw = match.groupdict().get("w")
+        height_raw = match.groupdict().get("h")
+        try:
+            width = int(width_raw) if width_raw else None
+        except Exception:
+            width = None
+        try:
+            height = int(height_raw) if height_raw else None
+        except Exception:
+            height = None
+        if width or height:
+            return width, height
+    return None, None
+
+
+def _is_weak_image_reference(url: object, min_side_px: int = 1000) -> bool:
+    low = str(url or "").strip().lower()
+    if not low:
+        return True
+    if any(token in low for token in _WEAK_IMAGE_ASSET_TOKENS):
+        return True
+    width, height = _extract_image_size_hint_local(low)
+    if width is None and height is None:
+        return False
+    if width is not None and height is not None:
+        return min(width, height) < int(min_side_px)
+    known_side = width if width is not None else height
+    return bool(known_side is not None and known_side < int(min_side_px))
 
 
 def _row_value(row: object, key: str, default: object = None) -> object:
@@ -6769,6 +6831,7 @@ def enrich_product_from_supplier(
                 conn.commit()
                 return {"ok": False, "message": fail_comment}
 
+        name_inference_override = _should_override_parsed_category_with_name_inference(product_row, parsed, category_inferred)
         updates = {}
         skipped_manual_fields = []
         has_ozon_priority = bool(
@@ -6798,7 +6861,12 @@ def enrich_product_from_supplier(
             old_value = product[field] if field in product.keys() else None
             if new_value is None:
                 continue
-            if has_ozon_priority and field in {"category", "base_category", "subcategory"} and not force:
+            if (
+                has_ozon_priority
+                and field in {"category", "base_category", "subcategory"}
+                and not force
+                and not (name_inference_override and field_source_types.get(field) == "name_category_inference")
+            ):
                 skipped_manual_fields.append(f"{field}:ozon_priority")
                 continue
             if field == "category" and str(new_value).strip().lower() in weak_categories and not force:
@@ -6809,6 +6877,10 @@ def enrich_product_from_supplier(
             row_source_type = field_source_types.get(field, source_type)
             if not can_overwrite_field(conn, product_id, field, row_source_type, force=force):
                 skipped_manual_fields.append(field)
+                continue
+            if field == "image_url" and old_value not in (None, "", 0, 0.0) and not force:
+                if _is_weak_image_reference(old_value) and not _is_weak_image_reference(new_value):
+                    updates[field] = new_value
                 continue
             if old_value not in (None, "", 0, 0.0) and not force:
                 continue

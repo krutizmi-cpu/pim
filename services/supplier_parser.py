@@ -519,6 +519,33 @@ def _looks_like_image_url(url: str) -> bool:
     return any(token in low for token in ["/image", "/images/", "/img/", "cdn", "upload", "photo", "picture"])
 
 
+def _looks_like_non_product_asset(url: str | None) -> bool:
+    low = str(url or "").lower()
+    if not low:
+        return True
+    if low.endswith(".svg"):
+        return True
+    blocked_tokens = (
+        "logo",
+        "favicon",
+        "sprite",
+        "icon-",
+        "/icon",
+        "header-logo",
+        "footer-logo",
+        "banner",
+        "slider",
+        "promo",
+        "advert",
+        "news",
+        "visa",
+        "master",
+        "mir.svg",
+        "dlya-velocity",
+    )
+    return any(token in low for token in blocked_tokens)
+
+
 def _extract_image_urls(soup: BeautifulSoup, page_url: str | None = None) -> list[str]:
     image_urls: list[str] = []
     seen: set[str] = set()
@@ -623,7 +650,12 @@ def _prioritize_image_urls(image_urls: list[str], hints: list[str] | None = None
         scored.append((score, candidate))
     scored.sort(key=lambda item: (-item[0], item[1]))
     ordered = [url for _, url in scored]
-    filtered = [url for url in ordered if not _is_definitely_low_resolution_image(url)]
+    filtered = [
+        url
+        for url in ordered
+        if not _is_definitely_low_resolution_image(url)
+        and not _looks_like_non_product_asset(url)
+    ]
     return filtered
 
 
