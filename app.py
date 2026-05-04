@@ -6865,7 +6865,7 @@ def enrich_product_from_supplier(
                 has_ozon_priority
                 and field in {"category", "base_category", "subcategory"}
                 and not force
-                and not (name_inference_override and field_source_types.get(field) == "name_category_inference")
+                and not name_inference_override
             ):
                 skipped_manual_fields.append(f"{field}:ozon_priority")
                 continue
