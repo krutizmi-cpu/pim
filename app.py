@@ -2285,6 +2285,41 @@ def _should_override_parsed_category_with_name_inference(
     return False
 
 
+def _should_override_stale_category_priority(
+    product_row: dict,
+    parsed: dict[str, object],
+    category_inferred: dict[str, object],
+) -> bool:
+    if _should_override_parsed_category_with_name_inference(product_row, parsed, category_inferred):
+        return True
+    source_name = " ".join(
+        [
+            str(product_row.get("name") or ""),
+            str(parsed.get("name") or ""),
+        ]
+    ).strip().lower()
+    if not source_name:
+        return False
+    has_bicycle_context = any(token in source_name for token in _BICYCLE_CONTEXT_TOKENS)
+    current_blob = " ".join(
+        [
+            str(product_row.get("category") or ""),
+            str(product_row.get("base_category") or ""),
+            str(product_row.get("subcategory") or ""),
+        ]
+    ).strip().lower()
+    parsed_blob = " ".join(
+        [
+            str(parsed.get("category") or ""),
+            str(parsed.get("base_category") or ""),
+            str(parsed.get("subcategory") or ""),
+        ]
+    ).strip().lower()
+    current_conflicting = any(token in current_blob for token in _CATEGORY_CONFLICT_TOKENS)
+    parsed_looks_bicycle = any(token in parsed_blob for token in _BICYCLE_CATEGORY_TOKENS)
+    return bool(has_bicycle_context and current_conflicting and parsed_looks_bicycle)
+
+
 def _extract_image_size_hint_local(url: str | None) -> tuple[int | None, int | None]:
     text = str(url or "").strip().lower()
     if not text:
@@ -6831,7 +6866,7 @@ def enrich_product_from_supplier(
                 conn.commit()
                 return {"ok": False, "message": fail_comment}
 
-        name_inference_override = _should_override_parsed_category_with_name_inference(product_row, parsed, category_inferred)
+        name_inference_override = _should_override_stale_category_priority(product_row, parsed, category_inferred)
         updates = {}
         skipped_manual_fields = []
         has_ozon_priority = bool(
