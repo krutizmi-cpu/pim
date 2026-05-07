@@ -7138,7 +7138,12 @@ def enrich_product_from_supplier(
                 target_channel_code=None,
             )
             conn.commit()
-        ozon_match = bulk_assign_ozon_categories(conn, [int(product_id)], min_score=OZON_CATEGORY_MIN_SCORE, force=False)
+        ozon_match = bulk_assign_ozon_categories(
+            conn,
+            [int(product_id)],
+            min_score=OZON_CATEGORY_MIN_SCORE,
+            force=bool(name_inference_override),
+        )
         skipped_msg = f", пропущено ручных полей: {len(skipped_manual_fields)}" if skipped_manual_fields else ""
         skipped_attr_msg = f", пропущено атрибутов по приоритету: {len(skipped_attribute_fields)}" if skipped_attribute_fields else ""
         ozon_attr_msg = (
