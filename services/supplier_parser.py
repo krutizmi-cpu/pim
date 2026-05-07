@@ -709,6 +709,7 @@ def _extract_attributes(soup: BeautifulSoup) -> dict[str, str]:
         ".product-params__item",
         ".property__item",
         ".props__item",
+        ".detail__description-row",
     ]
     for selector in row_selectors:
         for row in soup.select(selector):

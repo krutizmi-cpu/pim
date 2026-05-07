@@ -75,6 +75,21 @@ def _infer_export_color(text: str) -> tuple[str | None, str | None]:
     return None, None
 
 
+def _extract_abus_lock_dimensions_cm(text: str) -> tuple[float | None, float | None]:
+    low = _compact_export_text(text)
+    match = re.search(r"(\d{2,3})\s*hb\s*(\d{2,3})", low, flags=re.IGNORECASE)
+    if not match:
+        return None, None
+    try:
+        width_cm = round(int(match.group(1)) / 10.0, 2)
+        height_cm = round(int(match.group(2)) / 10.0, 2)
+    except Exception:
+        return None, None
+    if width_cm <= 0 or height_cm <= 0:
+        return None, None
+    return width_cm, height_cm
+
+
 def _apply_sportmaster_defaults(product: dict[str, object], value_map: dict[str, object]) -> None:
     text_blob = " ".join(
         [
@@ -137,6 +152,35 @@ def _apply_sportmaster_defaults(product: dict[str, object], value_map: dict[str,
         value_map["gross_weight"] = value_map.get("weight")
     if value_map.get("package_length") in (None, "") and value_map.get("length") not in (None, ""):
         value_map["package_length"] = value_map.get("length")
+    if value_map.get("package_height") in (None, "") and value_map.get("length") not in (None, ""):
+        value_map["package_height"] = value_map.get("length")
+
+    lock_width_cm, lock_height_cm = _extract_abus_lock_dimensions_cm(text_blob)
+    if value_map.get("package_width") in (None, "") and lock_width_cm is not None:
+        value_map["package_width"] = lock_width_cm
+    if value_map.get("package_height") in (None, "") and lock_height_cm is not None:
+        value_map["package_height"] = lock_height_cm
+
+    if value_map.get("ставка_ндс") in (None, ""):
+        value_map["ставка_ндс"] = "20"
+
+    if value_map.get("tnved_code") in (None, ""):
+        value_map["tnved_code"] = "8301409000"
+
+    brand_text = _compact_export_text(str(product.get("brand") or value_map.get("brand") or ""))
+    lock_type_text = _compact_export_text(str(value_map.get("тип_замка") or ""))
+    is_abus_u_lock = "abus" in brand_text and ("u-lock" in low_blob or "ulock" in low_blob or "u-lock" in lock_type_text or "u lock" in lock_type_text)
+    default_materials = None
+    if is_abus_u_lock:
+        default_materials = "Закаленная сталь, ПВХ"
+    elif value_map.get("тип_замка") not in (None, "") or ("замок" in low_blob and "вело" in low_blob):
+        default_materials = "Сталь"
+
+    if default_materials:
+        if value_map.get("материалы") in (None, ""):
+            value_map["материалы"] = default_materials
+        if value_map.get("состав_товара") in (None, ""):
+            value_map["состав_товара"] = default_materials
 
 
 _DUPLICATE_TEMPLATE_SLOT_RE = re.compile(r"\.\d+$")
