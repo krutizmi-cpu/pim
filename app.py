@@ -2105,6 +2105,16 @@ def _is_parsed_result_relevant(product_row: dict, parsed: dict, source_url: str,
         return True, "article_or_code_match"
     if overlap >= min_overlap and (brand_match or fallback_score >= min_fallback_score):
         return True, f"name_overlap={overlap}"
+    category_inferred = infer_category_fields(
+        {
+            "name": parsed.get("name") or product_row.get("name"),
+            "category": parsed.get("category") or product_row.get("category"),
+            "base_category": product_row.get("base_category"),
+            "subcategory": product_row.get("subcategory"),
+        }
+    )
+    if brand_match and _should_override_stale_category_priority(product_row, parsed, category_inferred):
+        return True, "stale_category_context_match"
     if (not require_article_match) and fallback_score >= (min_fallback_score + 1.0):
         return True, f"score={fallback_score:.2f}"
     return False, f"rejected: code_match={code_match}, overlap={overlap}, brand_match={brand_match}, score={fallback_score:.2f}"
