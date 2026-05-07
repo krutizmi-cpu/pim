@@ -6903,6 +6903,9 @@ def enrich_product_from_supplier(
                 return {"ok": False, "message": fail_comment}
 
         name_inference_override = _should_override_stale_category_priority(product_row, parsed, category_inferred)
+        stale_category_override_fields = (
+            {"category", "base_category", "subcategory"} if name_inference_override else set()
+        )
         updates = {}
         skipped_manual_fields = []
         has_ozon_priority = bool(
@@ -6946,14 +6949,20 @@ def enrich_product_from_supplier(
                 skipped_manual_fields.append(field)
                 continue
             row_source_type = field_source_types.get(field, source_type)
-            if not can_overwrite_field(conn, product_id, field, row_source_type, force=force):
+            if field not in stale_category_override_fields and not can_overwrite_field(
+                conn,
+                product_id,
+                field,
+                row_source_type,
+                force=force,
+            ):
                 skipped_manual_fields.append(field)
                 continue
             if field == "image_url" and old_value not in (None, "", 0, 0.0) and not force:
                 if _is_weak_image_reference(old_value) and not _is_weak_image_reference(new_value):
                     updates[field] = new_value
                 continue
-            if old_value not in (None, "", 0, 0.0) and not force:
+            if old_value not in (None, "", 0, 0.0) and not force and field not in stale_category_override_fields:
                 continue
             updates[field] = new_value
 
