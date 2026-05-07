@@ -3551,6 +3551,38 @@ def _build_ozon_template_category_options(
     return options, labels
 
 
+def _resolve_preferred_sportmaster_scope(conn, product_row: dict | None = None) -> str:
+    catalog_scope = str(st.session_state.get("catalog_export_category_code") or "").strip()
+    if catalog_scope.startswith("sportmaster:"):
+        return catalog_scope
+    export_profile_id = _safe_int_id(st.session_state.get("catalog_export_profile_id"))
+    if export_profile_id > 0:
+        try:
+            for profile in list_template_profiles(conn, channel_code=SPORTMASTER_CHANNEL_CODE):
+                if int(profile.get("id") or 0) == int(export_profile_id):
+                    category_code = str(profile.get("category_code") or "").strip()
+                    if category_code.startswith("sportmaster:"):
+                        return category_code
+                    break
+        except Exception:
+            pass
+    if product_row:
+        best_profile = compute_best_template_profile_readiness(conn, product_row)
+        if str(best_profile.get("channel_code") or "").strip() == SPORTMASTER_CHANNEL_CODE:
+            best_profile_id = _safe_int_id(best_profile.get("profile_id"))
+            if best_profile_id > 0:
+                try:
+                    for profile in list_template_profiles(conn, channel_code=SPORTMASTER_CHANNEL_CODE):
+                        if int(profile.get("id") or 0) == best_profile_id:
+                            category_code = str(profile.get("category_code") or "").strip()
+                            if category_code.startswith("sportmaster:"):
+                                return category_code
+                            break
+                except Exception:
+                    pass
+    return ""
+
+
 def _is_blank_value(value: object) -> bool:
     if value is None:
         return True
@@ -5885,6 +5917,8 @@ def show_catalog_tab():
     workflow_detmir_ready = sum(1 for row in workflow_brief_rows if _safe_int_id(row.get("detmir_category_id")) > 0)
     workflow_with_images = sum(1 for row in workflow_brief_rows if str(row.get("image_url") or "").strip())
     workflow_parse_success = sum(1 for row in workflow_brief_rows if str(row.get("supplier_parse_status") or "").strip().lower() == "success")
+    current_workflow_client = str(st.session_state.get("catalog_export_client_code") or "").strip().lower()
+    detmir_after_ai_default = bool(current_workflow_client == "detmir")
 
     with st.container(border=True):
         st.markdown("### Основной конвейер каталога")
@@ -5944,10 +5978,12 @@ def show_catalog_tab():
                 st.caption("Массово найти данные по товарам, переписать контент и подготовить master-карточки под клиентов.")
                 fill_detmir_after_ai = st.checkbox(
                     "После AI сразу подготовить Detmir overlay",
-                    value=True,
+                    value=bool(st.session_state.get("catalog_fill_detmir_after_ai", detmir_after_ai_default)),
                     key="catalog_fill_detmir_after_ai",
-                    help="После supplier/web + AI система сразу перенесёт уже найденные значения в Detmir overlay.",
+                    help="Нужно только для Детского Мира. Для Sportmaster и других Excel-клиентов обычно не включаем.",
                 )
+                if current_workflow_client and current_workflow_client != "detmir":
+                    st.caption("Сейчас выбран не Detmir-клиент, поэтому Detmir overlay лучше не запускать в массовом проходе.")
                 if st.button("Запустить массовое заполнение для области", type="primary", use_container_width=True, key="catalog_workflow_fill_all"):
                     run_ai_enrichment_batch(
                         candidate_ids=[int(x) for x in workflow_target_ids],
@@ -5955,7 +5991,7 @@ def show_catalog_tab():
                         run_label=f"AI / {workflow_scope}",
                         mode=str(ai_mode or "fast_batch"),
                     )
-                    if bool(fill_detmir_after_ai) and workflow_target_ids:
+                    if bool(fill_detmir_after_ai) and current_workflow_client == "detmir" and workflow_target_ids:
                         run_detmir_overlay_batch(
                             candidate_ids=[int(x) for x in workflow_target_ids],
                             run_limit=max(len(workflow_target_ids), 1),
@@ -8359,12 +8395,18 @@ def show_product_tab(summary: dict[str, object] | None = None):
             category_scopes = [product_ozon_scope] + category_scopes
         if selected_channel == "detmir" and product_detmir_scope and product_detmir_scope not in category_scopes:
             category_scopes = [product_detmir_scope] + category_scopes
+        if selected_channel == SPORTMASTER_CHANNEL_CODE:
+            preferred_sportmaster_scope = _resolve_preferred_sportmaster_scope(conn, dict(product))
+            if preferred_sportmaster_scope and preferred_sportmaster_scope not in category_scopes:
+                category_scopes = [preferred_sportmaster_scope] + category_scopes
         category_scopes = list(dict.fromkeys(category_scopes))
         scope_options = [""] + category_scopes
         if selected_channel == "ozon":
             scope_labels = _build_ozon_scope_labels(conn)
         elif selected_channel == "detmir":
             scope_labels = _build_detmir_scope_labels(conn)
+        elif selected_channel == SPORTMASTER_CHANNEL_CODE:
+            scope_labels = build_sportmaster_scope_labels(conn)
         else:
             scope_labels = {}
         if selected_channel not in {"ozon", "detmir"}:
@@ -8378,6 +8420,10 @@ def show_product_tab(summary: dict[str, object] | None = None):
             default_scope = product_ozon_scope
         elif selected_channel == "detmir" and product_detmir_scope:
             default_scope = product_detmir_scope
+        elif selected_channel == SPORTMASTER_CHANNEL_CODE:
+            preferred_sportmaster_scope = _resolve_preferred_sportmaster_scope(conn, dict(product))
+            if preferred_sportmaster_scope:
+                default_scope = preferred_sportmaster_scope
         elif not default_scope:
             product_scope_candidates = [
                 str(product["subcategory"] or "").strip(),

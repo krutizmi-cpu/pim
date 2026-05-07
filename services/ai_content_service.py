@@ -405,6 +405,17 @@ def check_ai_connection(settings: dict[str, Any]) -> dict[str, Any]:
     )
     if chat_check.get("ok"):
         return chat_check
+    chat_error = str(chat_check.get("error") or "").strip()
+    if provider == "openrouter" and chat_error:
+        return {
+            "ok": False,
+            "provider": provider,
+            "model": model,
+            "error": (
+                f"{model_check.get('text')} Но реальный chat-ping не прошёл: "
+                f"{chat_error}"
+            ),
+        }
     return {
         "ok": True,
         "provider": provider,
@@ -412,9 +423,9 @@ def check_ai_connection(settings: dict[str, Any]) -> dict[str, Any]:
         "mode": "model_endpoint_only",
         "text": (
             f"{model_check.get('text')} Короткий chat-ping не завершился быстро: "
-            f"{chat_check.get('error') or 'без текста ошибки'}"
+            f"{chat_error or 'без текста ошибки'}"
         ),
-        "warning": chat_check.get("error"),
+        "warning": chat_error,
     }
 
 
