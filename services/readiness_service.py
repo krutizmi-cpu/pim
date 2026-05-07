@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from typing import Any
 
 import pandas as pd
@@ -48,6 +49,17 @@ def _row_label(row: pd.Series, fallback_index: int) -> str:
     return f"row_{fallback_index + 1}"
 
 
+_DUPLICATE_SLOT_RE = re.compile(r"\.\d+$")
+
+
+def _base_template_column(column: object) -> str:
+    return _DUPLICATE_SLOT_RE.sub("", str(column or "").strip())
+
+
+def _template_column_is_required(column: object) -> bool:
+    return "*" in _base_template_column(column)
+
+
 def analyze_template_readiness(filled_df: pd.DataFrame, mapping_rows: list[dict[str, Any]]) -> dict[str, Any]:
     matched_rows = [row for row in mapping_rows if _mapping_is_matched(row) and row.get("template_column") in filled_df.columns]
     unmatched_rows = [row for row in mapping_rows if not _mapping_is_matched(row)]
@@ -78,6 +90,7 @@ def analyze_template_readiness(filled_df: pd.DataFrame, mapping_rows: list[dict[
                 "Колонка": column,
                 "Статус": "matched",
                 "Источник": f"{row.get('source_type') or ''}:{row.get('source_name') or ''}".strip(':'),
+                "Обязательный": int(_template_column_is_required(column)),
                 "Заполнено": filled_count,
                 "Пусто": total - filled_count,
                 "Покрытие, %": round((filled_count / total) * 100) if total else 0,
@@ -90,6 +103,7 @@ def analyze_template_readiness(filled_df: pd.DataFrame, mapping_rows: list[dict[
                 "Колонка": row.get("template_column"),
                 "Статус": "unmatched",
                 "Источник": "",
+                "Обязательный": int(_template_column_is_required(row.get("template_column"))),
                 "Заполнено": 0,
                 "Пусто": int(len(filled_df)),
                 "Покрытие, %": 0,
@@ -103,16 +117,42 @@ def analyze_template_readiness(filled_df: pd.DataFrame, mapping_rows: list[dict[
     blocked_rows = 0
 
     matched_columns = [row["template_column"] for row in matched_rows]
-    unmatched_columns = [row.get("template_column") for row in unmatched_rows if row.get("template_column")]
+    matched_required_groups: dict[str, list[str]] = {}
+    matched_optional_groups: dict[str, list[str]] = {}
+    for row in matched_rows:
+        column = str(row.get("template_column") or "").strip()
+        if not column:
+            continue
+        source_signature = f"{row.get('source_type') or ''}:{row.get('source_name') or ''}".strip(":")
+        group_key = f"{_base_template_column(column)}|{source_signature}"
+        target = matched_required_groups if _template_column_is_required(column) else matched_optional_groups
+        target.setdefault(group_key, []).append(column)
+
+    unmatched_required_columns = [
+        row.get("template_column")
+        for row in unmatched_rows
+        if row.get("template_column") and _template_column_is_required(row.get("template_column"))
+    ]
 
     for idx, (_, data_row) in enumerate(filled_df.iterrows()):
-        missing_columns = [column for column in matched_columns if _is_missing(data_row[column])]
-        matched_total = len(matched_columns)
-        filled_total = matched_total - len(missing_columns)
-        readiness_pct = round((filled_total / matched_total) * 100) if matched_total else 0
+        if matched_required_groups:
+            missing_columns = []
+            required_total = len(matched_required_groups)
+            filled_total = 0
+            for group_columns in matched_required_groups.values():
+                if any(not _is_missing(data_row[column]) for column in group_columns):
+                    filled_total += 1
+                else:
+                    missing_columns.append(_base_template_column(group_columns[0]))
+            readiness_pct = round((filled_total / required_total) * 100) if required_total else 0
+        else:
+            missing_columns = [column for column in matched_columns if _is_missing(data_row[column])]
+            matched_total = len(matched_columns)
+            filled_total = matched_total - len(missing_columns)
+            readiness_pct = round((filled_total / matched_total) * 100) if matched_total else 0
         readiness_values.append(readiness_pct)
 
-        if readiness_pct == 100 and not unmatched_columns:
+        if readiness_pct == 100 and not unmatched_required_columns:
             status = "ready"
             ready_rows += 1
         elif readiness_pct >= 80:
@@ -129,7 +169,7 @@ def analyze_template_readiness(filled_df: pd.DataFrame, mapping_rows: list[dict[
                     "Готовность, %": readiness_pct,
                     "Статус": status,
                     "Пустые matched поля": ", ".join(missing_columns),
-                    "Несматченные колонки": ", ".join(unmatched_columns),
+                    "Несматченные колонки": ", ".join(unmatched_required_columns),
                 }
             )
 

@@ -37,6 +37,136 @@ BASE_PRODUCT_FIELD_ALIASES = {
     "tnved_code": ["tnved", "тнвэд", "тн вэд", "код тнвэд"],
 }
 
+_EXPORT_COLOR_PATTERNS = [
+    ("черн", "Черный", "BLACK"),
+    ("black", "Черный", "BLACK"),
+    ("сер", "Серый", "GRAY"),
+    ("grey", "Серый", "GRAY"),
+    ("gray", "Серый", "GRAY"),
+    ("син", "Синий", "BLUE"),
+    ("blue", "Синий", "BLUE"),
+    ("крас", "Красный", "RED"),
+    ("red", "Красный", "RED"),
+    ("бел", "Белый", "WHITE"),
+    ("white", "Белый", "WHITE"),
+]
+
+
+def _compact_export_text(value: object) -> str:
+    return " ".join(str(value or "").strip().lower().split())
+
+
+def _sanitize_sportmaster_code(value: object, max_len: int) -> str | None:
+    text = str(value or "").strip().upper()
+    if not text:
+        return None
+    text = re.sub(r"[^A-Z0-9 .#_+\-\/\^\"]+", "", text)
+    text = " ".join(text.split()).strip()
+    if not text:
+        return None
+    return text[:max_len]
+
+
+def _infer_export_color(text: str) -> tuple[str | None, str | None]:
+    low = _compact_export_text(text)
+    for token, label, code in _EXPORT_COLOR_PATTERNS:
+        if token in low:
+            return label, code
+    return None, None
+
+
+def _apply_sportmaster_defaults(product: dict[str, object], value_map: dict[str, object]) -> None:
+    text_blob = " ".join(
+        [
+            str(product.get("name") or ""),
+            str(product.get("category") or ""),
+            str(product.get("base_category") or ""),
+            str(product.get("subcategory") or ""),
+            str(value_map.get("description") or ""),
+        ]
+    ).strip()
+    low_blob = _compact_export_text(text_blob)
+    is_bicycle_lock = (
+        ("вело" in low_blob or "велосип" in low_blob or "bike" in low_blob)
+        and ("замок" in low_blob or "lock" in low_blob)
+    )
+    if not is_bicycle_lock:
+        return
+
+    if value_map.get("возраст") in (None, ""):
+        value_map["возраст"] = "Унисекс взрослые"
+    if value_map.get("вид_товара") in (None, ""):
+        value_map["вид_товара"] = "Велозамки"
+    if value_map.get("вид_спорта") in (None, ""):
+        value_map["вид_спорта"] = "Велоспорт"
+    if value_map.get("размер_оригинальный") in (None, ""):
+        value_map["размер_оригинальный"] = "One size"
+    if value_map.get("размер_rus") in (None, ""):
+        value_map["размер_rus"] = "Без размера"
+
+    main_color, color_code = _infer_export_color(text_blob)
+    if main_color and value_map.get("основной_цвет") in (None, ""):
+        value_map["основной_цвет"] = main_color
+    if main_color and value_map.get("цвет") in (None, ""):
+        value_map["цвет"] = main_color
+    if color_code and value_map.get("код_цвета") in (None, ""):
+        value_map["код_цвета"] = color_code
+
+    if value_map.get("тип_замка") in (None, ""):
+        if "под ключ" in low_blob or "ключ" in low_blob:
+            value_map["тип_замка"] = "На ключе"
+        elif "код" in low_blob:
+            value_map["тип_замка"] = "Кодовый"
+
+    model_code = value_map.get("код_модели")
+    if model_code in (None, ""):
+        model_code = _sanitize_sportmaster_code(
+            product.get("supplier_article") or product.get("article") or product.get("internal_article"),
+            26,
+        )
+        if model_code:
+            value_map["код_модели"] = model_code
+
+    if value_map.get("код_цветомодели") in (None, ""):
+        normalized_model_code = _sanitize_sportmaster_code(value_map.get("код_модели"), 26)
+        normalized_color_code = _sanitize_sportmaster_code(value_map.get("код_цвета"), 20)
+        if normalized_model_code and normalized_color_code:
+            value_map["код_цветомодели"] = f"{normalized_model_code}-{normalized_color_code}"[:40]
+
+    if value_map.get("gross_weight") in (None, "") and value_map.get("weight") not in (None, ""):
+        value_map["gross_weight"] = value_map.get("weight")
+    if value_map.get("package_length") in (None, "") and value_map.get("length") not in (None, ""):
+        value_map["package_length"] = value_map.get("length")
+
+
+_DUPLICATE_TEMPLATE_SLOT_RE = re.compile(r"\.\d+$")
+
+
+def _template_slot_base(column: object) -> str:
+    return _DUPLICATE_TEMPLATE_SLOT_RE.sub("", str(column or "").strip())
+
+
+def _resolve_template_slot_value(
+    value_map: dict[str, object],
+    match: dict[str, object],
+    slot_counters: dict[str, int],
+):
+    template_column = str(match.get("template_column") or "").strip()
+    source_name = str(match.get("source_name") or "").strip()
+    source_type = str(match.get("source_type") or "").strip()
+    group_key = f"{_template_slot_base(template_column)}|{source_type}|{source_name}"
+    slot_index = int(slot_counters.get(group_key, 0))
+    slot_counters[group_key] = slot_index + 1
+
+    raw_value = value_map.get(source_name)
+    if isinstance(raw_value, (list, tuple)):
+        raw_value = raw_value[slot_index] if slot_index < len(raw_value) else None
+    elif slot_index > 0 and _template_slot_base(template_column) != template_column:
+        raw_value = None
+
+    transform_rule = _resolve_transform_rule(match)
+    return apply_transform(raw_value, transform_rule)
+
 
 def _get_public_media_base_url(conn) -> str:
     try:
@@ -536,6 +666,7 @@ def build_product_value_map(conn, product_id: int) -> dict[str, object]:
     if image_url:
         value_map["image_url"] = image_url
     value_map["media_gallery"] = deduped_media_values
+    _apply_sportmaster_defaults(product, value_map)
 
     return value_map
 
@@ -545,6 +676,7 @@ def fill_template_dataframe(conn, template_df: pd.DataFrame, product_ids: list[i
     for product_id in product_ids:
         value_map = build_product_value_map(conn, product_id)
         row_data = {}
+        slot_counters: dict[str, int] = {}
         for match in matches:
             col = match["template_column"]
             status = str(match.get("status") or "").strip().lower()
@@ -557,8 +689,7 @@ def fill_template_dataframe(conn, template_df: pd.DataFrame, product_ids: list[i
             if not is_matched:
                 row_data[col] = None
                 continue
-            transform_rule = _resolve_transform_rule(match)
-            row_data[col] = apply_transform(value_map.get(match["source_name"]), transform_rule)
+            row_data[col] = _resolve_template_slot_value(value_map, match, slot_counters)
         rows.append(row_data)
     return pd.DataFrame(rows)
 
@@ -687,6 +818,7 @@ def fill_template_workbook_bytes(
     for row_offset, product_id in enumerate(product_ids):
         target_row = start_row + row_offset
         value_map = build_product_value_map(conn, int(product_id))
+        slot_counters: dict[str, int] = {}
         for match in matches:
             status = str(match.get("status") or "").strip().lower()
             is_matched = status == "matched" or (
@@ -701,8 +833,7 @@ def fill_template_workbook_bytes(
             source_name = match.get("source_name")
             if not template_column or template_column not in column_map or not source_name:
                 continue
-            transform_rule = _resolve_transform_rule(match)
-            value = apply_transform(value_map.get(source_name), transform_rule)
+            value = _resolve_template_slot_value(value_map, match, slot_counters)
             ws.cell(row=target_row, column=column_map[template_column]).value = value
 
     output = BytesIO()
