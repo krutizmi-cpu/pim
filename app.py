@@ -7109,6 +7109,19 @@ def enrich_product_from_supplier(
                         else 0.45
                     ),
                 )
+            if name_inference_override and any(field in updates for field in stale_category_override_fields):
+                conn.execute(
+                    """
+                    UPDATE products
+                    SET ozon_description_category_id = NULL,
+                        ozon_type_id = NULL,
+                        ozon_category_path = NULL,
+                        ozon_category_confidence = NULL,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    """,
+                    (product_id,),
+                )
         else:
             conn.execute(
                 """
@@ -7138,12 +7151,14 @@ def enrich_product_from_supplier(
                 target_channel_code=None,
             )
             conn.commit()
-        ozon_match = bulk_assign_ozon_categories(
-            conn,
-            [int(product_id)],
-            min_score=OZON_CATEGORY_MIN_SCORE,
-            force=bool(name_inference_override),
-        )
+        ozon_match = {"processed": 0, "assigned": 0, "skipped": 0}
+        if not name_inference_override:
+            ozon_match = bulk_assign_ozon_categories(
+                conn,
+                [int(product_id)],
+                min_score=OZON_CATEGORY_MIN_SCORE,
+                force=False,
+            )
         skipped_msg = f", пропущено ручных полей: {len(skipped_manual_fields)}" if skipped_manual_fields else ""
         skipped_attr_msg = f", пропущено атрибутов по приоритету: {len(skipped_attribute_fields)}" if skipped_attribute_fields else ""
         ozon_attr_msg = (
